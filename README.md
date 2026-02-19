@@ -37,13 +37,14 @@ This repository includes `activeinferenceefe`, a modular framework agent that
 implements an audit-first Active Inference loop for ARC-AGI-3:
 
 - observation contract (state, levels, available actions, frame)
-- object representation contract (connected components + Action6 proposals)
-- hypothesis-bank posterior updates (MDL-aware)
-- Expected Free Energy ledger per candidate (risk / ambiguity / information gain / action cost)
-- causal event signatures for action interventions
+- object representation contract (same-color and mixed-color connected components with 4/8 connectivity + hierarchy links + Action6 proposals)
+- world-model hypothesis bank (hidden mode state + rule-family/parameter version space)
+- Expected Free Energy ledger per candidate (risk / ambiguity / split information gain / action cost / complexity / VFE term)
+- causal event signatures for action interventions (`obs_change_type` diff semantics)
 - JSONL trace emission for bottleneck analysis
 - stage diagnostics (`stage / duration_ms / status / reject_reason_v1`)
 - failure taxonomy in reasoning for non-silent fallback paths
+- two-step rollout scoring with budget-aware phase switching and stop-loss guard
 
 Run it with:
 
@@ -58,6 +59,9 @@ Useful environment variables:
 - `ACTIVE_INFERENCE_MAX_ACTION6_POINTS` (default `16`)
 - `ACTIVE_INFERENCE_EXPLORE_STEPS` (default `20`)
 - `ACTIVE_INFERENCE_EXPLOIT_ENTROPY_THRESHOLD` (default `0.9`)
+- `ACTIVE_INFERENCE_ROLLOUT_HORIZON` (default `2`)
+- `ACTIVE_INFERENCE_ROLLOUT_DISCOUNT` (default `0.55`)
+- `ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS` (default `3`)
 - `ACTIVE_INFERENCE_TRACE_ENABLED` (default `true`)
 - `ACTIVE_INFERENCE_TRACE_CANDIDATE_LIMIT` (default `30`)
 - `ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION` (default `false`)
@@ -67,8 +71,11 @@ Useful environment variables:
 
 ```bash
 export ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON='{
-  "explore": {"information_gain": 1.5},
-  "exploit": {"action_cost": 1.1, "risk": 1.3}
+  "explore": {
+    "information_gain_mechanism_dynamics": 1.7,
+    "information_gain_action_semantics": 1.3
+  },
+  "exploit": {"action_cost": 1.2, "risk": 1.4, "vfe": 0.2}
 }'
 ```
 

@@ -77,7 +77,16 @@ def _env_weight_overrides() -> dict[str, dict[str, float]]:
         if not isinstance(values_any, dict):
             continue
         normalized: dict[str, float] = {}
-        for key in ("risk", "ambiguity", "information_gain", "action_cost", "complexity"):
+        for key in (
+            "risk",
+            "ambiguity",
+            "information_gain_action_semantics",
+            "information_gain_mechanism_dynamics",
+            "information_gain_causal_mapping",
+            "action_cost",
+            "complexity",
+            "vfe",
+        ):
             if key not in values_any:
                 continue
             try:
@@ -119,6 +128,15 @@ class ActiveInferenceEFE(Agent):
             "ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION",
             False,
         )
+        self.rollout_horizon = max(1, _env_int("ACTIVE_INFERENCE_ROLLOUT_HORIZON", 2))
+        self.rollout_discount = max(
+            0.0,
+            min(1.0, _env_float("ACTIVE_INFERENCE_ROLLOUT_DISCOUNT", 0.55)),
+        )
+        self.no_change_stop_loss_steps = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS", 3),
+        )
 
         explore_steps = max(1, _env_int("ACTIVE_INFERENCE_EXPLORE_STEPS", 20))
         exploit_entropy_threshold = max(
@@ -129,6 +147,8 @@ class ActiveInferenceEFE(Agent):
             explore_steps=explore_steps,
             exploit_entropy_threshold=exploit_entropy_threshold,
             top_k_reasoning=self.top_k_reasoning,
+            rollout_horizon=self.rollout_horizon,
+            rollout_discount=self.rollout_discount,
             weight_overrides=weight_overrides,
         )
         self.hypothesis_bank = ActiveInferenceHypothesisBankV1()
@@ -136,6 +156,7 @@ class ActiveInferenceEFE(Agent):
         self._previous_packet: ObservationPacketV1 | None = None
         self._previous_representation: RepresentationStateV1 | None = None
         self._previous_action_candidate: ActionCandidateV1 | None = None
+        self._no_change_streak = 0
 
         self.trace_enabled = _env_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
         self.trace_recorder: ActiveInferenceTraceRecorderV1 | None = None
@@ -201,8 +222,8 @@ class ActiveInferenceEFE(Agent):
 
     def _reasoning_for_forced_reset(self, packet: ObservationPacketV1) -> dict[str, Any]:
         return {
-            "schema_name": "active_inference_reasoning_v1",
-            "schema_version": 1,
+            "schema_name": "active_inference_reasoning_v2",
+            "schema_version": 2,
             "phase": "control",
             "selected_candidate": {
                 "candidate_id": "reset_forced_by_state",
@@ -214,6 +235,7 @@ class ActiveInferenceEFE(Agent):
                 "reason": "state_requires_reset",
             },
             "hypothesis_summary": self.hypothesis_bank.summary(),
+            "no_change_streak": int(self._no_change_streak),
         }
 
     def _reasoning_for_failure(
@@ -227,8 +249,8 @@ class ActiveInferenceEFE(Agent):
             self._observation_summary_for_trace(packet) if packet is not None else None
         )
         return {
-            "schema_name": "active_inference_reasoning_v1",
-            "schema_version": 1,
+            "schema_name": "active_inference_reasoning_v2",
+            "schema_version": 2,
             "phase": "failure_fallback",
             "failure_taxonomy_v1": {
                 "failure_code": failure_code,
@@ -238,6 +260,7 @@ class ActiveInferenceEFE(Agent):
             "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
             "observation_packet_summary": packet_summary,
             "hypothesis_summary": self.hypothesis_bank.summary(),
+            "no_change_streak": int(self._no_change_streak),
         }
 
     def choose_action(
@@ -349,15 +372,22 @@ class ActiveInferenceEFE(Agent):
                     previous_representation=self._previous_representation,
                     observed_signature=causal_signature,
                 )
+                if str(causal_signature.obs_change_type) == "NO_CHANGE":
+                    self._no_change_streak += 1
+                else:
+                    self._no_change_streak = 0
                 diagnostics.finish_ok(
                     "causal_update",
                     {
                         "updated": True,
                         "signature_digest": causal_signature.signature_digest,
                         "event_tags": list(causal_signature.event_tags),
+                        "obs_change_type": str(causal_signature.obs_change_type),
+                        "no_change_streak": int(self._no_change_streak),
                     },
                 )
             else:
+                self._no_change_streak = 0
                 diagnostics.finish_ok(
                     "causal_update",
                     {"updated": False, "reason": "insufficient_history"},
@@ -368,10 +398,12 @@ class ActiveInferenceEFE(Agent):
                 f"causal_update_error::{type(exc).__name__}",
             )
 
+        remaining_budget = max(0, int(self.MAX_ACTIONS - int(self.action_counter)))
         diagnostics.start("phase_determination")
         try:
             phase = self.policy.determine_phase(
                 action_counter=self.action_counter,
+                remaining_budget=remaining_budget,
                 hypothesis_bank=self.hypothesis_bank,
             )
             diagnostics.finish_ok(
@@ -379,6 +411,7 @@ class ActiveInferenceEFE(Agent):
                 {
                     "phase": phase,
                     "posterior_entropy_bits": float(self.hypothesis_bank.posterior_entropy()),
+                    "remaining_budget": int(remaining_budget),
                 },
             )
         except Exception as exc:
@@ -406,112 +439,176 @@ class ActiveInferenceEFE(Agent):
                 },
             )
         else:
-            diagnostics.start("candidate_generation")
-            try:
-                candidates = build_action_candidates_v1(packet, representation)
-                if not candidates:
-                    diagnostics.finish_rejected(
-                        "candidate_generation",
-                        "no_candidates_generated",
+            diagnostics.start("stop_loss_guard")
+            stop_loss_applied = False
+            stop_loss_candidate: ActionCandidateV1 | None = None
+            if self._no_change_streak >= self.no_change_stop_loss_steps:
+                if 7 in packet.available_actions:
+                    stop_loss_candidate = ActionCandidateV1(
+                        candidate_id="a7_stop_loss",
+                        action_id=7,
+                        source="stop_loss_guard",
                     )
-                    selected_candidate = ActionCandidateV1(
-                        candidate_id="reset_no_candidates",
+                elif 0 in packet.available_actions:
+                    stop_loss_candidate = ActionCandidateV1(
+                        candidate_id="reset_stop_loss",
                         action_id=0,
-                        source="candidate_guard",
+                        source="stop_loss_guard",
                     )
-                    action = GameAction.RESET
-                    action.reasoning = {
-                        "schema_name": "active_inference_reasoning_v1",
-                        "schema_version": 1,
-                        "phase": phase,
-                        "selected_candidate": selected_candidate.to_dict(),
-                        "reason": "no_candidates",
-                        "hypothesis_summary": self.hypothesis_bank.summary(),
-                        "stage_diagnostics_v1": diagnostics.to_dicts(),
-                        "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
-                    }
                 else:
-                    diagnostics.finish_ok(
-                        "candidate_generation",
-                        {
-                            "candidate_count": int(len(candidates)),
-                            "action6_candidate_count": int(
-                                sum(1 for candidate in candidates if candidate.action_id == 6)
-                            ),
-                        },
+                    stop_loss_candidate = ActionCandidateV1(
+                        candidate_id="reset_stop_loss",
+                        action_id=0,
+                        source="stop_loss_guard",
                     )
 
-                    diagnostics.start("policy_selection")
-                    selected_candidate, ranked_entries = self.policy.select_action(
-                        packet=packet,
-                        representation=representation,
-                        candidates=candidates,
-                        hypothesis_bank=self.hypothesis_bank,
-                        phase=phase,
-                    )
-                    diagnostics.finish_ok(
-                        "policy_selection",
-                        {
-                            "selected_candidate_id": selected_candidate.candidate_id,
-                            "selected_action_id": int(selected_candidate.action_id),
-                            "ranked_count": int(len(ranked_entries)),
-                        },
-                    )
+            if stop_loss_candidate is not None:
+                stop_loss_applied = True
+                selected_candidate = stop_loss_candidate
+                if int(stop_loss_candidate.action_id) == 0:
+                    action = GameAction.RESET
+                else:
+                    action = self._candidate_to_game_action(stop_loss_candidate)
+                diagnostics.finish_ok(
+                    "stop_loss_guard",
+                    {
+                        "triggered": True,
+                        "no_change_streak": int(self._no_change_streak),
+                        "threshold": int(self.no_change_stop_loss_steps),
+                        "selected_action_id": int(selected_candidate.action_id),
+                    },
+                )
+                self._no_change_streak = 0
+                action.reasoning = {
+                    "schema_name": "active_inference_reasoning_v2",
+                    "schema_version": 2,
+                    "phase": phase,
+                    "selected_candidate": selected_candidate.to_dict(),
+                    "reason": "stop_loss_guard_triggered",
+                    "hypothesis_summary": self.hypothesis_bank.summary(),
+                    "representation_summary": representation.summary,
+                    "remaining_budget": int(remaining_budget),
+                }
+            else:
+                diagnostics.finish_ok(
+                    "stop_loss_guard",
+                    {
+                        "triggered": False,
+                        "no_change_streak": int(self._no_change_streak),
+                        "threshold": int(self.no_change_stop_loss_steps),
+                    },
+                )
 
-                    diagnostics.start("action_materialization")
-                    try:
-                        action = self._candidate_to_game_action(selected_candidate)
-                        diagnostics.finish_ok(
-                            "action_materialization",
-                            {
-                                "selected_action_id": int(selected_candidate.action_id),
-                                "is_action6": bool(selected_candidate.action_id == 6),
-                            },
-                        )
-                    except Exception as exc:
+            if not stop_loss_applied:
+                diagnostics.start("candidate_generation")
+                try:
+                    candidates = build_action_candidates_v1(packet, representation)
+                    if not candidates:
                         diagnostics.finish_rejected(
-                            "action_materialization",
-                            f"action_materialization_error::{type(exc).__name__}",
+                            "candidate_generation",
+                            "no_candidates_generated",
+                        )
+                        selected_candidate = ActionCandidateV1(
+                            candidate_id="reset_no_candidates",
+                            action_id=0,
+                            source="candidate_guard",
                         )
                         action = GameAction.RESET
-                        selected_candidate = ActionCandidateV1(
-                            candidate_id="reset_action_materialization_failure",
-                            action_id=0,
-                            source="action_materialization_guard",
+                        action.reasoning = {
+                            "schema_name": "active_inference_reasoning_v2",
+                            "schema_version": 2,
+                            "phase": phase,
+                            "selected_candidate": selected_candidate.to_dict(),
+                            "reason": "no_candidates",
+                            "hypothesis_summary": self.hypothesis_bank.summary(),
+                            "remaining_budget": int(remaining_budget),
+                            "stage_diagnostics_v1": diagnostics.to_dicts(),
+                            "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
+                        }
+                    else:
+                        diagnostics.finish_ok(
+                            "candidate_generation",
+                            {
+                                "candidate_count": int(len(candidates)),
+                                "action6_candidate_count": int(
+                                    sum(1 for candidate in candidates if candidate.action_id == 6)
+                                ),
+                            },
                         )
 
-                    top_entries = [
-                        entry.to_dict() for entry in ranked_entries[: self.top_k_reasoning]
-                    ]
-                    action.reasoning = {
-                        "schema_name": "active_inference_reasoning_v1",
-                        "schema_version": 1,
-                        "phase": phase,
-                        "selected_candidate": selected_candidate.to_dict(),
-                        "selected_free_energy": (
-                            ranked_entries[0].to_dict() if ranked_entries else None
-                        ),
-                        "top_k_candidates_by_efe": top_entries,
-                        "hypothesis_summary": self.hypothesis_bank.summary(),
-                        "representation_summary": representation.summary,
-                        "causal_event_signature_previous_step": (
-                            causal_signature.to_dict() if causal_signature else None
-                        ),
-                        "stage_diagnostics_v1": diagnostics.to_dicts(),
-                        "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
-                    }
-            except Exception as exc:
-                diagnostics.finish_rejected(
-                    "candidate_generation",
-                    f"candidate_generation_error::{type(exc).__name__}",
-                )
-                action = GameAction.RESET
-                action.reasoning = self._reasoning_for_failure(
-                    packet=packet,
-                    diagnostics=diagnostics,
-                    failure_code="A5_A6_POLICY_PIPELINE_FAILURE",
-                    failure_message=str(exc),
-                )
+                        diagnostics.start("policy_selection")
+                        selected_candidate, ranked_entries = self.policy.select_action(
+                            packet=packet,
+                            representation=representation,
+                            candidates=candidates,
+                            hypothesis_bank=self.hypothesis_bank,
+                            phase=phase,
+                            remaining_budget=remaining_budget,
+                        )
+                        diagnostics.finish_ok(
+                            "policy_selection",
+                            {
+                                "selected_candidate_id": selected_candidate.candidate_id,
+                                "selected_action_id": int(selected_candidate.action_id),
+                                "ranked_count": int(len(ranked_entries)),
+                            },
+                        )
+
+                        diagnostics.start("action_materialization")
+                        try:
+                            action = self._candidate_to_game_action(selected_candidate)
+                            diagnostics.finish_ok(
+                                "action_materialization",
+                                {
+                                    "selected_action_id": int(selected_candidate.action_id),
+                                    "is_action6": bool(selected_candidate.action_id == 6),
+                                },
+                            )
+                        except Exception as exc:
+                            diagnostics.finish_rejected(
+                                "action_materialization",
+                                f"action_materialization_error::{type(exc).__name__}",
+                            )
+                            action = GameAction.RESET
+                            selected_candidate = ActionCandidateV1(
+                                candidate_id="reset_action_materialization_failure",
+                                action_id=0,
+                                source="action_materialization_guard",
+                            )
+
+                        top_entries = [
+                            entry.to_dict() for entry in ranked_entries[: self.top_k_reasoning]
+                        ]
+                        action.reasoning = {
+                            "schema_name": "active_inference_reasoning_v2",
+                            "schema_version": 2,
+                            "phase": phase,
+                            "selected_candidate": selected_candidate.to_dict(),
+                            "selected_free_energy": (
+                                ranked_entries[0].to_dict() if ranked_entries else None
+                            ),
+                            "top_k_candidates_by_efe": top_entries,
+                            "hypothesis_summary": self.hypothesis_bank.summary(),
+                            "representation_summary": representation.summary,
+                            "causal_event_signature_previous_step": (
+                                causal_signature.to_dict() if causal_signature else None
+                            ),
+                            "remaining_budget": int(remaining_budget),
+                            "stage_diagnostics_v1": diagnostics.to_dicts(),
+                            "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
+                        }
+                except Exception as exc:
+                    diagnostics.finish_rejected(
+                        "candidate_generation",
+                        f"candidate_generation_error::{type(exc).__name__}",
+                    )
+                    action = GameAction.RESET
+                    action.reasoning = self._reasoning_for_failure(
+                        packet=packet,
+                        diagnostics=diagnostics,
+                        failure_code="A5_A6_POLICY_PIPELINE_FAILURE",
+                        failure_message=str(exc),
+                    )
 
         if isinstance(action.reasoning, dict):
             action.reasoning.setdefault("stage_diagnostics_v1", diagnostics.to_dicts())
@@ -536,6 +633,8 @@ class ActiveInferenceEFE(Agent):
                     "game_id": self.game_id,
                     "card_id": self.card_id,
                     "action_counter": int(self.action_counter),
+                    "remaining_budget": int(remaining_budget),
+                    "no_change_streak": int(self._no_change_streak),
                     "phase": phase,
                     "observation_packet_summary": self._observation_summary_for_trace(packet),
                     "representation_state": representation_payload,
@@ -570,6 +669,7 @@ class ActiveInferenceEFE(Agent):
                     "card_id": self.card_id,
                     "total_actions_taken": int(self.action_counter),
                     "final_hypothesis_summary": self.hypothesis_bank.summary(),
+                    "final_no_change_streak": int(self._no_change_streak),
                 }
             )
             self.trace_recorder.close()

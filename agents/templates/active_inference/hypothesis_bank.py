@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any
 
 from .contracts import (
     ActionCandidateV1,
@@ -12,12 +12,33 @@ from .contracts import (
     RepresentationStateV1,
 )
 
-_MAGNITUDE_ORDER = {
-    "none": 0,
-    "small": 1,
-    "medium": 2,
-    "large": 3,
-}
+OBS_CHANGE_TYPES: tuple[str, ...] = (
+    "NO_CHANGE",
+    "LOCAL_COLOR_CHANGE",
+    "CC_TRANSLATION",
+    "CC_COUNT_CHANGE",
+    "GLOBAL_PATTERN_CHANGE",
+    "METADATA_PROGRESS_CHANGE",
+    "OBSERVED_UNCLASSIFIED",
+)
+
+EPS = 1.0e-9
+
+
+@dataclass(slots=True)
+class RuleFamilySpecV1:
+    family_id: str
+    parameter_ids: list[str]
+    base_mdl_bits: float
+
+
+@dataclass(slots=True)
+class HypothesisInstanceV1:
+    hypothesis_id: str
+    mode_id: str
+    family_id: str
+    parameter_id: str
+    mdl_bits: float
 
 
 def _color_value(cell_any: object) -> int:
@@ -47,18 +68,25 @@ def _safe_entropy(distribution: dict[str, float]) -> float:
     return float(entropy)
 
 
-def _magnitude_from_changed_pixels(
-    changed_pixel_count: int, frame_height: int, frame_width: int
-) -> str:
-    total = max(1, int(frame_height) * int(frame_width))
-    ratio = float(changed_pixel_count) / float(total)
-    if changed_pixel_count <= 0:
-        return "none"
-    if ratio < 0.01:
-        return "small"
-    if ratio < 0.08:
-        return "medium"
-    return "large"
+def _normalize_distribution(values: dict[str, float]) -> dict[str, float]:
+    total = sum(max(0.0, float(v)) for v in values.values())
+    if total <= EPS:
+        if not values:
+            return {}
+        uniform = 1.0 / float(len(values))
+        return {key: uniform for key in values}
+    return {key: max(0.0, float(v)) / total for (key, v) in values.items()}
+
+
+def _signature_key(obs_change_type: str, progress_flag: bool) -> str:
+    return f"type={obs_change_type}|progress={int(progress_flag)}"
+
+
+def signature_key_from_event(signature: CausalEventSignatureV1) -> str:
+    return _signature_key(
+        str(signature.obs_change_type),
+        bool(int(signature.level_delta) > 0),
+    )
 
 
 def _state_transition(previous_state: str, current_state: str) -> str:
@@ -109,6 +137,106 @@ def _changed_pixels_and_bbox(
     return (changed, (int(min_x), int(min_y), int(max_x), int(max_y)))
 
 
+def _palette_delta_topk(
+    previous_frame: list[list[int]],
+    current_frame: list[list[int]],
+    top_k: int = 5,
+) -> dict[str, int]:
+    prev_hist: dict[int, int] = {}
+    curr_hist: dict[int, int] = {}
+
+    for row in previous_frame:
+        for value in row:
+            color = _color_value(value)
+            prev_hist[color] = prev_hist.get(color, 0) + 1
+
+    for row in current_frame:
+        for value in row:
+            color = _color_value(value)
+            curr_hist[color] = curr_hist.get(color, 0) + 1
+
+    delta: list[tuple[int, int]] = []
+    for color in set(prev_hist.keys()) | set(curr_hist.keys()):
+        diff = int(curr_hist.get(color, 0) - prev_hist.get(color, 0))
+        if diff != 0:
+            delta.append((color, diff))
+
+    delta.sort(key=lambda item: (abs(item[1]), item[0]), reverse=True)
+    return {str(color): int(diff) for (color, diff) in delta[:top_k]}
+
+
+def _component_translation_matches(
+    previous_representation: RepresentationStateV1,
+    current_representation: RepresentationStateV1,
+) -> int:
+    prev_nodes = previous_representation.component_views.get("same_color_8", [])
+    curr_nodes = current_representation.component_views.get("same_color_8", [])
+    if not prev_nodes or not curr_nodes:
+        return 0
+
+    matched = 0
+    used_curr: set[str] = set()
+    for prev in prev_nodes:
+        best = None
+        best_score = 10**9
+        for curr in curr_nodes:
+            if curr.component_id in used_curr:
+                continue
+            if prev.color_signature != curr.color_signature:
+                continue
+            area_gap = abs(int(prev.area) - int(curr.area))
+            if area_gap > max(2, int(prev.area * 0.2)):
+                continue
+            centroid_gap = abs(int(prev.centroid_x) - int(curr.centroid_x)) + abs(
+                int(prev.centroid_y) - int(curr.centroid_y)
+            )
+            score = area_gap * 10 + centroid_gap
+            if score < best_score:
+                best_score = score
+                best = curr
+        if best is None:
+            continue
+        shift = abs(int(prev.centroid_x) - int(best.centroid_x)) + abs(
+            int(prev.centroid_y) - int(best.centroid_y)
+        )
+        if shift > 0:
+            matched += 1
+        used_curr.add(best.component_id)
+    return int(matched)
+
+
+def _classify_observed_change_type(
+    *,
+    changed_pixel_count: int,
+    changed_area_ratio: float,
+    level_delta: int,
+    state_transition: str,
+    changed_object_count: int,
+    object_count_delta: int,
+    translation_match_count: int,
+    palette_delta_total: int,
+) -> str:
+    if changed_pixel_count <= 0 and level_delta <= 0:
+        return "NO_CHANGE"
+
+    if level_delta > 0 or state_transition.endswith("->WIN"):
+        return "METADATA_PROGRESS_CHANGE"
+
+    if object_count_delta != 0:
+        return "CC_COUNT_CHANGE"
+
+    if translation_match_count > 0 and changed_area_ratio < 0.35:
+        return "CC_TRANSLATION"
+
+    if changed_area_ratio >= 0.35:
+        return "GLOBAL_PATTERN_CHANGE"
+
+    if changed_pixel_count > 0 and changed_area_ratio < 0.12 and palette_delta_total > 0:
+        return "LOCAL_COLOR_CHANGE"
+
+    return "OBSERVED_UNCLASSIFIED"
+
+
 def build_causal_event_signature_v1(
     previous_packet: ObservationPacketV1,
     current_packet: ObservationPacketV1,
@@ -119,17 +247,40 @@ def build_causal_event_signature_v1(
     changed_pixels, changed_bbox = _changed_pixels_and_bbox(
         previous_packet.frame, current_packet.frame
     )
+
+    frame_area = max(1, int(previous_representation.frame_height) * int(previous_representation.frame_width))
+    changed_area_ratio = float(changed_pixels) / float(frame_area)
+
     level_delta = int(current_packet.levels_completed - previous_packet.levels_completed)
     state_transition = _state_transition(previous_packet.state, current_packet.state)
+
     previous_digests = {obj.digest for obj in previous_representation.object_nodes}
     current_digests = {obj.digest for obj in current_representation.object_nodes}
     changed_object_count = len(previous_digests.symmetric_difference(current_digests))
+    object_count_delta = int(
+        len(current_representation.object_nodes) - len(previous_representation.object_nodes)
+    )
 
-    tags: list[str] = []
-    if changed_pixels == 0:
-        tags.append("no_change")
-    else:
-        tags.append("pixel_change")
+    palette_delta = _palette_delta_topk(previous_packet.frame, current_packet.frame)
+    palette_delta_total = sum(abs(int(v)) for v in palette_delta.values())
+
+    translation_match_count = _component_translation_matches(
+        previous_representation,
+        current_representation,
+    )
+
+    obs_change_type = _classify_observed_change_type(
+        changed_pixel_count=changed_pixels,
+        changed_area_ratio=changed_area_ratio,
+        level_delta=level_delta,
+        state_transition=state_transition,
+        changed_object_count=changed_object_count,
+        object_count_delta=object_count_delta,
+        translation_match_count=translation_match_count,
+        palette_delta_total=palette_delta_total,
+    )
+
+    tags: list[str] = [str(obs_change_type).lower()]
     if level_delta > 0:
         tags.append("progress")
     if executed_action.action_id == 6:
@@ -137,12 +288,27 @@ def build_causal_event_signature_v1(
     if changed_object_count > 0:
         tags.append("object_change")
 
+    cc_match_summary = {
+        "previous_same8_count": int(
+            len(previous_representation.component_views.get("same_color_8", []))
+        ),
+        "current_same8_count": int(
+            len(current_representation.component_views.get("same_color_8", []))
+        ),
+        "translation_match_count": int(translation_match_count),
+        "object_count_delta": int(object_count_delta),
+    }
+
     digest_source = {
+        "obs_change_type": obs_change_type,
         "changed_pixels": changed_pixels,
         "changed_bbox": changed_bbox,
+        "changed_area_ratio": round(changed_area_ratio, 6),
         "level_delta": level_delta,
         "state_transition": state_transition,
         "changed_object_count": changed_object_count,
+        "palette_delta": palette_delta,
+        "cc_match_summary": cc_match_summary,
         "tags": sorted(tags),
     }
     signature_digest = hashlib.sha256(
@@ -150,137 +316,304 @@ def build_causal_event_signature_v1(
     ).hexdigest()[:24]
 
     return CausalEventSignatureV1(
-        schema_name="active_inference_causal_event_signature_v1",
-        schema_version=1,
+        schema_name="active_inference_causal_event_signature_v2",
+        schema_version=2,
+        obs_change_type=str(obs_change_type),
         changed_pixel_count=int(changed_pixels),
         changed_bbox=changed_bbox,
+        changed_area_ratio=float(changed_area_ratio),
         level_delta=int(level_delta),
         state_transition=state_transition,
         changed_object_count=int(changed_object_count),
         event_tags=sorted(tags),
+        palette_delta_topk=palette_delta,
+        cc_match_summary=cc_match_summary,
         signature_digest=signature_digest,
     )
 
 
-@dataclass(slots=True)
-class TransitionHypothesisV1:
-    hypothesis_id: str
-    family: str
-    mdl_bits: float
-    predict_fn: Callable[
-        [ObservationPacketV1, ActionCandidateV1, RepresentationStateV1], tuple[str, bool]
+def _rule_family_specs() -> list[RuleFamilySpecV1]:
+    return [
+        RuleFamilySpecV1("no_op_guard", ["strict_noop"], 10.0),
+        RuleFamilySpecV1("navigation", ["axis_shift", "cursor_step"], 14.0),
+        RuleFamilySpecV1("local_transform", ["require_hit_object", "allow_any_click"], 16.0),
+        RuleFamilySpecV1("global_transform", ["wide_change"], 20.0),
+        RuleFamilySpecV1("progress_trigger", ["on_hit", "on_confirm"], 18.0),
     ]
 
-    def predict(
-        self,
-        packet: ObservationPacketV1,
-        candidate: ActionCandidateV1,
-        representation: RepresentationStateV1,
-    ) -> tuple[str, bool]:
-        return self.predict_fn(packet, candidate, representation)
+
+def _all_signature_keys() -> list[str]:
+    out: list[str] = []
+    for obs_type in OBS_CHANGE_TYPES:
+        for progress in (0, 1):
+            out.append(_signature_key(obs_type, bool(progress)))
+    return out
 
 
-def _pred_sparse(
+def _context_features(
     packet: ObservationPacketV1,
     candidate: ActionCandidateV1,
     representation: RepresentationStateV1,
-) -> tuple[str, bool]:
-    if candidate.action_id == 0:
-        return ("large", False)
-    if candidate.action_id == 6:
-        return ("small", False)
-    return ("small", False)
+) -> dict[str, Any]:
+    coord_context = candidate.metadata.get("coordinate_context_feature", {})
+    hit_object = int(coord_context.get("hit_object", -1))
+    on_boundary = int(coord_context.get("on_boundary", -1))
+    dist_bucket = str(coord_context.get("distance_to_nearest_object_bucket", "na"))
+
+    object_count = int(representation.summary.get("object_count", 0))
+    if object_count <= 0:
+        object_count_bucket = "zero"
+    elif object_count <= 3:
+        object_count_bucket = "few"
+    elif object_count <= 9:
+        object_count_bucket = "mid"
+    else:
+        object_count_bucket = "many"
+
+    mixed8_count = int(
+        representation.summary.get("component_view_summary", {})
+        .get("mixed_color_8", {})
+        .get("count", 0)
+    )
+
+    return {
+        "action_id": int(candidate.action_id),
+        "is_action6": int(candidate.action_id == 6),
+        "is_action5": int(candidate.action_id == 5),
+        "is_action7": int(candidate.action_id == 7),
+        "hit_object": int(hit_object),
+        "on_boundary": int(on_boundary),
+        "distance_bucket": dist_bucket,
+        "object_count_bucket": object_count_bucket,
+        "mixed8_count": int(mixed8_count),
+        "levels_completed": int(packet.levels_completed),
+        "progress_gap": int(max(0, packet.win_levels - packet.levels_completed)),
+    }
 
 
-def _pred_navigation(
-    packet: ObservationPacketV1,
-    candidate: ActionCandidateV1,
-    representation: RepresentationStateV1,
-) -> tuple[str, bool]:
-    if candidate.action_id in (1, 2, 3, 4):
-        return ("small", False)
-    if candidate.action_id in (5, 7):
-        return ("medium", False)
-    if candidate.action_id == 6:
-        return ("medium", False)
-    return ("large", False)
+def _impossible_signature_keys(
+    family_id: str,
+    parameter_id: str,
+    features: dict[str, Any],
+) -> set[str]:
+    impossible: set[str] = set()
+
+    if family_id == "no_op_guard":
+        impossible.add(_signature_key("METADATA_PROGRESS_CHANGE", True))
+
+    if family_id == "local_transform" and parameter_id == "require_hit_object":
+        if int(features.get("hit_object", -1)) == 0:
+            impossible.add(_signature_key("LOCAL_COLOR_CHANGE", False))
+            impossible.add(_signature_key("CC_COUNT_CHANGE", False))
+
+    if family_id == "navigation":
+        impossible.add(_signature_key("METADATA_PROGRESS_CHANGE", True))
+
+    return impossible
 
 
-def _pred_trigger(
-    packet: ObservationPacketV1,
-    candidate: ActionCandidateV1,
-    representation: RepresentationStateV1,
-) -> tuple[str, bool]:
-    if candidate.action_id in (5, 6):
-        return ("large", True)
-    if candidate.action_id == 7:
-        return ("medium", False)
-    return ("small", False)
+def _predict_distribution_for_hypothesis(
+    *,
+    family_id: str,
+    parameter_id: str,
+    mode_id: str,
+    features: dict[str, Any],
+) -> dict[str, float]:
+    action_id = int(features.get("action_id", -1))
+    is_action6 = bool(int(features.get("is_action6", 0)) == 1)
+    is_action5 = bool(int(features.get("is_action5", 0)) == 1)
+    is_action7 = bool(int(features.get("is_action7", 0)) == 1)
+    hit_object = int(features.get("hit_object", -1))
+    progress_gap = int(features.get("progress_gap", 0))
+
+    distribution: dict[str, float] = {
+        _signature_key("OBSERVED_UNCLASSIFIED", False): 1.0
+    }
+
+    if family_id == "no_op_guard":
+        distribution = {
+            _signature_key("NO_CHANGE", False): 0.86,
+            _signature_key("LOCAL_COLOR_CHANGE", False): 0.12,
+            _signature_key("OBSERVED_UNCLASSIFIED", False): 0.02,
+        }
+
+    elif family_id == "navigation":
+        if action_id in (1, 2, 3, 4):
+            distribution = {
+                _signature_key("CC_TRANSLATION", False): 0.58,
+                _signature_key("NO_CHANGE", False): 0.22,
+                _signature_key("LOCAL_COLOR_CHANGE", False): 0.12,
+                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.08,
+            }
+        elif is_action7:
+            distribution = {
+                _signature_key("CC_TRANSLATION", False): 0.34,
+                _signature_key("NO_CHANGE", False): 0.48,
+                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.18,
+            }
+
+    elif family_id == "local_transform":
+        if is_action6 and hit_object == 1:
+            distribution = {
+                _signature_key("LOCAL_COLOR_CHANGE", False): 0.56,
+                _signature_key("CC_COUNT_CHANGE", False): 0.16,
+                _signature_key("CC_TRANSLATION", False): 0.12,
+                _signature_key("NO_CHANGE", False): 0.08,
+                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.08,
+            }
+        elif is_action6 and hit_object == 0:
+            if parameter_id == "require_hit_object":
+                distribution = {
+                    _signature_key("NO_CHANGE", False): 0.76,
+                    _signature_key("OBSERVED_UNCLASSIFIED", False): 0.24,
+                }
+            else:
+                distribution = {
+                    _signature_key("LOCAL_COLOR_CHANGE", False): 0.26,
+                    _signature_key("NO_CHANGE", False): 0.56,
+                    _signature_key("OBSERVED_UNCLASSIFIED", False): 0.18,
+                }
+
+    elif family_id == "global_transform":
+        if is_action5 or is_action6:
+            distribution = {
+                _signature_key("GLOBAL_PATTERN_CHANGE", False): 0.46,
+                _signature_key("CC_COUNT_CHANGE", False): 0.22,
+                _signature_key("LOCAL_COLOR_CHANGE", False): 0.10,
+                _signature_key("NO_CHANGE", False): 0.10,
+                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.12,
+            }
+
+    elif family_id == "progress_trigger":
+        if (is_action6 and hit_object == 1 and progress_gap > 0) or (
+            is_action5 and parameter_id == "on_confirm" and progress_gap > 0
+        ):
+            distribution = {
+                _signature_key("METADATA_PROGRESS_CHANGE", True): 0.42,
+                _signature_key("LOCAL_COLOR_CHANGE", False): 0.16,
+                _signature_key("GLOBAL_PATTERN_CHANGE", False): 0.12,
+                _signature_key("NO_CHANGE", False): 0.14,
+                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.16,
+            }
+        else:
+            distribution = {
+                _signature_key("NO_CHANGE", False): 0.44,
+                _signature_key("LOCAL_COLOR_CHANGE", False): 0.24,
+                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.32,
+            }
+
+    if mode_id == "confirm":
+        distribution[_signature_key("METADATA_PROGRESS_CHANGE", True)] = (
+            distribution.get(_signature_key("METADATA_PROGRESS_CHANGE", True), 0.0) + 0.06
+        )
+
+    impossible = _impossible_signature_keys(family_id, parameter_id, features)
+    for key in impossible:
+        distribution[key] = 0.0
+
+    return _normalize_distribution(distribution)
 
 
-def _pred_action6_focused(
-    packet: ObservationPacketV1,
-    candidate: ActionCandidateV1,
-    representation: RepresentationStateV1,
-) -> tuple[str, bool]:
-    if candidate.action_id == 6:
-        return ("medium", False)
-    return ("small", False)
+def _transition_mode(mode_id: str, action_id: int, observed_signature_key: str) -> str:
+    if observed_signature_key.endswith("progress=1"):
+        return "confirm"
+    if action_id in (1, 2, 3, 4):
+        return "navigate"
+    if action_id in (5, 6):
+        return "interact"
+    if action_id == 7:
+        return "navigate"
+    return mode_id
 
 
 class ActiveInferenceHypothesisBankV1:
     def __init__(self) -> None:
-        self.hypotheses: list[TransitionHypothesisV1] = [
-            TransitionHypothesisV1(
-                hypothesis_id="h_sparse_v1",
-                family="sparse_dynamics",
-                mdl_bits=12.0,
-                predict_fn=_pred_sparse,
-            ),
-            TransitionHypothesisV1(
-                hypothesis_id="h_navigation_v1",
-                family="navigation_dynamics",
-                mdl_bits=20.0,
-                predict_fn=_pred_navigation,
-            ),
-            TransitionHypothesisV1(
-                hypothesis_id="h_trigger_v1",
-                family="trigger_dynamics",
-                mdl_bits=26.0,
-                predict_fn=_pred_trigger,
-            ),
-            TransitionHypothesisV1(
-                hypothesis_id="h_action6_focused_v1",
-                family="action6_focus",
-                mdl_bits=18.0,
-                predict_fn=_pred_action6_focused,
-            ),
-        ]
+        self.modes: list[str] = ["unknown", "navigate", "interact", "confirm"]
+        self.family_specs: list[RuleFamilySpecV1] = _rule_family_specs()
+        self.signature_space: list[str] = _all_signature_keys()
+
+        self.hypotheses: list[HypothesisInstanceV1] = []
+        self._hypothesis_index_by_triplet: dict[tuple[str, str, str], str] = {}
+
+        for mode_id in self.modes:
+            for family_spec in self.family_specs:
+                for parameter_id in family_spec.parameter_ids:
+                    hypothesis_id = (
+                        f"h::{mode_id}::{family_spec.family_id}::{parameter_id}"
+                    )
+                    mdl_bits = float(
+                        family_spec.base_mdl_bits
+                        + (0.75 * len(parameter_id))
+                        + (0.25 * len(mode_id))
+                    )
+                    hypothesis = HypothesisInstanceV1(
+                        hypothesis_id=hypothesis_id,
+                        mode_id=mode_id,
+                        family_id=family_spec.family_id,
+                        parameter_id=parameter_id,
+                        mdl_bits=mdl_bits,
+                    )
+                    self.hypotheses.append(hypothesis)
+                    self._hypothesis_index_by_triplet[
+                        (mode_id, family_spec.family_id, parameter_id)
+                    ] = hypothesis_id
+
         prior = 1.0 / float(max(1, len(self.hypotheses)))
         self.posterior_by_hypothesis_id: dict[str, float] = {
-            h.hypothesis_id: prior for h in self.hypotheses
+            hypothesis.hypothesis_id: prior for hypothesis in self.hypotheses
         }
         self.last_update: dict[str, float] = {}
+        self.last_vfe_bits: float = 0.0
+        self.last_observed_signature: str = ""
 
-    def _renormalize(self) -> None:
-        total = sum(max(0.0, w) for w in self.posterior_by_hypothesis_id.values())
-        if total <= 1.0e-12:
+    def _renormalize(self, posterior: dict[str, float]) -> dict[str, float]:
+        total = sum(max(0.0, weight) for weight in posterior.values())
+        if total <= EPS:
             uniform = 1.0 / float(max(1, len(self.hypotheses)))
-            for h in self.hypotheses:
-                self.posterior_by_hypothesis_id[h.hypothesis_id] = uniform
-            return
-        for hid in list(self.posterior_by_hypothesis_id.keys()):
-            self.posterior_by_hypothesis_id[hid] = float(
-                max(0.0, self.posterior_by_hypothesis_id[hid]) / total
-            )
+            return {hypothesis.hypothesis_id: uniform for hypothesis in self.hypotheses}
+        return {
+            hid: float(max(0.0, posterior.get(hid, 0.0)) / total)
+            for hid in posterior
+        }
 
     def posterior_entropy(self) -> float:
-        return _safe_entropy(
-            {
-                hypothesis_id: weight
-                for (hypothesis_id, weight) in self.posterior_by_hypothesis_id.items()
-            }
-        )
+        return _safe_entropy(self.posterior_by_hypothesis_id)
+
+    def current_vfe_bits(self) -> float:
+        return float(self.last_vfe_bits)
+
+    def partition_distribution(
+        self,
+        partition_key: str,
+        *,
+        posterior: dict[str, float] | None = None,
+    ) -> dict[str, float]:
+        posterior_used = posterior or self.posterior_by_hypothesis_id
+        out: dict[str, float] = {}
+
+        for hypothesis in self.hypotheses:
+            weight = float(posterior_used.get(hypothesis.hypothesis_id, 0.0))
+            if weight <= 0.0:
+                continue
+            if partition_key == "action_semantics":
+                key = hypothesis.family_id
+            elif partition_key == "mechanism_dynamics":
+                key = f"{hypothesis.family_id}:{hypothesis.parameter_id}"
+            elif partition_key == "causal_mapping":
+                key = hypothesis.mode_id
+            else:
+                key = "unknown"
+            out[key] = out.get(key, 0.0) + weight
+
+        return _normalize_distribution(out)
+
+    def partition_entropy(
+        self,
+        partition_key: str,
+        *,
+        posterior: dict[str, float] | None = None,
+    ) -> float:
+        return _safe_entropy(self.partition_distribution(partition_key, posterior=posterior))
 
     def summary(self) -> dict[str, object]:
         ranked = sorted(
@@ -288,10 +621,17 @@ class ActiveInferenceHypothesisBankV1:
             key=lambda item: (-item[1], item[0]),
         )
         return {
-            "schema_name": "active_inference_hypothesis_summary_v1",
-            "schema_version": 1,
+            "schema_name": "active_inference_hypothesis_summary_v2",
+            "schema_version": 2,
             "posterior_entropy_bits": float(self.posterior_entropy()),
             "active_hypothesis_count": int(len(self.hypotheses)),
+            "partition_entropy": {
+                "action_semantics": float(self.partition_entropy("action_semantics")),
+                "mechanism_dynamics": float(
+                    self.partition_entropy("mechanism_dynamics")
+                ),
+                "causal_mapping": float(self.partition_entropy("causal_mapping")),
+            },
             "posterior_by_hypothesis_id": {
                 hypothesis_id: float(weight) for (hypothesis_id, weight) in ranked
             },
@@ -299,6 +639,69 @@ class ActiveInferenceHypothesisBankV1:
                 hypothesis_id: float(weight)
                 for (hypothesis_id, weight) in sorted(self.last_update.items())
             },
+            "last_vfe_bits": float(self.last_vfe_bits),
+            "last_observed_signature": self.last_observed_signature,
+        }
+
+    def _predict_distribution_for_hypothesis(
+        self,
+        hypothesis: HypothesisInstanceV1,
+        features: dict[str, Any],
+    ) -> dict[str, float]:
+        return _predict_distribution_for_hypothesis(
+            family_id=hypothesis.family_id,
+            parameter_id=hypothesis.parameter_id,
+            mode_id=hypothesis.mode_id,
+            features=features,
+        )
+
+    def predictive_statistics(
+        self,
+        packet: ObservationPacketV1,
+        candidate: ActionCandidateV1,
+        representation: RepresentationStateV1,
+        *,
+        posterior: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        posterior_used = posterior or self.posterior_by_hypothesis_id
+        features = _context_features(packet, candidate, representation)
+
+        predictive_distribution: dict[str, float] = {}
+        supports: dict[str, list[str]] = {}
+        hypothesis_signature: dict[str, str] = {}
+        expected_mdl_bits = 0.0
+        per_hypothesis_distribution: dict[str, dict[str, float]] = {}
+
+        for hypothesis in self.hypotheses:
+            weight = float(posterior_used.get(hypothesis.hypothesis_id, 0.0))
+            if weight <= 0.0:
+                continue
+
+            distribution_h = self._predict_distribution_for_hypothesis(hypothesis, features)
+            per_hypothesis_distribution[hypothesis.hypothesis_id] = distribution_h
+
+            best_key = max(distribution_h.items(), key=lambda item: item[1])[0]
+            hypothesis_signature[hypothesis.hypothesis_id] = best_key
+            expected_mdl_bits += weight * float(hypothesis.mdl_bits)
+
+            for signature_key, probability in distribution_h.items():
+                p = float(probability)
+                if p <= 0.0:
+                    continue
+                predictive_distribution[signature_key] = (
+                    predictive_distribution.get(signature_key, 0.0) + (weight * p)
+                )
+                supports.setdefault(signature_key, []).append(hypothesis.hypothesis_id)
+
+        predictive_distribution = _normalize_distribution(predictive_distribution)
+
+        return {
+            "features": features,
+            "predictive_distribution": predictive_distribution,
+            "supports_by_signature": supports,
+            "expected_mdl_bits": float(expected_mdl_bits),
+            "hypothesis_signature": hypothesis_signature,
+            "per_hypothesis_distribution": per_hypothesis_distribution,
         }
 
     def predictive_distribution(
@@ -307,25 +710,143 @@ class ActiveInferenceHypothesisBankV1:
         candidate: ActionCandidateV1,
         representation: RepresentationStateV1,
     ) -> tuple[dict[str, float], dict[str, list[str]], float, dict[str, str]]:
-        distribution: dict[str, float] = {}
-        supports: dict[str, list[str]] = {}
-        hypothesis_signature: dict[str, str] = {}
-        expected_mdl = 0.0
+        stats = self.predictive_statistics(packet, candidate, representation)
+        return (
+            stats["predictive_distribution"],
+            stats["supports_by_signature"],
+            float(stats["expected_mdl_bits"]),
+            stats["hypothesis_signature"],
+        )
 
+    def expected_ambiguity(
+        self,
+        packet: ObservationPacketV1,
+        candidate: ActionCandidateV1,
+        representation: RepresentationStateV1,
+        *,
+        posterior: dict[str, float] | None = None,
+    ) -> float:
+        posterior_used = posterior or self.posterior_by_hypothesis_id
+        stats = self.predictive_statistics(
+            packet,
+            candidate,
+            representation,
+            posterior=posterior_used,
+        )
+        per_h = stats["per_hypothesis_distribution"]
+        ambiguity = 0.0
+        for hypothesis_id, distribution in per_h.items():
+            weight = float(posterior_used.get(hypothesis_id, 0.0))
+            if weight <= 0.0:
+                continue
+            ambiguity += weight * _safe_entropy(distribution)
+        return float(max(0.0, ambiguity))
+
+    def posterior_after_signature(
+        self,
+        packet: ObservationPacketV1,
+        candidate: ActionCandidateV1,
+        representation: RepresentationStateV1,
+        observed_signature_key: str,
+        *,
+        posterior: dict[str, float] | None = None,
+    ) -> dict[str, float]:
+        posterior_used = posterior or self.posterior_by_hypothesis_id
+        features = _context_features(packet, candidate, representation)
+        mdl_lambda = 0.015
+
+        updated: dict[str, float] = {}
         for hypothesis in self.hypotheses:
-            weight = float(self.posterior_by_hypothesis_id.get(hypothesis.hypothesis_id, 0.0))
-            signature = hypothesis.predict(packet, candidate, representation)
-            signature_key = f"magnitude={signature[0]}|progress={int(signature[1])}"
-            distribution[signature_key] = distribution.get(signature_key, 0.0) + weight
-            supports.setdefault(signature_key, []).append(hypothesis.hypothesis_id)
-            hypothesis_signature[hypothesis.hypothesis_id] = signature_key
-            expected_mdl += weight * float(hypothesis.mdl_bits)
+            prior = float(posterior_used.get(hypothesis.hypothesis_id, 0.0))
+            if prior <= 0.0:
+                updated[hypothesis.hypothesis_id] = 0.0
+                continue
 
-        total = sum(distribution.values())
-        if total > 1.0e-12:
-            for key in list(distribution.keys()):
-                distribution[key] = float(distribution[key] / total)
-        return distribution, supports, float(expected_mdl), hypothesis_signature
+            distribution_h = self._predict_distribution_for_hypothesis(hypothesis, features)
+            likelihood = float(distribution_h.get(observed_signature_key, 0.0))
+            penalized_prior = prior * math.exp(-mdl_lambda * (float(hypothesis.mdl_bits) / 64.0))
+            updated[hypothesis.hypothesis_id] = penalized_prior * max(EPS, likelihood)
+
+        updated = self._renormalize(updated)
+
+        transitioned: dict[str, float] = {
+            hypothesis.hypothesis_id: 0.0 for hypothesis in self.hypotheses
+        }
+        for hypothesis in self.hypotheses:
+            weight = float(updated.get(hypothesis.hypothesis_id, 0.0))
+            if weight <= 0.0:
+                continue
+            next_mode = _transition_mode(
+                hypothesis.mode_id,
+                int(candidate.action_id),
+                observed_signature_key,
+            )
+            target_id = self._hypothesis_index_by_triplet.get(
+                (next_mode, hypothesis.family_id, hypothesis.parameter_id),
+                hypothesis.hypothesis_id,
+            )
+            transitioned[target_id] = transitioned.get(target_id, 0.0) + weight
+
+        return self._renormalize(transitioned)
+
+    def split_information_gain(
+        self,
+        packet: ObservationPacketV1,
+        candidate: ActionCandidateV1,
+        representation: RepresentationStateV1,
+        *,
+        posterior: dict[str, float] | None = None,
+    ) -> dict[str, float]:
+        posterior_used = posterior or self.posterior_by_hypothesis_id
+        stats = self.predictive_statistics(
+            packet,
+            candidate,
+            representation,
+            posterior=posterior_used,
+        )
+        predictive_distribution = stats["predictive_distribution"]
+
+        out: dict[str, float] = {}
+        for partition_key in (
+            "action_semantics",
+            "mechanism_dynamics",
+            "causal_mapping",
+        ):
+            prior_entropy = self.partition_entropy(
+                partition_key,
+                posterior=posterior_used,
+            )
+            expected_posterior_entropy = 0.0
+            for signature_key, probability in predictive_distribution.items():
+                p = float(probability)
+                if p <= 0.0:
+                    continue
+                posterior_after = self.posterior_after_signature(
+                    packet,
+                    candidate,
+                    representation,
+                    signature_key,
+                    posterior=posterior_used,
+                )
+                expected_posterior_entropy += p * self.partition_entropy(
+                    partition_key,
+                    posterior=posterior_after,
+                )
+
+            out[partition_key] = float(max(0.0, prior_entropy - expected_posterior_entropy))
+
+        return out
+
+    def with_posterior(
+        self,
+        posterior: dict[str, float],
+    ) -> ActiveInferenceHypothesisBankV1:
+        cloned = ActiveInferenceHypothesisBankV1()
+        cloned.posterior_by_hypothesis_id = cloned._renormalize(dict(posterior))
+        cloned.last_update = dict(self.last_update)
+        cloned.last_vfe_bits = float(self.last_vfe_bits)
+        cloned.last_observed_signature = str(self.last_observed_signature)
+        return cloned
 
     def update_with_observation(
         self,
@@ -335,33 +856,25 @@ class ActiveInferenceHypothesisBankV1:
         previous_representation: RepresentationStateV1,
         observed_signature: CausalEventSignatureV1,
     ) -> None:
-        observed_magnitude = _magnitude_from_changed_pixels(
-            observed_signature.changed_pixel_count,
-            previous_representation.frame_height,
-            previous_representation.frame_width,
+        observed_signature_key = signature_key_from_event(observed_signature)
+
+        stats_before = self.predictive_statistics(
+            previous_packet,
+            executed_candidate,
+            previous_representation,
+            posterior=self.posterior_by_hypothesis_id,
         )
-        observed_progress = bool(observed_signature.level_delta > 0)
-        observed_order = _MAGNITUDE_ORDER[observed_magnitude]
+        predictive_distribution = stats_before["predictive_distribution"]
+        p_obs = float(predictive_distribution.get(observed_signature_key, EPS))
+        self.last_vfe_bits = float(-math.log2(max(EPS, p_obs)))
+        self.last_observed_signature = observed_signature_key
 
-        beta = 1.35
-        mdl_lambda = 0.01
-
-        updated: dict[str, float] = {}
-        for hypothesis in self.hypotheses:
-            predicted_magnitude, predicted_progress = hypothesis.predict(
-                previous_packet, executed_candidate, previous_representation
-            )
-            predicted_order = _MAGNITUDE_ORDER[predicted_magnitude]
-            mismatch_cost = 0.75 * abs(predicted_order - observed_order)
-            if bool(predicted_progress) != observed_progress:
-                mismatch_cost += 1.25
-            old_weight = float(
-                self.posterior_by_hypothesis_id.get(hypothesis.hypothesis_id, 0.0)
-            )
-            new_weight = old_weight * math.exp(-beta * mismatch_cost)
-            new_weight *= math.exp(-mdl_lambda * (float(hypothesis.mdl_bits) / 64.0))
-            updated[hypothesis.hypothesis_id] = float(new_weight)
-
-        self.posterior_by_hypothesis_id = updated
-        self._renormalize()
+        previous_posterior = dict(self.posterior_by_hypothesis_id)
+        self.posterior_by_hypothesis_id = self.posterior_after_signature(
+            previous_packet,
+            executed_candidate,
+            previous_representation,
+            observed_signature_key,
+            posterior=previous_posterior,
+        )
         self.last_update = dict(self.posterior_by_hypothesis_id)

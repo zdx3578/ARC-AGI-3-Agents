@@ -52,11 +52,17 @@ def test_representation_and_action6_candidates_expose_coverage() -> None:
     assert representation.summary["object_count"] >= 1
     assert representation.summary["action6_coordinate_proposal_count"] >= 1
     assert representation.summary["action6_coordinate_proposal_coverage"] > 0.0
+    assert "same_color_4" in representation.component_views
+    assert "same_color_8" in representation.component_views
+    assert "mixed_color_4" in representation.component_views
+    assert "mixed_color_8" in representation.component_views
+    assert representation.hierarchy_links
 
     candidates = build_action_candidates_v1(packet, representation)
     action6 = [candidate for candidate in candidates if candidate.action_id == 6]
     assert action6
     assert "proposal_coverage" in action6[0].metadata
+    assert "coordinate_context_feature" in action6[0].metadata
 
 
 @pytest.mark.unit
@@ -71,7 +77,9 @@ def test_policy_accepts_weight_override() -> None:
     candidates = build_action_candidates_v1(packet, representation)
     bank = ActiveInferenceHypothesisBankV1()
     policy = ActiveInferencePolicyEvaluatorV1(
-        weight_overrides={"explore": {"information_gain": 1.75}}
+        weight_overrides={
+            "explore": {"information_gain_mechanism_dynamics": 1.75}
+        }
     )
     entries = policy.evaluate_candidates(
         packet=packet,
@@ -81,7 +89,28 @@ def test_policy_accepts_weight_override() -> None:
         phase="explore",
     )
     assert entries
-    assert entries[0].witness["weights"]["information_gain"] == pytest.approx(1.75)
+    assert entries[0].witness["weights"]["information_gain_mechanism_dynamics"] == pytest.approx(1.75)
+    assert entries[0].information_gain_mechanism_dynamics >= 0.0
+
+
+@pytest.mark.unit
+def test_hypothesis_bank_split_information_gain_contract() -> None:
+    packet = build_observation_packet_v1(
+        _frame_data_stub(),
+        game_id="ls20",
+        card_id="card-x",
+        action_counter=2,
+    )
+    representation = build_representation_state_v1(packet)
+    candidates = build_action_candidates_v1(packet, representation)
+    bank = ActiveInferenceHypothesisBankV1()
+    split = bank.split_information_gain(packet, candidates[0], representation)
+    assert set(split.keys()) == {
+        "action_semantics",
+        "mechanism_dynamics",
+        "causal_mapping",
+    }
+    assert all(value >= 0.0 for value in split.values())
 
 
 @pytest.mark.unit

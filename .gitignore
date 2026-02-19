@@ -1,5 +1,6 @@
 # OS and environment
 .DS_Store
+*.zip
 *.log
 *.env
 !.env-example
@@ -14,6 +15,7 @@
 
 # Recordings
 recordings/*.recording.jsonl
+recordings/active_inference_traces/
 tests/recordings/*.recording.jsonl
 tests/recordings/not-a-recording.txt
 
