@@ -16,6 +16,10 @@ class ObservationPacketV1:
     win_levels: int
     available_actions: list[int]
     frame: list[list[int]]
+    num_frames_received: int = 1
+    frame_chain_digests: list[str] = field(default_factory=list)
+    frame_chain_micro_signatures: list[dict[str, Any]] = field(default_factory=list)
+    frame_chain_macro_signature: dict[str, Any] = field(default_factory=dict)
     action_cost_per_step: int = 1
     action6_coordinate_min: int = 0
     action6_coordinate_max: int = 63
@@ -35,6 +39,12 @@ class ObservationPacketV1:
                 "win_levels": int(self.win_levels),
                 "available_actions": [int(v) for v in self.available_actions],
                 "frame": self.frame,
+                "num_frames_received": int(self.num_frames_received),
+                "frame_chain_digests": [str(v) for v in self.frame_chain_digests],
+                "frame_chain_micro_signatures": [
+                    dict(v) for v in self.frame_chain_micro_signatures
+                ],
+                "frame_chain_macro_signature": dict(self.frame_chain_macro_signature),
             },
             "constraints": {
                 "action_cost_per_step": int(self.action_cost_per_step),

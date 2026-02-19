@@ -128,6 +128,11 @@ class ActiveInferenceEFE(Agent):
             "ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION",
             False,
         )
+        self.frame_chain_window = max(1, _env_int("ACTIVE_INFERENCE_FRAME_CHAIN_WINDOW", 8))
+        self.available_actions_history_window = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_ACTION_SPACE_HISTORY_WINDOW", 24),
+        )
         self.rollout_horizon = max(1, _env_int("ACTIVE_INFERENCE_ROLLOUT_HORIZON", 2))
         self.rollout_discount = max(
             0.0,
@@ -157,6 +162,7 @@ class ActiveInferenceEFE(Agent):
         self._previous_representation: RepresentationStateV1 | None = None
         self._previous_action_candidate: ActionCandidateV1 | None = None
         self._no_change_streak = 0
+        self._available_actions_history: list[list[int]] = []
 
         self.trace_enabled = _env_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
         self.trace_recorder: ActiveInferenceTraceRecorderV1 | None = None
@@ -212,11 +218,47 @@ class ActiveInferenceEFE(Agent):
                 "frame_height": int(frame_height),
                 "frame_width": int(frame_width),
                 "frame_digest": frame_digest,
+                "num_frames_received": int(packet.num_frames_received),
+                "frame_chain_digests": [str(v) for v in packet.frame_chain_digests],
+                "frame_chain_micro_signatures": [
+                    dict(v) for v in packet.frame_chain_micro_signatures
+                ],
+                "frame_chain_macro_signature": dict(packet.frame_chain_macro_signature),
             },
             "constraints": {
                 "action_cost_per_step": int(packet.action_cost_per_step),
                 "action6_coordinate_min": int(packet.action6_coordinate_min),
                 "action6_coordinate_max": int(packet.action6_coordinate_max),
+            },
+        }
+
+    def _available_actions_trajectory_summary(self) -> dict[str, Any]:
+        if not self._available_actions_history:
+            return {
+                "window_size": int(self.available_actions_history_window),
+                "history_length": 0,
+                "last_actions": [],
+                "toggle_count": 0,
+                "action_presence_counts": {},
+            }
+        action_presence_counts: dict[int, int] = {}
+        toggle_count = 0
+        previous: set[int] | None = None
+        for available in self._available_actions_history:
+            current = set(int(v) for v in available)
+            for action_id in current:
+                action_presence_counts[action_id] = action_presence_counts.get(action_id, 0) + 1
+            if previous is not None and current != previous:
+                toggle_count += 1
+            previous = current
+        return {
+            "window_size": int(self.available_actions_history_window),
+            "history_length": int(len(self._available_actions_history)),
+            "last_actions": [int(v) for v in self._available_actions_history[-1]],
+            "toggle_count": int(toggle_count),
+            "action_presence_counts": {
+                str(key): int(value)
+                for (key, value) in sorted(action_presence_counts.items())
             },
         }
 
@@ -235,6 +277,10 @@ class ActiveInferenceEFE(Agent):
                 "reason": "state_requires_reset",
             },
             "hypothesis_summary": self.hypothesis_bank.summary(),
+            "posterior_delta_report_previous_step": dict(
+                self.hypothesis_bank.last_posterior_delta_report
+            ),
+            "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
             "no_change_streak": int(self._no_change_streak),
         }
 
@@ -260,6 +306,10 @@ class ActiveInferenceEFE(Agent):
             "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
             "observation_packet_summary": packet_summary,
             "hypothesis_summary": self.hypothesis_bank.summary(),
+            "posterior_delta_report_previous_step": dict(
+                self.hypothesis_bank.last_posterior_delta_report
+            ),
+            "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
             "no_change_streak": int(self._no_change_streak),
         }
 
@@ -281,12 +331,19 @@ class ActiveInferenceEFE(Agent):
 
         diagnostics.start("observation_contract")
         try:
+            frame_chain = list(frames[-self.frame_chain_window :]) if frames else []
             packet = build_observation_packet_v1(
                 latest_frame,
                 game_id=self.game_id,
                 card_id=self.card_id,
                 action_counter=self.action_counter,
+                frame_chain=frame_chain,
             )
+            self._available_actions_history.append([int(v) for v in packet.available_actions])
+            if len(self._available_actions_history) > self.available_actions_history_window:
+                self._available_actions_history = self._available_actions_history[
+                    -self.available_actions_history_window :
+                ]
             diagnostics.finish_ok(
                 "observation_contract",
                 {
@@ -296,6 +353,10 @@ class ActiveInferenceEFE(Agent):
                     "available_action_count": int(len(packet.available_actions)),
                     "frame_height": int(len(packet.frame)),
                     "frame_width": int(len(packet.frame[0]) if packet.frame else 0),
+                    "num_frames_received": int(packet.num_frames_received),
+                    "frame_chain_micro_signature_count": int(
+                        len(packet.frame_chain_micro_signatures)
+                    ),
                 },
             )
         except Exception as exc:
@@ -376,6 +437,7 @@ class ActiveInferenceEFE(Agent):
                     self._no_change_streak += 1
                 else:
                     self._no_change_streak = 0
+                posterior_report = dict(self.hypothesis_bank.last_posterior_delta_report)
                 diagnostics.finish_ok(
                     "causal_update",
                     {
@@ -384,6 +446,15 @@ class ActiveInferenceEFE(Agent):
                         "event_tags": list(causal_signature.event_tags),
                         "obs_change_type": str(causal_signature.obs_change_type),
                         "no_change_streak": int(self._no_change_streak),
+                        "active_hypothesis_count_before": int(
+                            posterior_report.get("active_hypothesis_count_before", 0)
+                        ),
+                        "active_hypothesis_count_after": int(
+                            posterior_report.get("active_hypothesis_count_after", 0)
+                        ),
+                        "eliminated_count_by_reason": dict(
+                            posterior_report.get("eliminated_count_by_reason", {})
+                        ),
                     },
                 )
             else:
@@ -486,7 +557,11 @@ class ActiveInferenceEFE(Agent):
                     "selected_candidate": selected_candidate.to_dict(),
                     "reason": "stop_loss_guard_triggered",
                     "hypothesis_summary": self.hypothesis_bank.summary(),
+                    "posterior_delta_report_previous_step": dict(
+                        self.hypothesis_bank.last_posterior_delta_report
+                    ),
                     "representation_summary": representation.summary,
+                    "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "remaining_budget": int(remaining_budget),
                 }
             else:
@@ -521,6 +596,10 @@ class ActiveInferenceEFE(Agent):
                             "selected_candidate": selected_candidate.to_dict(),
                             "reason": "no_candidates",
                             "hypothesis_summary": self.hypothesis_bank.summary(),
+                            "posterior_delta_report_previous_step": dict(
+                                self.hypothesis_bank.last_posterior_delta_report
+                            ),
+                            "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                             "remaining_budget": int(remaining_budget),
                             "stage_diagnostics_v1": diagnostics.to_dicts(),
                             "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
@@ -532,6 +611,11 @@ class ActiveInferenceEFE(Agent):
                                 "candidate_count": int(len(candidates)),
                                 "action6_candidate_count": int(
                                     sum(1 for candidate in candidates if candidate.action_id == 6)
+                                ),
+                                "action6_candidate_diagnostics": dict(
+                                    representation.summary.get(
+                                        "action6_candidate_diagnostics", {}
+                                    )
                                 ),
                             },
                         )
@@ -589,10 +673,14 @@ class ActiveInferenceEFE(Agent):
                             ),
                             "top_k_candidates_by_efe": top_entries,
                             "hypothesis_summary": self.hypothesis_bank.summary(),
+                            "posterior_delta_report_previous_step": dict(
+                                self.hypothesis_bank.last_posterior_delta_report
+                            ),
                             "representation_summary": representation.summary,
                             "causal_event_signature_previous_step": (
                                 causal_signature.to_dict() if causal_signature else None
                             ),
+                            "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                             "remaining_budget": int(remaining_budget),
                             "stage_diagnostics_v1": diagnostics.to_dicts(),
                             "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
@@ -645,9 +733,13 @@ class ActiveInferenceEFE(Agent):
                         for entry in ranked_entries[: self.trace_candidate_limit]
                     ],
                     "hypothesis_summary": self.hypothesis_bank.summary(),
+                    "posterior_delta_report_previous_step": dict(
+                        self.hypothesis_bank.last_posterior_delta_report
+                    ),
                     "causal_event_signature_previous_step": (
                         causal_signature.to_dict() if causal_signature else None
                     ),
+                    "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "stage_diagnostics_v1": diagnostics.to_dicts(),
                     "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
                 }
@@ -669,6 +761,10 @@ class ActiveInferenceEFE(Agent):
                     "card_id": self.card_id,
                     "total_actions_taken": int(self.action_counter),
                     "final_hypothesis_summary": self.hypothesis_bank.summary(),
+                    "final_posterior_delta_report": dict(
+                        self.hypothesis_bank.last_posterior_delta_report
+                    ),
+                    "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "final_no_change_streak": int(self._no_change_streak),
                 }
             )

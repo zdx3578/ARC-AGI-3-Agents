@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import pytest
 
 from agents.templates.active_inference.diagnostics import StageDiagnosticsCollectorV1
-from agents.templates.active_inference.hypothesis_bank import ActiveInferenceHypothesisBankV1
+from agents.templates.active_inference.hypothesis_bank import (
+    ActiveInferenceHypothesisBankV1,
+    build_causal_event_signature_v1,
+)
 from agents.templates.active_inference.policy import ActiveInferencePolicyEvaluatorV1
 from agents.templates.active_inference.representation import (
     build_action_candidates_v1,
@@ -12,28 +15,42 @@ from agents.templates.active_inference.representation import (
 )
 
 
-def _frame_data_stub() -> SimpleNamespace:
+def _frame_data_stub(
+    *,
+    frame: list[list[int]] | None = None,
+    levels_completed: int = 0,
+    state_name: str = "NOT_FINISHED",
+) -> SimpleNamespace:
+    frame_payload = frame or [[1, 1, 0], [1, 0, 0], [0, 2, 2]]
     return SimpleNamespace(
         available_actions=[6, 6, "3", "bad"],
-        frame=[[[1, 1, 0], [1, 0, 0], [0, 2, 2]]],
-        state=SimpleNamespace(name="NOT_FINISHED"),
-        levels_completed=0,
+        frame=[frame_payload],
+        state=SimpleNamespace(name=state_name),
+        levels_completed=levels_completed,
         win_levels=3,
     )
 
 
 @pytest.mark.unit
 def test_observation_packet_normalizes_nested_frame() -> None:
+    frame_chain = [
+        SimpleNamespace(frame=[[0, 0, 0], [0, 0, 0], [0, 0, 0]]),
+        SimpleNamespace(frame=[[1, 1, 0], [1, 0, 0], [0, 2, 2]]),
+    ]
     packet = build_observation_packet_v1(
         _frame_data_stub(),
         game_id="ls20",
         card_id="card-x",
         action_counter=7,
+        frame_chain=frame_chain,
     )
     assert packet.available_actions == [3, 6]
     assert len(packet.frame) == 3
     assert len(packet.frame[0]) == 3
     assert packet.frame[0][0] == 1
+    assert packet.num_frames_received >= 2
+    assert packet.frame_chain_digests
+    assert packet.frame_chain_macro_signature["micro_signature_count"] >= 1
 
 
 @pytest.mark.unit
@@ -52,6 +69,10 @@ def test_representation_and_action6_candidates_expose_coverage() -> None:
     assert representation.summary["object_count"] >= 1
     assert representation.summary["action6_coordinate_proposal_count"] >= 1
     assert representation.summary["action6_coordinate_proposal_coverage"] > 0.0
+    assert representation.summary["action6_candidate_diagnostics"]["proposal_count"] >= 1
+    assert (
+        representation.summary["action6_candidate_diagnostics"]["unique_region_count"] >= 1
+    )
     assert "same_color_4" in representation.component_views
     assert "same_color_8" in representation.component_views
     assert "mixed_color_4" in representation.component_views
@@ -62,6 +83,7 @@ def test_representation_and_action6_candidates_expose_coverage() -> None:
     action6 = [candidate for candidate in candidates if candidate.action_id == 6]
     assert action6
     assert "proposal_coverage" in action6[0].metadata
+    assert "proposal_diagnostics" in action6[0].metadata
     assert "coordinate_context_feature" in action6[0].metadata
 
 
@@ -111,6 +133,46 @@ def test_hypothesis_bank_split_information_gain_contract() -> None:
         "causal_mapping",
     }
     assert all(value >= 0.0 for value in split.values())
+
+
+@pytest.mark.unit
+def test_hypothesis_bank_posterior_delta_report_fields() -> None:
+    previous_packet = build_observation_packet_v1(
+        _frame_data_stub(frame=[[1, 1, 0], [1, 0, 0], [0, 2, 2]]),
+        game_id="ls20",
+        card_id="card-x",
+        action_counter=1,
+    )
+    current_packet = build_observation_packet_v1(
+        _frame_data_stub(frame=[[1, 1, 0], [1, 3, 0], [0, 2, 2]]),
+        game_id="ls20",
+        card_id="card-x",
+        action_counter=2,
+    )
+    previous_representation = build_representation_state_v1(previous_packet)
+    current_representation = build_representation_state_v1(current_packet)
+    executed_candidate = build_action_candidates_v1(previous_packet, previous_representation)[0]
+
+    signature = build_causal_event_signature_v1(
+        previous_packet,
+        current_packet,
+        previous_representation,
+        current_representation,
+        executed_candidate,
+    )
+    bank = ActiveInferenceHypothesisBankV1()
+    bank.update_with_observation(
+        previous_packet=previous_packet,
+        current_packet=current_packet,
+        executed_candidate=executed_candidate,
+        previous_representation=previous_representation,
+        observed_signature=signature,
+    )
+    report = bank.last_posterior_delta_report
+    assert report["schema_name"] == "active_inference_posterior_delta_report_v1"
+    assert "eliminated_count_by_reason" in report
+    assert "survivor_family_histogram" in report
+    assert "mode_transition_count" in report
 
 
 @pytest.mark.unit

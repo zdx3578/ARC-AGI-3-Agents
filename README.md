@@ -37,10 +37,13 @@ This repository includes `activeinferenceefe`, a modular framework agent that
 implements an audit-first Active Inference loop for ARC-AGI-3:
 
 - observation contract (state, levels, available actions, frame)
+- frame-chain diagnostics (1-N frame digests + micro/macro transition signatures)
 - object representation contract (same-color and mixed-color connected components with 4/8 connectivity + hierarchy links + Action6 proposals)
 - world-model hypothesis bank (hidden mode state + rule-family/parameter version space)
+- posterior delta report per step (elimination/falsification reason buckets + survivor histograms)
 - Expected Free Energy ledger per candidate (risk / ambiguity / split information gain / action cost / complexity / VFE term)
 - causal event signatures for action interventions (`obs_change_type` diff semantics)
+- Action6 proposal diagnostics (region coverage / redundancy / context diversity / hit-object rate)
 - JSONL trace emission for bottleneck analysis
 - stage diagnostics (`stage / duration_ms / status / reject_reason_v1`)
 - failure taxonomy in reasoning for non-silent fallback paths
@@ -65,6 +68,8 @@ Useful environment variables:
 - `ACTIVE_INFERENCE_TRACE_ENABLED` (default `true`)
 - `ACTIVE_INFERENCE_TRACE_CANDIDATE_LIMIT` (default `30`)
 - `ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION` (default `false`)
+- `ACTIVE_INFERENCE_FRAME_CHAIN_WINDOW` (default `8`)
+- `ACTIVE_INFERENCE_ACTION_SPACE_HISTORY_WINDOW` (default `24`)
 - `ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` (optional)
 
 `ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` format example:

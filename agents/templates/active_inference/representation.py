@@ -74,8 +74,168 @@ def _normalize_frame_to_int_grid(frame_any: Any) -> list[list[int]]:
     return padded
 
 
+def _frame_digest(frame: list[list[int]]) -> str:
+    return hashlib.sha256(
+        repr(frame).encode("utf-8", errors="ignore")
+    ).hexdigest()[:24]
+
+
+def _changed_pixels_and_bbox(
+    previous_frame: list[list[int]],
+    current_frame: list[list[int]],
+) -> tuple[int, tuple[int, int, int, int] | None]:
+    prev_h = len(previous_frame)
+    prev_w = len(previous_frame[0]) if previous_frame else 0
+    curr_h = len(current_frame)
+    curr_w = len(current_frame[0]) if current_frame else 0
+    union_h = max(prev_h, curr_h)
+    union_w = max(prev_w, curr_w)
+
+    changed = 0
+    min_x: int | None = None
+    min_y: int | None = None
+    max_x: int | None = None
+    max_y: int | None = None
+
+    for y in range(union_h):
+        for x in range(union_w):
+            prev_value = (
+                int(previous_frame[y][x]) if y < prev_h and x < prev_w else -1
+            )
+            curr_value = int(current_frame[y][x]) if y < curr_h and x < curr_w else -1
+            if prev_value == curr_value:
+                continue
+            changed += 1
+            if min_x is None or x < min_x:
+                min_x = x
+            if min_y is None or y < min_y:
+                min_y = y
+            if max_x is None or x > max_x:
+                max_x = x
+            if max_y is None or y > max_y:
+                max_y = y
+
+    if changed <= 0:
+        return (0, None)
+    return (int(changed), (int(min_x), int(min_y), int(max_x), int(max_y)))
+
+
+def _micro_signature_for_transition(
+    previous_frame: list[list[int]],
+    current_frame: list[list[int]],
+    from_index: int,
+    to_index: int,
+) -> dict[str, Any]:
+    changed_count, changed_bbox = _changed_pixels_and_bbox(previous_frame, current_frame)
+    frame_height = len(previous_frame)
+    frame_width = len(previous_frame[0]) if previous_frame else 0
+    frame_area = max(1, int(frame_height) * int(frame_width))
+    changed_area_ratio = float(changed_count) / float(frame_area)
+
+    if changed_count <= 0:
+        micro_type = "NO_CHANGE"
+    elif changed_area_ratio >= 0.35:
+        micro_type = "GLOBAL_PATTERN_CHANGE"
+    elif changed_area_ratio < 0.12:
+        micro_type = "LOCAL_COLOR_CHANGE"
+    else:
+        micro_type = "OBSERVED_UNCLASSIFIED"
+
+    digest_source = {
+        "from_index": int(from_index),
+        "to_index": int(to_index),
+        "micro_change_type": micro_type,
+        "changed_pixel_count": int(changed_count),
+        "changed_area_ratio": round(changed_area_ratio, 6),
+        "changed_bbox": changed_bbox,
+    }
+    signature_digest = hashlib.sha256(
+        repr(digest_source).encode("utf-8", errors="ignore")
+    ).hexdigest()[:24]
+
+    out: dict[str, Any] = {
+        "from_index": int(from_index),
+        "to_index": int(to_index),
+        "micro_change_type": micro_type,
+        "changed_pixel_count": int(changed_count),
+        "changed_area_ratio": float(changed_area_ratio),
+        "signature_digest": signature_digest,
+    }
+    if changed_bbox is not None:
+        out["changed_bbox"] = {
+            "min_x": int(changed_bbox[0]),
+            "min_y": int(changed_bbox[1]),
+            "max_x": int(changed_bbox[2]),
+            "max_y": int(changed_bbox[3]),
+        }
+    return out
+
+
+def _frame_chain_summary(
+    latest_frame_data: FrameData,
+    frame_chain: list[FrameData] | None = None,
+) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    chain_frames: list[list[list[int]]] = []
+    if frame_chain:
+        for frame_data in frame_chain:
+            normalized = _normalize_frame_to_int_grid(getattr(frame_data, "frame", None))
+            if normalized:
+                chain_frames.append(normalized)
+
+    latest_normalized = _normalize_frame_to_int_grid(getattr(latest_frame_data, "frame", None))
+    if latest_normalized:
+        chain_frames.append(latest_normalized)
+
+    dedup_frames: list[list[list[int]]] = []
+    dedup_digests: list[str] = []
+    for frame in chain_frames:
+        digest = _frame_digest(frame)
+        if dedup_digests and dedup_digests[-1] == digest:
+            continue
+        dedup_frames.append(frame)
+        dedup_digests.append(digest)
+
+    micro_signatures: list[dict[str, Any]] = []
+    micro_hist: dict[str, int] = {}
+    total_changed_pixels = 0
+    for idx in range(len(dedup_frames) - 1):
+        micro = _micro_signature_for_transition(
+            dedup_frames[idx],
+            dedup_frames[idx + 1],
+            idx,
+            idx + 1,
+        )
+        micro_signatures.append(micro)
+        micro_type = str(micro.get("micro_change_type", "OBSERVED_UNCLASSIFIED"))
+        micro_hist[micro_type] = micro_hist.get(micro_type, 0) + 1
+        total_changed_pixels += int(micro.get("changed_pixel_count", 0))
+
+    dominant_micro_type = (
+        max(micro_hist.items(), key=lambda item: (item[1], item[0]))[0]
+        if micro_hist
+        else "NO_CHANGE"
+    )
+    macro_signature = {
+        "micro_signature_count": int(len(micro_signatures)),
+        "total_changed_pixels": int(total_changed_pixels),
+        "non_no_change_transition_count": int(
+            sum(
+                1
+                for micro in micro_signatures
+                if str(micro.get("micro_change_type", "")) != "NO_CHANGE"
+            )
+        ),
+        "dominant_micro_change_type": dominant_micro_type,
+    }
+    return dedup_digests, micro_signatures, macro_signature
+
+
 def build_observation_packet_v1(
-    frame_data: FrameData, game_id: str, card_id: str, action_counter: int
+    frame_data: FrameData,
+    game_id: str,
+    card_id: str,
+    action_counter: int,
+    frame_chain: list[FrameData] | None = None,
 ) -> ObservationPacketV1:
     available_actions: list[int] = []
     for value_any in frame_data.available_actions:
@@ -85,9 +245,13 @@ def build_observation_packet_v1(
             continue
 
     frame = _normalize_frame_to_int_grid(frame_data.frame)
+    frame_chain_digests, frame_chain_micro, frame_chain_macro = _frame_chain_summary(
+        frame_data,
+        frame_chain=frame_chain,
+    )
     return ObservationPacketV1(
         schema_name="active_inference_observation_packet_v1",
-        schema_version=1,
+        schema_version=2,
         game_id=game_id,
         card_id=card_id,
         action_counter=int(action_counter),
@@ -96,6 +260,10 @@ def build_observation_packet_v1(
         win_levels=int(frame_data.win_levels),
         available_actions=sorted(set(available_actions)),
         frame=frame,
+        num_frames_received=int(len(frame_chain_digests)),
+        frame_chain_digests=frame_chain_digests,
+        frame_chain_micro_signatures=frame_chain_micro,
+        frame_chain_macro_signature=frame_chain_macro,
     )
 
 
@@ -429,6 +597,14 @@ def build_representation_state_v1(
     object_areas = sorted(int(obj.area) for obj in object_nodes)
     max_proposals = max(1, (9 * len(object_nodes)) + (3 * len(mixed8)) + 3)
     proposal_coverage = float(len(action6_points) / float(max_proposals))
+    proposal_diagnostics = _action6_proposal_diagnostics(
+        packet,
+        object_nodes,
+        frame_height,
+        frame_width,
+        background_color,
+        action6_points,
+    )
 
     summary: dict[str, Any] = {
         "object_count": int(len(object_nodes)),
@@ -439,6 +615,7 @@ def build_representation_state_v1(
         ),
         "action6_coordinate_proposal_count": int(len(action6_points)),
         "action6_coordinate_proposal_coverage": float(proposal_coverage),
+        "action6_candidate_diagnostics": proposal_diagnostics,
         "object_area_stats": {
             "min": int(object_areas[0]) if object_areas else 0,
             "max": int(object_areas[-1]) if object_areas else 0,
@@ -486,22 +663,23 @@ def _distance_to_nearest_object(x: int, y: int, object_nodes: list[ObjectNodeV1]
     )
 
 
-def _coordinate_context_feature(
+def _coordinate_context_feature_from_geometry(
     packet: ObservationPacketV1,
-    representation: RepresentationStateV1,
+    object_nodes: list[ObjectNodeV1],
+    frame_height: int,
+    frame_width: int,
+    background_color: int,
     x: int,
     y: int,
 ) -> dict[str, Any]:
-    frame_height = int(representation.frame_height)
-    frame_width = int(representation.frame_width)
-    in_bounds = 0 <= y < frame_height and 0 <= x < frame_width
-    color_at_point = int(packet.frame[y][x]) if in_bounds else int(representation.background_color)
-    hit_object = bool(in_bounds and color_at_point != representation.background_color)
+    in_bounds = 0 <= y < int(frame_height) and 0 <= x < int(frame_width)
+    color_at_point = int(packet.frame[y][x]) if in_bounds else int(background_color)
+    hit_object = bool(in_bounds and color_at_point != int(background_color))
     on_boundary = bool(
         in_bounds
-        and (x == 0 or y == 0 or x == frame_width - 1 or y == frame_height - 1)
+        and (x == 0 or y == 0 or x == int(frame_width) - 1 or y == int(frame_height) - 1)
     )
-    dist = _distance_to_nearest_object(x, y, representation.object_nodes)
+    dist = _distance_to_nearest_object(x, y, object_nodes)
     if dist < 3.0:
         dist_bucket = "near"
     elif dist < 8.0:
@@ -516,6 +694,97 @@ def _coordinate_context_feature(
         "distance_to_nearest_object_bucket": dist_bucket,
         "coarse_region_x": int(max(0, min(7, x // 8))),
         "coarse_region_y": int(max(0, min(7, y // 8))),
+    }
+
+
+def _coordinate_context_feature(
+    packet: ObservationPacketV1,
+    representation: RepresentationStateV1,
+    x: int,
+    y: int,
+) -> dict[str, Any]:
+    return _coordinate_context_feature_from_geometry(
+        packet,
+        representation.object_nodes,
+        int(representation.frame_height),
+        int(representation.frame_width),
+        int(representation.background_color),
+        int(x),
+        int(y),
+    )
+
+
+def _action6_proposal_diagnostics(
+    packet: ObservationPacketV1,
+    object_nodes: list[ObjectNodeV1],
+    frame_height: int,
+    frame_width: int,
+    background_color: int,
+    proposals: list[tuple[int, int]],
+) -> dict[str, Any]:
+    proposal_count = int(len(proposals))
+    if proposal_count <= 0:
+        return {
+            "proposal_count": 0,
+            "unique_region_count": 0,
+            "region_coverage_ratio": 0.0,
+            "redundancy_rate": 0.0,
+            "hit_object_rate": 0.0,
+            "on_boundary_rate": 0.0,
+            "unique_context_feature_rate": 0.0,
+            "distance_bucket_histogram": {},
+        }
+
+    coarse_regions: set[tuple[int, int]] = set()
+    context_signatures: set[tuple[object, ...]] = set()
+    hit_object_count = 0
+    on_boundary_count = 0
+    distance_hist: dict[str, int] = {}
+
+    for (x, y) in proposals:
+        feature = _coordinate_context_feature_from_geometry(
+            packet,
+            object_nodes,
+            frame_height,
+            frame_width,
+            background_color,
+            int(x),
+            int(y),
+        )
+        cx = int(feature.get("coarse_region_x", -1))
+        cy = int(feature.get("coarse_region_y", -1))
+        coarse_regions.add((cx, cy))
+        context_signature = (
+            int(feature.get("hit_object", 0)),
+            int(feature.get("on_boundary", 0)),
+            str(feature.get("distance_to_nearest_object_bucket", "na")),
+            int(feature.get("hit_color", -1)),
+            cx,
+            cy,
+        )
+        context_signatures.add(context_signature)
+        if int(feature.get("hit_object", 0)) == 1:
+            hit_object_count += 1
+        if int(feature.get("on_boundary", 0)) == 1:
+            on_boundary_count += 1
+        bucket = str(feature.get("distance_to_nearest_object_bucket", "na"))
+        distance_hist[bucket] = distance_hist.get(bucket, 0) + 1
+
+    unique_region_count = int(len(coarse_regions))
+    redundant_region_points = max(0, proposal_count - unique_region_count)
+    return {
+        "proposal_count": int(proposal_count),
+        "unique_region_count": unique_region_count,
+        "region_coverage_ratio": float(unique_region_count / 64.0),
+        "redundancy_rate": float(redundant_region_points / float(max(1, proposal_count))),
+        "hit_object_rate": float(hit_object_count / float(max(1, proposal_count))),
+        "on_boundary_rate": float(on_boundary_count / float(max(1, proposal_count))),
+        "unique_context_feature_rate": float(
+            len(context_signatures) / float(max(1, proposal_count))
+        ),
+        "distance_bucket_histogram": {
+            str(key): int(value) for (key, value) in sorted(distance_hist.items())
+        },
     }
 
 
@@ -545,6 +814,11 @@ def build_action_candidates_v1(
                             "proposal_coverage": float(
                                 representation.summary.get(
                                     "action6_coordinate_proposal_coverage", 0.0
+                                )
+                            ),
+                            "proposal_diagnostics": dict(
+                                representation.summary.get(
+                                    "action6_candidate_diagnostics", {}
                                 )
                             ),
                             "coordinate_context_feature": context_feature,

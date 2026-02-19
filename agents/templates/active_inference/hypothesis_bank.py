@@ -565,6 +565,7 @@ class ActiveInferenceHypothesisBankV1:
         self.last_update: dict[str, float] = {}
         self.last_vfe_bits: float = 0.0
         self.last_observed_signature: str = ""
+        self.last_posterior_delta_report: dict[str, Any] = {}
 
     def _renormalize(self, posterior: dict[str, float]) -> dict[str, float]:
         total = sum(max(0.0, weight) for weight in posterior.values())
@@ -641,6 +642,7 @@ class ActiveInferenceHypothesisBankV1:
             },
             "last_vfe_bits": float(self.last_vfe_bits),
             "last_observed_signature": self.last_observed_signature,
+            "last_posterior_delta_report": dict(self.last_posterior_delta_report),
         }
 
     def _predict_distribution_for_hypothesis(
@@ -751,27 +753,65 @@ class ActiveInferenceHypothesisBankV1:
         *,
         posterior: dict[str, float] | None = None,
     ) -> dict[str, float]:
+        posterior_after, _ = self.posterior_after_signature_with_report(
+            packet,
+            candidate,
+            representation,
+            observed_signature_key,
+            posterior=posterior,
+        )
+        return posterior_after
+
+    def posterior_after_signature_with_report(
+        self,
+        packet: ObservationPacketV1,
+        candidate: ActionCandidateV1,
+        representation: RepresentationStateV1,
+        observed_signature_key: str,
+        *,
+        posterior: dict[str, float] | None = None,
+    ) -> tuple[dict[str, float], dict[str, Any]]:
         posterior_used = posterior or self.posterior_by_hypothesis_id
         features = _context_features(packet, candidate, representation)
         mdl_lambda = 0.015
+        active_threshold = 1.0e-4
 
         updated: dict[str, float] = {}
+        primary_reason_by_hypothesis: dict[str, str] = {}
+        likelihood_by_hypothesis: dict[str, float] = {}
         for hypothesis in self.hypotheses:
             prior = float(posterior_used.get(hypothesis.hypothesis_id, 0.0))
             if prior <= 0.0:
                 updated[hypothesis.hypothesis_id] = 0.0
+                primary_reason_by_hypothesis[hypothesis.hypothesis_id] = "inactive_prior"
+                likelihood_by_hypothesis[hypothesis.hypothesis_id] = 0.0
                 continue
 
             distribution_h = self._predict_distribution_for_hypothesis(hypothesis, features)
             likelihood = float(distribution_h.get(observed_signature_key, 0.0))
+            impossible_keys = _impossible_signature_keys(
+                hypothesis.family_id,
+                hypothesis.parameter_id,
+                features,
+            )
+            if observed_signature_key in impossible_keys:
+                reason = "impossible_constraint"
+            elif likelihood <= EPS:
+                reason = "zero_likelihood"
+            else:
+                reason = "supported"
             penalized_prior = prior * math.exp(-mdl_lambda * (float(hypothesis.mdl_bits) / 64.0))
             updated[hypothesis.hypothesis_id] = penalized_prior * max(EPS, likelihood)
+            primary_reason_by_hypothesis[hypothesis.hypothesis_id] = reason
+            likelihood_by_hypothesis[hypothesis.hypothesis_id] = likelihood
 
         updated = self._renormalize(updated)
 
         transitioned: dict[str, float] = {
             hypothesis.hypothesis_id: 0.0 for hypothesis in self.hypotheses
         }
+        transitioned_out_hypothesis_ids: set[str] = set()
+        transition_count = 0
         for hypothesis in self.hypotheses:
             weight = float(updated.get(hypothesis.hypothesis_id, 0.0))
             if weight <= 0.0:
@@ -785,9 +825,80 @@ class ActiveInferenceHypothesisBankV1:
                 (next_mode, hypothesis.family_id, hypothesis.parameter_id),
                 hypothesis.hypothesis_id,
             )
+            if target_id != hypothesis.hypothesis_id:
+                transitioned_out_hypothesis_ids.add(hypothesis.hypothesis_id)
+                transition_count += 1
             transitioned[target_id] = transitioned.get(target_id, 0.0) + weight
 
-        return self._renormalize(transitioned)
+        posterior_after = self._renormalize(transitioned)
+
+        eliminated_count_by_reason: dict[str, int] = {}
+        eliminated_mass_by_reason: dict[str, float] = {}
+        eliminated_examples: list[dict[str, Any]] = []
+        survivor_family_histogram: dict[str, float] = {}
+        survivor_mode_histogram: dict[str, float] = {}
+
+        active_before = 0
+        active_after = 0
+        for hypothesis in self.hypotheses:
+            hypothesis_id = hypothesis.hypothesis_id
+            prior = float(posterior_used.get(hypothesis_id, 0.0))
+            after = float(posterior_after.get(hypothesis_id, 0.0))
+            if prior > active_threshold:
+                active_before += 1
+            if after > active_threshold:
+                active_after += 1
+                survivor_family_histogram[hypothesis.family_id] = (
+                    survivor_family_histogram.get(hypothesis.family_id, 0.0) + after
+                )
+                survivor_mode_histogram[hypothesis.mode_id] = (
+                    survivor_mode_histogram.get(hypothesis.mode_id, 0.0) + after
+                )
+            if prior > active_threshold and after <= active_threshold:
+                reason = primary_reason_by_hypothesis.get(hypothesis_id, "posterior_collapse")
+                if hypothesis_id in transitioned_out_hypothesis_ids:
+                    reason = "mode_transition"
+                eliminated_count_by_reason[reason] = eliminated_count_by_reason.get(reason, 0) + 1
+                eliminated_mass_by_reason[reason] = (
+                    eliminated_mass_by_reason.get(reason, 0.0) + prior
+                )
+                if len(eliminated_examples) < 12:
+                    eliminated_examples.append(
+                        {
+                            "hypothesis_id": hypothesis_id,
+                            "reason": reason,
+                            "prior_weight": float(prior),
+                            "posterior_weight": float(after),
+                            "likelihood": float(likelihood_by_hypothesis.get(hypothesis_id, 0.0)),
+                        }
+                    )
+
+        report = {
+            "schema_name": "active_inference_posterior_delta_report_v1",
+            "schema_version": 1,
+            "observed_signature_key": observed_signature_key,
+            "active_hypothesis_count_before": int(active_before),
+            "active_hypothesis_count_after": int(active_after),
+            "eliminated_count_by_reason": {
+                str(key): int(value)
+                for (key, value) in sorted(eliminated_count_by_reason.items())
+            },
+            "eliminated_mass_by_reason": {
+                str(key): float(value)
+                for (key, value) in sorted(eliminated_mass_by_reason.items())
+            },
+            "survivor_family_histogram": {
+                str(key): float(value)
+                for (key, value) in sorted(survivor_family_histogram.items())
+            },
+            "survivor_mode_histogram": {
+                str(key): float(value)
+                for (key, value) in sorted(survivor_mode_histogram.items())
+            },
+            "mode_transition_count": int(transition_count),
+            "example_eliminated_hypotheses": eliminated_examples,
+        }
+        return posterior_after, report
 
     def split_information_gain(
         self,
@@ -846,6 +957,7 @@ class ActiveInferenceHypothesisBankV1:
         cloned.last_update = dict(self.last_update)
         cloned.last_vfe_bits = float(self.last_vfe_bits)
         cloned.last_observed_signature = str(self.last_observed_signature)
+        cloned.last_posterior_delta_report = dict(self.last_posterior_delta_report)
         return cloned
 
     def update_with_observation(
@@ -870,11 +982,18 @@ class ActiveInferenceHypothesisBankV1:
         self.last_observed_signature = observed_signature_key
 
         previous_posterior = dict(self.posterior_by_hypothesis_id)
-        self.posterior_by_hypothesis_id = self.posterior_after_signature(
+        posterior_after, report = self.posterior_after_signature_with_report(
             previous_packet,
             executed_candidate,
             previous_representation,
             observed_signature_key,
             posterior=previous_posterior,
         )
+        report["action_id"] = int(executed_candidate.action_id)
+        report["candidate_id"] = str(executed_candidate.candidate_id)
+        report["action_counter"] = int(current_packet.action_counter)
+        report["state_transition"] = str(observed_signature.state_transition)
+        report["level_delta"] = int(observed_signature.level_delta)
+        self.posterior_by_hypothesis_id = posterior_after
         self.last_update = dict(self.posterior_by_hypothesis_id)
+        self.last_posterior_delta_report = report
