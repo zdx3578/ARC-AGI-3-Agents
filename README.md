@@ -50,6 +50,7 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 - navigation-state diagnostics (`tracked_agent_token_id`, `agent_pos_xy`, `delta_pos_xy`, `control_schema_posterior`)
 - least-tried probing in explore/explain phases, including early probing budget that forces action-space coverage in the first N steps
 - hard methodology guard: `cross-episode memory = off` (no persistent cross-run parameter learning; enforced in reasoning + trace)
+- hard objective guard: `action_cost_in_objective = off` (action cost is logged for audit, but excluded from action selection objective)
 - JSONL trace emission for bottleneck analysis
 - stage diagnostics (`stage / duration_ms / status / reject_reason_v1`)
 - failure taxonomy in reasoning for non-silent fallback paths
@@ -76,6 +77,7 @@ Useful environment variables:
 - `ACTIVE_INFERENCE_EARLY_PROBE_BUDGET` (default `8`, force early action-space coverage in explore/explain)
 - `ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS` (default `3`)
 - `ACTIVE_INFERENCE_ENABLE_CROSS_EPISODE_MEMORY` (default `false`; any `true` request is blocked and recorded as `override_blocked=true`, policy remains hard-off)
+- `ACTIVE_INFERENCE_ENABLE_ACTION_COST_OBJECTIVE` (default `false`; any `true` request is blocked and recorded as `action_cost_override_blocked=true`, objective remains hard-off)
 - `ACTIVE_INFERENCE_TRACE_ENABLED` (default `true`)
 - `ACTIVE_INFERENCE_TRACE_CANDIDATE_LIMIT` (default `30`)
 - `ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION` (default `false`)

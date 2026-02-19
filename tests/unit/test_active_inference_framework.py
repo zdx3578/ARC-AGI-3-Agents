@@ -125,6 +125,36 @@ def test_policy_accepts_weight_override() -> None:
 
 
 @pytest.mark.unit
+def test_policy_ignores_action_cost_even_with_override() -> None:
+    packet = build_observation_packet_v1(
+        _frame_data_stub(),
+        game_id="ls20",
+        card_id="card-x",
+        action_counter=2,
+    )
+    representation = build_representation_state_v1(packet)
+    candidates = build_action_candidates_v1(packet, representation)
+    bank = ActiveInferenceHypothesisBankV1()
+    policy = ActiveInferencePolicyEvaluatorV1(
+        weight_overrides={"explore": {"action_cost": 9.0}},
+        ignore_action_cost=True,
+    )
+    entries = policy.evaluate_candidates(
+        packet=packet,
+        representation=representation,
+        candidates=candidates,
+        hypothesis_bank=bank,
+        phase="explore",
+    )
+    assert entries
+    assert entries[0].witness["weights"]["action_cost"] == pytest.approx(0.0)
+    assert entries[0].witness["objective_policy_v1"]["ignore_action_cost"] is True
+    assert entries[0].witness["objective_policy_v1"]["applied_action_cost_weight"] == pytest.approx(
+        0.0
+    )
+
+
+@pytest.mark.unit
 def test_policy_selection_reports_tie_diagnostics() -> None:
     packet = build_observation_packet_v1(
         _frame_data_stub(),
@@ -280,6 +310,8 @@ def test_agent_effective_explore_steps_uses_budget_bounded_policy(
     assert exploration_policy["effective_explore_steps"] == 40
     assert exploration_policy["available_action_count"] == 6
     assert exploration_policy["exploration_budget_remaining"] == 40
+    assert exploration_policy["action_cost_in_objective"] == "off_hard"
+    assert exploration_policy["action_cost_override_blocked"] is False
 
 
 @pytest.mark.unit

@@ -27,6 +27,7 @@ class ActiveInferencePolicyEvaluatorV1:
         rollout_horizon: int = 2,
         rollout_discount: float = 0.55,
         tie_epsilon: float = 1.0e-6,
+        ignore_action_cost: bool = True,
         weight_overrides: dict[str, dict[str, float]] | None = None,
     ) -> None:
         self.explore_steps = int(max(1, explore_steps))
@@ -35,6 +36,7 @@ class ActiveInferencePolicyEvaluatorV1:
         self.rollout_horizon = int(max(1, rollout_horizon))
         self.rollout_discount = float(max(0.0, min(1.0, rollout_discount)))
         self.tie_epsilon = float(max(0.0, tie_epsilon))
+        self.ignore_action_cost = bool(ignore_action_cost)
         self.weight_overrides = weight_overrides or {}
 
     def _weights_for_phase(self, phase: str) -> dict[str, float]:
@@ -64,6 +66,8 @@ class ActiveInferencePolicyEvaluatorV1:
                 out[key] = float(value_any)
             except Exception:
                 continue
+        if self.ignore_action_cost:
+            out["action_cost"] = 0.0
         return out
 
     def determine_phase(
@@ -143,6 +147,10 @@ class ActiveInferencePolicyEvaluatorV1:
 
             witness = {
                 "weights": {str(k): float(v) for (k, v) in weights.items()},
+                "objective_policy_v1": {
+                    "ignore_action_cost": bool(self.ignore_action_cost),
+                    "applied_action_cost_weight": float(weights["action_cost"]),
+                },
                 "risk_terms": {str(k): float(v) for (k, v) in risk_terms.items()},
                 "preference_distribution": {
                     str(k): float(v) for (k, v) in preference_distribution.items()

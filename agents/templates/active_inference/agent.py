@@ -127,6 +127,14 @@ class ActiveInferenceEFE(Agent):
         self.cross_episode_memory_override_blocked = bool(
             self.cross_episode_memory_enable_requested
         )
+        self.action_cost_objective_hard_off = True
+        self.action_cost_objective_enable_requested = _env_bool(
+            "ACTIVE_INFERENCE_ENABLE_ACTION_COST_OBJECTIVE",
+            False,
+        )
+        self.action_cost_objective_override_blocked = bool(
+            self.action_cost_objective_enable_requested
+        )
         self.MAX_ACTIONS = max(1, _env_int("ACTIVE_INFERENCE_MAX_ACTIONS", 80))
         self.component_connectivity = (
             4 if _env_int("ACTIVE_INFERENCE_COMPONENT_CONNECTIVITY", 8) == 4 else 8
@@ -181,6 +189,7 @@ class ActiveInferenceEFE(Agent):
             top_k_reasoning=self.top_k_reasoning,
             rollout_horizon=self.rollout_horizon,
             rollout_discount=self.rollout_discount,
+            ignore_action_cost=True,
             weight_overrides=weight_overrides,
         )
         self.hypothesis_bank = ActiveInferenceHypothesisBankV1()
@@ -368,6 +377,11 @@ class ActiveInferenceEFE(Agent):
             "exploration_budget_remaining": int(exploration_budget_remaining),
             "early_probe_budget_config": int(self.early_probe_budget),
             "early_probe_budget_remaining": int(early_probe_budget_remaining),
+            "action_cost_in_objective": "off_hard",
+            "action_cost_enable_requested": bool(self.action_cost_objective_enable_requested),
+            "action_cost_override_blocked": bool(
+                self.action_cost_objective_override_blocked
+            ),
         }
 
     def _control_schema_posterior(self) -> dict[str, dict[str, float]]:
@@ -1092,6 +1106,13 @@ class ActiveInferenceEFE(Agent):
                         "exploration_min_steps": int(self.exploration_min_steps),
                         "exploration_max_steps": int(self.exploration_max_steps),
                         "exploration_fraction": float(self.exploration_fraction),
+                        "action_cost_in_objective": "off_hard",
+                        "action_cost_enable_requested": bool(
+                            self.action_cost_objective_enable_requested
+                        ),
+                        "action_cost_override_blocked": bool(
+                            self.action_cost_objective_override_blocked
+                        ),
                     },
                     "final_hypothesis_summary": self.hypothesis_bank.summary(),
                     "final_posterior_delta_report": dict(
