@@ -391,6 +391,31 @@ def _context_features(
     }
 
 
+def _action_space_compatibility_reason(
+    hypothesis: HypothesisInstanceV1,
+    available_actions: set[int],
+) -> str | None:
+    family_id = str(hypothesis.family_id)
+    mode_id = str(hypothesis.mode_id)
+
+    if family_id == "navigation" and not any(v in available_actions for v in (1, 2, 3, 4, 7)):
+        return "family_requires_navigation_action"
+    if family_id == "local_transform" and 6 not in available_actions:
+        return "family_requires_action6"
+    if family_id == "global_transform" and not any(v in available_actions for v in (5, 6)):
+        return "family_requires_action5_or_action6"
+    if family_id == "progress_trigger" and not any(v in available_actions for v in (5, 6)):
+        return "family_requires_progress_action"
+
+    if mode_id == "interact" and not any(v in available_actions for v in (5, 6)):
+        return "mode_requires_interact_action"
+    if mode_id == "confirm" and not any(v in available_actions for v in (5, 6, 7)):
+        return "mode_requires_confirm_action"
+    if mode_id == "navigate" and not any(v in available_actions for v in (1, 2, 3, 4, 7)):
+        return "mode_requires_navigation_action"
+    return None
+
+
 def _impossible_signature_keys(
     family_id: str,
     parameter_id: str,
@@ -526,6 +551,16 @@ def _transition_mode(mode_id: str, action_id: int, observed_signature_key: str) 
     return mode_id
 
 
+def _mode_transition_soft_confidence(action_id: int, observed_signature_key: str) -> float:
+    if observed_signature_key.endswith("progress=1"):
+        return 0.95
+    if int(action_id) in (1, 2, 3, 4, 7):
+        return 0.72
+    if int(action_id) in (5, 6):
+        return 0.78
+    return 0.60
+
+
 class ActiveInferenceHypothesisBankV1:
     def __init__(self) -> None:
         self.modes: list[str] = ["unknown", "navigate", "interact", "confirm"]
@@ -566,6 +601,8 @@ class ActiveInferenceHypothesisBankV1:
         self.last_vfe_bits: float = 0.0
         self.last_observed_signature: str = ""
         self.last_posterior_delta_report: dict[str, Any] = {}
+        self.last_action_space_signature: str = ""
+        self.action_space_constraint_report: dict[str, Any] = {}
 
     def _renormalize(self, posterior: dict[str, float]) -> dict[str, float]:
         total = sum(max(0.0, weight) for weight in posterior.values())
@@ -643,7 +680,85 @@ class ActiveInferenceHypothesisBankV1:
             "last_vfe_bits": float(self.last_vfe_bits),
             "last_observed_signature": self.last_observed_signature,
             "last_posterior_delta_report": dict(self.last_posterior_delta_report),
+            "action_space_constraint_report": dict(self.action_space_constraint_report),
         }
+
+    def apply_action_space_constraints(
+        self,
+        available_actions: list[int],
+    ) -> dict[str, Any]:
+        available_set = {int(v) for v in available_actions}
+        signature = ",".join(str(v) for v in sorted(available_set))
+        if (
+            signature == self.last_action_space_signature
+            and self.action_space_constraint_report
+        ):
+            return dict(self.action_space_constraint_report)
+
+        compatible_ids: set[str] = set()
+        elimination_by_reason: dict[str, int] = {}
+        posterior_before = dict(self.posterior_by_hypothesis_id)
+        for hypothesis in self.hypotheses:
+            reason = _action_space_compatibility_reason(hypothesis, available_set)
+            if reason is None:
+                compatible_ids.add(hypothesis.hypothesis_id)
+                continue
+            elimination_by_reason[reason] = elimination_by_reason.get(reason, 0) + 1
+
+        if compatible_ids:
+            total = sum(
+                float(posterior_before.get(hid, 0.0))
+                for hid in compatible_ids
+            )
+            constrained: dict[str, float] = {
+                hid: 0.0 for hid in posterior_before
+            }
+            if total <= EPS:
+                uniform = 1.0 / float(max(1, len(compatible_ids)))
+                for hid in compatible_ids:
+                    constrained[hid] = uniform
+            else:
+                for hid in compatible_ids:
+                    constrained[hid] = float(posterior_before.get(hid, 0.0) / total)
+            self.posterior_by_hypothesis_id = constrained
+        else:
+            # Keep posterior unchanged if all hypotheses were deemed incompatible.
+            self.posterior_by_hypothesis_id = dict(posterior_before)
+
+        report = {
+            "schema_name": "active_inference_action_space_constraint_report_v1",
+            "schema_version": 1,
+            "available_actions": [int(v) for v in sorted(available_set)],
+            "active_hypothesis_count_before": int(
+                sum(1 for v in posterior_before.values() if float(v) > 1.0e-4)
+            ),
+            "active_hypothesis_count_after": int(
+                sum(1 for v in self.posterior_by_hypothesis_id.values() if float(v) > 1.0e-4)
+            ),
+            "compatible_hypothesis_count": int(len(compatible_ids)),
+            "eliminated_count_by_action_space_reason": {
+                str(key): int(value)
+                for (key, value) in sorted(elimination_by_reason.items())
+            },
+            "mode_elimination_due_to_action_space_incompatibility": int(
+                sum(
+                    value
+                    for (key, value) in elimination_by_reason.items()
+                    if str(key).startswith("mode_")
+                )
+            ),
+            "family_elimination_due_to_action_space_incompatibility": int(
+                sum(
+                    value
+                    for (key, value) in elimination_by_reason.items()
+                    if str(key).startswith("family_")
+                )
+            ),
+            "applied": bool(bool(compatible_ids)),
+        }
+        self.last_action_space_signature = signature
+        self.action_space_constraint_report = report
+        return dict(report)
 
     def _predict_distribution_for_hypothesis(
         self,
@@ -812,6 +927,8 @@ class ActiveInferenceHypothesisBankV1:
         }
         transitioned_out_hypothesis_ids: set[str] = set()
         transition_count = 0
+        soft_confidence_weighted_sum = 0.0
+        soft_confidence_weight_mass = 0.0
         for hypothesis in self.hypotheses:
             weight = float(updated.get(hypothesis.hypothesis_id, 0.0))
             if weight <= 0.0:
@@ -825,10 +942,24 @@ class ActiveInferenceHypothesisBankV1:
                 (next_mode, hypothesis.family_id, hypothesis.parameter_id),
                 hypothesis.hypothesis_id,
             )
-            if target_id != hypothesis.hypothesis_id:
-                transitioned_out_hypothesis_ids.add(hypothesis.hypothesis_id)
-                transition_count += 1
-            transitioned[target_id] = transitioned.get(target_id, 0.0) + weight
+            if target_id == hypothesis.hypothesis_id:
+                transitioned[target_id] = transitioned.get(target_id, 0.0) + weight
+                continue
+
+            soft_confidence = _mode_transition_soft_confidence(
+                int(candidate.action_id),
+                observed_signature_key,
+            )
+            transition_mass = weight * float(max(0.0, min(1.0, soft_confidence)))
+            stay_mass = weight - transition_mass
+            transitioned[target_id] = transitioned.get(target_id, 0.0) + transition_mass
+            transitioned[hypothesis.hypothesis_id] = (
+                transitioned.get(hypothesis.hypothesis_id, 0.0) + stay_mass
+            )
+            transitioned_out_hypothesis_ids.add(hypothesis.hypothesis_id)
+            transition_count += 1
+            soft_confidence_weighted_sum += float(weight) * float(soft_confidence)
+            soft_confidence_weight_mass += float(weight)
 
         posterior_after = self._renormalize(transitioned)
 
@@ -896,7 +1027,16 @@ class ActiveInferenceHypothesisBankV1:
                 for (key, value) in sorted(survivor_mode_histogram.items())
             },
             "mode_transition_count": int(transition_count),
+            "mode_transition_soft_confidence": float(
+                soft_confidence_weighted_sum / max(EPS, soft_confidence_weight_mass)
+            ),
             "example_eliminated_hypotheses": eliminated_examples,
+            "mode_elimination_due_to_action_space_incompatibility": int(
+                self.action_space_constraint_report.get(
+                    "mode_elimination_due_to_action_space_incompatibility",
+                    0,
+                )
+            ),
         }
         return posterior_after, report
 
@@ -958,6 +1098,8 @@ class ActiveInferenceHypothesisBankV1:
         cloned.last_vfe_bits = float(self.last_vfe_bits)
         cloned.last_observed_signature = str(self.last_observed_signature)
         cloned.last_posterior_delta_report = dict(self.last_posterior_delta_report)
+        cloned.last_action_space_signature = str(self.last_action_space_signature)
+        cloned.action_space_constraint_report = dict(self.action_space_constraint_report)
         return cloned
 
     def update_with_observation(

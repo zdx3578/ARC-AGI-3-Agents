@@ -26,6 +26,7 @@ class ActiveInferencePolicyEvaluatorV1:
         top_k_reasoning: int = 5,
         rollout_horizon: int = 2,
         rollout_discount: float = 0.55,
+        tie_epsilon: float = 1.0e-6,
         weight_overrides: dict[str, dict[str, float]] | None = None,
     ) -> None:
         self.explore_steps = int(max(1, explore_steps))
@@ -33,6 +34,7 @@ class ActiveInferencePolicyEvaluatorV1:
         self.top_k_reasoning = int(max(1, top_k_reasoning))
         self.rollout_horizon = int(max(1, rollout_horizon))
         self.rollout_discount = float(max(0.0, min(1.0, rollout_discount)))
+        self.tie_epsilon = float(max(0.0, tie_epsilon))
         self.weight_overrides = weight_overrides or {}
 
     def _weights_for_phase(self, phase: str) -> dict[str, float]:
@@ -261,6 +263,10 @@ class ActiveInferencePolicyEvaluatorV1:
             )
             return fallback, []
 
+        selection_metric = "total_efe"
+        selection_score_by_candidate: dict[str, float] = {
+            entry.candidate.candidate_id: float(entry.total_efe) for entry in entries
+        }
         if int(remaining_budget) >= 2:
             rollout_scores = self._rollout_score_by_candidate(
                 packet=packet,
@@ -270,13 +276,66 @@ class ActiveInferencePolicyEvaluatorV1:
                 phase=phase,
                 entries=entries,
             )
+            selection_metric = "rollout_total_efe"
+            selection_score_by_candidate = {
+                entry.candidate.candidate_id: float(
+                    rollout_scores.get(entry.candidate.candidate_id, entry.total_efe)
+                )
+                for entry in entries
+            }
             entries.sort(
                 key=lambda entry: (
-                    float(rollout_scores.get(entry.candidate.candidate_id, entry.total_efe)),
+                    float(selection_score_by_candidate.get(entry.candidate.candidate_id, entry.total_efe)),
                     float(entry.total_efe),
                     int(entry.candidate.action_id),
                     entry.candidate.candidate_id,
                 )
             )
 
+        best_score = float(
+            selection_score_by_candidate.get(
+                entries[0].candidate.candidate_id,
+                entries[0].total_efe,
+            )
+        )
+        second_score = (
+            float(
+                selection_score_by_candidate.get(
+                    entries[1].candidate.candidate_id,
+                    entries[1].total_efe,
+                )
+            )
+            if len(entries) >= 2
+            else best_score
+        )
+        tie_group_size = int(
+            sum(
+                1
+                for entry in entries
+                if abs(
+                    float(
+                        selection_score_by_candidate.get(
+                            entry.candidate.candidate_id,
+                            entry.total_efe,
+                        )
+                    )
+                    - best_score
+                )
+                <= self.tie_epsilon
+            )
+        )
+        if tie_group_size > 1:
+            tie_breaker_rule_applied = "fixed_order(action_id,candidate_id)"
+        else:
+            tie_breaker_rule_applied = "argmin_unique"
+
+        entries[0].witness["selection_diagnostics_v1"] = {
+            "selection_metric": selection_metric,
+            "best_score": float(best_score),
+            "second_best_score": float(second_score),
+            "best_vs_second_best_delta_total_efe": float(second_score - best_score),
+            "tie_group_size": tie_group_size,
+            "tie_epsilon": float(self.tie_epsilon),
+            "tie_breaker_rule_applied": tie_breaker_rule_applied,
+        }
         return entries[0].candidate, entries

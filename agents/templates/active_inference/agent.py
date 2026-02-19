@@ -163,6 +163,9 @@ class ActiveInferenceEFE(Agent):
         self._previous_action_candidate: ActionCandidateV1 | None = None
         self._no_change_streak = 0
         self._available_actions_history: list[list[int]] = []
+        self._control_schema_counts: dict[str, dict[str, int]] = {}
+        self._tracked_agent_token_digest: str | None = None
+        self._latest_navigation_state_estimate: dict[str, Any] = {}
 
         self.trace_enabled = _env_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
         self.trace_recorder: ActiveInferenceTraceRecorderV1 | None = None
@@ -262,6 +265,97 @@ class ActiveInferenceEFE(Agent):
             },
         }
 
+    def _control_schema_posterior(self) -> dict[str, dict[str, float]]:
+        out: dict[str, dict[str, float]] = {}
+        for action_id, counts in sorted(self._control_schema_counts.items()):
+            total = float(sum(int(v) for v in counts.values()))
+            if total <= 0.0:
+                continue
+            out[str(action_id)] = {
+                str(delta_key): float(int(count) / total)
+                for (delta_key, count) in sorted(counts.items())
+            }
+        return out
+
+    def _estimate_navigation_state(
+        self,
+        previous_representation: RepresentationStateV1,
+        current_representation: RepresentationStateV1,
+        executed_candidate: ActionCandidateV1,
+    ) -> dict[str, Any]:
+        previous_nodes = list(previous_representation.object_nodes)
+        current_nodes = list(current_representation.object_nodes)
+        if not previous_nodes or not current_nodes:
+            return {
+                "schema_name": "active_inference_navigation_state_estimate_v1",
+                "schema_version": 1,
+                "matched": False,
+                "reason": "missing_object_nodes",
+                "control_schema_posterior": self._control_schema_posterior(),
+            }
+
+        best_pair: tuple[Any, Any] | None = None
+        best_score = 10**9
+        for previous in previous_nodes:
+            for current in current_nodes:
+                if int(previous.color) != int(current.color):
+                    continue
+                area_gap = abs(int(previous.area) - int(current.area))
+                if area_gap > max(2, int(previous.area * 0.3)):
+                    continue
+                delta_x = int(current.centroid_x) - int(previous.centroid_x)
+                delta_y = int(current.centroid_y) - int(previous.centroid_y)
+                shift = abs(delta_x) + abs(delta_y)
+                if shift <= 0:
+                    continue
+                score = (area_gap * 10) + shift
+                if self._tracked_agent_token_digest is not None:
+                    if str(previous.digest) != self._tracked_agent_token_digest:
+                        score += 5
+                if score < best_score:
+                    best_score = score
+                    best_pair = (previous, current)
+
+        if best_pair is None:
+            return {
+                "schema_name": "active_inference_navigation_state_estimate_v1",
+                "schema_version": 1,
+                "matched": False,
+                "reason": "no_translation_match",
+                "control_schema_posterior": self._control_schema_posterior(),
+            }
+
+        previous, current = best_pair
+        delta_x = int(current.centroid_x) - int(previous.centroid_x)
+        delta_y = int(current.centroid_y) - int(previous.centroid_y)
+        delta_key = f"dx={delta_x}|dy={delta_y}"
+        action_key = str(int(executed_candidate.action_id))
+        per_action = self._control_schema_counts.setdefault(action_key, {})
+        per_action[delta_key] = int(per_action.get(delta_key, 0) + 1)
+        self._tracked_agent_token_digest = str(current.digest)
+
+        return {
+            "schema_name": "active_inference_navigation_state_estimate_v1",
+            "schema_version": 1,
+            "matched": True,
+            "tracked_agent_token_id": str(current.digest),
+            "tracked_agent_token_pair": {
+                "previous_digest": str(previous.digest),
+                "current_digest": str(current.digest),
+            },
+            "agent_pos_xy": {
+                "x": int(current.centroid_x),
+                "y": int(current.centroid_y),
+            },
+            "agent_pos_region": {
+                "x": int(max(0, min(7, int(current.centroid_x) // 8))),
+                "y": int(max(0, min(7, int(current.centroid_y) // 8))),
+            },
+            "delta_pos_xy": {"dx": int(delta_x), "dy": int(delta_y)},
+            "action_id": int(executed_candidate.action_id),
+            "control_schema_posterior": self._control_schema_posterior(),
+        }
+
     def _reasoning_for_forced_reset(self, packet: ObservationPacketV1) -> dict[str, Any]:
         return {
             "schema_name": "active_inference_reasoning_v2",
@@ -280,6 +374,10 @@ class ActiveInferenceEFE(Agent):
             "posterior_delta_report_previous_step": dict(
                 self.hypothesis_bank.last_posterior_delta_report
             ),
+            "action_space_constraint_report_v1": dict(
+                self.hypothesis_bank.action_space_constraint_report
+            ),
+            "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
             "no_change_streak": int(self._no_change_streak),
         }
@@ -309,6 +407,10 @@ class ActiveInferenceEFE(Agent):
             "posterior_delta_report_previous_step": dict(
                 self.hypothesis_bank.last_posterior_delta_report
             ),
+            "action_space_constraint_report_v1": dict(
+                self.hypothesis_bank.action_space_constraint_report
+            ),
+            "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
             "no_change_streak": int(self._no_change_streak),
         }
@@ -327,6 +429,9 @@ class ActiveInferenceEFE(Agent):
         candidates: list[ActionCandidateV1] = []
         ranked_entries = []
         causal_signature = None
+        selection_diagnostics: dict[str, Any] = {}
+        action_space_constraint_report: dict[str, Any] = {}
+        navigation_state_estimate: dict[str, Any] = {}
         phase = "control"
 
         diagnostics.start("observation_contract")
@@ -372,6 +477,40 @@ class ActiveInferenceEFE(Agent):
                 failure_message=str(exc),
             )
             return fallback
+
+        diagnostics.start("action_space_constraint")
+        try:
+            action_space_constraint_report = self.hypothesis_bank.apply_action_space_constraints(
+                packet.available_actions
+            )
+            diagnostics.finish_ok(
+                "action_space_constraint",
+                {
+                    "active_hypothesis_count_before": int(
+                        action_space_constraint_report.get(
+                            "active_hypothesis_count_before",
+                            0,
+                        )
+                    ),
+                    "active_hypothesis_count_after": int(
+                        action_space_constraint_report.get(
+                            "active_hypothesis_count_after",
+                            0,
+                        )
+                    ),
+                    "mode_elimination_due_to_action_space_incompatibility": int(
+                        action_space_constraint_report.get(
+                            "mode_elimination_due_to_action_space_incompatibility",
+                            0,
+                        )
+                    ),
+                },
+            )
+        except Exception as exc:
+            diagnostics.finish_rejected(
+                "action_space_constraint",
+                f"action_space_constraint_error::{type(exc).__name__}",
+            )
 
         diagnostics.start("representation_build")
         try:
@@ -433,6 +572,12 @@ class ActiveInferenceEFE(Agent):
                     previous_representation=self._previous_representation,
                     observed_signature=causal_signature,
                 )
+                navigation_state_estimate = self._estimate_navigation_state(
+                    self._previous_representation,
+                    representation,
+                    self._previous_action_candidate,
+                )
+                self._latest_navigation_state_estimate = dict(navigation_state_estimate)
                 if str(causal_signature.obs_change_type) == "NO_CHANGE":
                     self._no_change_streak += 1
                 else:
@@ -455,10 +600,15 @@ class ActiveInferenceEFE(Agent):
                         "eliminated_count_by_reason": dict(
                             posterior_report.get("eliminated_count_by_reason", {})
                         ),
+                        "mode_transition_soft_confidence": float(
+                            posterior_report.get("mode_transition_soft_confidence", 0.0)
+                        ),
+                        "navigation_state_estimate_v1": dict(navigation_state_estimate),
                     },
                 )
             else:
                 self._no_change_streak = 0
+                self._latest_navigation_state_estimate = {}
                 diagnostics.finish_ok(
                     "causal_update",
                     {"updated": False, "reason": "insufficient_history"},
@@ -468,6 +618,7 @@ class ActiveInferenceEFE(Agent):
                 "causal_update",
                 f"causal_update_error::{type(exc).__name__}",
             )
+            self._latest_navigation_state_estimate = {}
 
         remaining_budget = max(0, int(self.MAX_ACTIONS - int(self.action_counter)))
         diagnostics.start("phase_determination")
@@ -560,6 +711,8 @@ class ActiveInferenceEFE(Agent):
                     "posterior_delta_report_previous_step": dict(
                         self.hypothesis_bank.last_posterior_delta_report
                     ),
+                    "action_space_constraint_report_v1": dict(action_space_constraint_report),
+                    "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
                     "representation_summary": representation.summary,
                     "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "remaining_budget": int(remaining_budget),
@@ -599,6 +752,8 @@ class ActiveInferenceEFE(Agent):
                             "posterior_delta_report_previous_step": dict(
                                 self.hypothesis_bank.last_posterior_delta_report
                             ),
+                            "action_space_constraint_report_v1": dict(action_space_constraint_report),
+                            "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
                             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                             "remaining_budget": int(remaining_budget),
                             "stage_diagnostics_v1": diagnostics.to_dicts(),
@@ -629,12 +784,20 @@ class ActiveInferenceEFE(Agent):
                             phase=phase,
                             remaining_budget=remaining_budget,
                         )
+                        if ranked_entries:
+                            selection_diagnostics = dict(
+                                ranked_entries[0].witness.get(
+                                    "selection_diagnostics_v1",
+                                    {},
+                                )
+                            )
                         diagnostics.finish_ok(
                             "policy_selection",
                             {
                                 "selected_candidate_id": selected_candidate.candidate_id,
                                 "selected_action_id": int(selected_candidate.action_id),
                                 "ranked_count": int(len(ranked_entries)),
+                                "selection_diagnostics_v1": dict(selection_diagnostics),
                             },
                         )
 
@@ -676,6 +839,9 @@ class ActiveInferenceEFE(Agent):
                             "posterior_delta_report_previous_step": dict(
                                 self.hypothesis_bank.last_posterior_delta_report
                             ),
+                            "action_space_constraint_report_v1": dict(action_space_constraint_report),
+                            "selection_diagnostics_v1": dict(selection_diagnostics),
+                            "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
                             "representation_summary": representation.summary,
                             "causal_event_signature_previous_step": (
                                 causal_signature.to_dict() if causal_signature else None
@@ -736,9 +902,12 @@ class ActiveInferenceEFE(Agent):
                     "posterior_delta_report_previous_step": dict(
                         self.hypothesis_bank.last_posterior_delta_report
                     ),
+                    "action_space_constraint_report_v1": dict(action_space_constraint_report),
+                    "selection_diagnostics_v1": dict(selection_diagnostics),
                     "causal_event_signature_previous_step": (
                         causal_signature.to_dict() if causal_signature else None
                     ),
+                    "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
                     "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "stage_diagnostics_v1": diagnostics.to_dicts(),
                     "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
@@ -764,6 +933,13 @@ class ActiveInferenceEFE(Agent):
                     "final_posterior_delta_report": dict(
                         self.hypothesis_bank.last_posterior_delta_report
                     ),
+                    "final_action_space_constraint_report": dict(
+                        self.hypothesis_bank.action_space_constraint_report
+                    ),
+                    "final_navigation_state_estimate_v1": dict(
+                        self._latest_navigation_state_estimate
+                    ),
+                    "final_control_schema_posterior": self._control_schema_posterior(),
                     "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "final_no_change_streak": int(self._no_change_streak),
                 }

@@ -51,6 +51,9 @@ def test_observation_packet_normalizes_nested_frame() -> None:
     assert packet.num_frames_received >= 2
     assert packet.frame_chain_digests
     assert packet.frame_chain_macro_signature["micro_signature_count"] >= 1
+    assert packet.frame_chain_macro_signature["dominant_micro_object_change_type"]
+    assert packet.frame_chain_micro_signatures[0]["micro_pixel_change_type"]
+    assert packet.frame_chain_micro_signatures[0]["micro_object_change_type"]
 
 
 @pytest.mark.unit
@@ -116,6 +119,34 @@ def test_policy_accepts_weight_override() -> None:
 
 
 @pytest.mark.unit
+def test_policy_selection_reports_tie_diagnostics() -> None:
+    packet = build_observation_packet_v1(
+        _frame_data_stub(),
+        game_id="ls20",
+        card_id="card-x",
+        action_counter=2,
+    )
+    representation = build_representation_state_v1(packet)
+    candidates = build_action_candidates_v1(packet, representation)
+    bank = ActiveInferenceHypothesisBankV1()
+    policy = ActiveInferencePolicyEvaluatorV1(rollout_horizon=1)
+    selected, entries = policy.select_action(
+        packet=packet,
+        representation=representation,
+        candidates=candidates,
+        hypothesis_bank=bank,
+        phase="explore",
+        remaining_budget=1,
+    )
+    assert selected.candidate_id
+    assert entries
+    diagnostics = entries[0].witness["selection_diagnostics_v1"]
+    assert "best_vs_second_best_delta_total_efe" in diagnostics
+    assert "tie_group_size" in diagnostics
+    assert "tie_breaker_rule_applied" in diagnostics
+
+
+@pytest.mark.unit
 def test_hypothesis_bank_split_information_gain_contract() -> None:
     packet = build_observation_packet_v1(
         _frame_data_stub(),
@@ -173,6 +204,16 @@ def test_hypothesis_bank_posterior_delta_report_fields() -> None:
     assert "eliminated_count_by_reason" in report
     assert "survivor_family_histogram" in report
     assert "mode_transition_count" in report
+    assert "mode_transition_soft_confidence" in report
+
+
+@pytest.mark.unit
+def test_hypothesis_bank_action_space_constraints_report() -> None:
+    bank = ActiveInferenceHypothesisBankV1()
+    report = bank.apply_action_space_constraints([1, 2, 3, 4])
+    assert report["schema_name"] == "active_inference_action_space_constraint_report_v1"
+    assert "mode_elimination_due_to_action_space_incompatibility" in report
+    assert report["active_hypothesis_count_after"] <= report["active_hypothesis_count_before"]
 
 
 @pytest.mark.unit

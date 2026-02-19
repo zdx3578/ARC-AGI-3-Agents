@@ -38,12 +38,16 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 
 - observation contract (state, levels, available actions, frame)
 - frame-chain diagnostics (1-N frame digests + micro/macro transition signatures)
+- micro-signature dual channel (`micro_pixel_change_type` + `micro_object_change_type`)
 - object representation contract (same-color and mixed-color connected components with 4/8 connectivity + hierarchy links + Action6 proposals)
 - world-model hypothesis bank (hidden mode state + rule-family/parameter version space)
 - posterior delta report per step (elimination/falsification reason buckets + survivor histograms)
+- action-space compatibility pruning + soft mode-transition confidence diagnostics
 - Expected Free Energy ledger per candidate (risk / ambiguity / split information gain / action cost / complexity / VFE term)
 - causal event signatures for action interventions (`obs_change_type` diff semantics)
 - Action6 proposal diagnostics (region coverage / redundancy / context diversity / hit-object rate)
+- action-selection tie diagnostics (`best_vs_second_best_delta_total_efe`, `tie_group_size`, `tie_breaker_rule_applied`)
+- navigation-state diagnostics (`tracked_agent_token_id`, `agent_pos_xy`, `delta_pos_xy`, `control_schema_posterior`)
 - JSONL trace emission for bottleneck analysis
 - stage diagnostics (`stage / duration_ms / status / reject_reason_v1`)
 - failure taxonomy in reasoning for non-silent fallback paths

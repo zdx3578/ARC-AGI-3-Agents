@@ -141,10 +141,18 @@ def _micro_signature_for_transition(
     else:
         micro_type = "OBSERVED_UNCLASSIFIED"
 
+    object_micro_type, object_witness = _micro_object_change_type(
+        previous_frame,
+        current_frame,
+        changed_pixel_count=int(changed_count),
+        changed_area_ratio=float(changed_area_ratio),
+    )
+
     digest_source = {
         "from_index": int(from_index),
         "to_index": int(to_index),
-        "micro_change_type": micro_type,
+        "micro_pixel_change_type": micro_type,
+        "micro_object_change_type": object_micro_type,
         "changed_pixel_count": int(changed_count),
         "changed_area_ratio": round(changed_area_ratio, 6),
         "changed_bbox": changed_bbox,
@@ -157,8 +165,11 @@ def _micro_signature_for_transition(
         "from_index": int(from_index),
         "to_index": int(to_index),
         "micro_change_type": micro_type,
+        "micro_pixel_change_type": micro_type,
+        "micro_object_change_type": object_micro_type,
         "changed_pixel_count": int(changed_count),
         "changed_area_ratio": float(changed_area_ratio),
+        "object_witness": object_witness,
         "signature_digest": signature_digest,
     }
     if changed_bbox is not None:
@@ -196,7 +207,8 @@ def _frame_chain_summary(
         dedup_digests.append(digest)
 
     micro_signatures: list[dict[str, Any]] = []
-    micro_hist: dict[str, int] = {}
+    micro_pixel_hist: dict[str, int] = {}
+    micro_object_hist: dict[str, int] = {}
     total_changed_pixels = 0
     for idx in range(len(dedup_frames) - 1):
         micro = _micro_signature_for_transition(
@@ -206,26 +218,50 @@ def _frame_chain_summary(
             idx + 1,
         )
         micro_signatures.append(micro)
-        micro_type = str(micro.get("micro_change_type", "OBSERVED_UNCLASSIFIED"))
-        micro_hist[micro_type] = micro_hist.get(micro_type, 0) + 1
+        pixel_type = str(micro.get("micro_pixel_change_type", "OBSERVED_UNCLASSIFIED"))
+        object_type = str(micro.get("micro_object_change_type", "OBSERVED_UNCLASSIFIED"))
+        micro_pixel_hist[pixel_type] = micro_pixel_hist.get(pixel_type, 0) + 1
+        micro_object_hist[object_type] = micro_object_hist.get(object_type, 0) + 1
         total_changed_pixels += int(micro.get("changed_pixel_count", 0))
 
-    dominant_micro_type = (
-        max(micro_hist.items(), key=lambda item: (item[1], item[0]))[0]
-        if micro_hist
+    dominant_micro_pixel_type = (
+        max(micro_pixel_hist.items(), key=lambda item: (item[1], item[0]))[0]
+        if micro_pixel_hist
+        else "NO_CHANGE"
+    )
+    dominant_micro_object_type = (
+        max(micro_object_hist.items(), key=lambda item: (item[1], item[0]))[0]
+        if micro_object_hist
         else "NO_CHANGE"
     )
     macro_signature = {
         "micro_signature_count": int(len(micro_signatures)),
         "total_changed_pixels": int(total_changed_pixels),
-        "non_no_change_transition_count": int(
+        "non_no_change_pixel_transition_count": int(
             sum(
                 1
                 for micro in micro_signatures
-                if str(micro.get("micro_change_type", "")) != "NO_CHANGE"
+                if str(micro.get("micro_pixel_change_type", "")) != "NO_CHANGE"
             )
         ),
-        "dominant_micro_change_type": dominant_micro_type,
+        "non_no_change_object_transition_count": int(
+            sum(
+                1
+                for micro in micro_signatures
+                if str(micro.get("micro_object_change_type", "")) != "NO_CHANGE"
+            )
+        ),
+        "dominant_micro_change_type": dominant_micro_pixel_type,
+        "dominant_micro_pixel_change_type": dominant_micro_pixel_type,
+        "dominant_micro_object_change_type": dominant_micro_object_type,
+        "micro_pixel_histogram": {
+            str(key): int(value)
+            for (key, value) in sorted(micro_pixel_hist.items())
+        },
+        "micro_object_histogram": {
+            str(key): int(value)
+            for (key, value) in sorted(micro_object_hist.items())
+        },
     }
     return dedup_digests, micro_signatures, macro_signature
 
@@ -407,6 +443,103 @@ def _extract_components(
         reverse=True,
     )
     return components
+
+
+def _translation_match_count_between_component_lists(
+    previous_components: list[_ComponentWithCells],
+    current_components: list[_ComponentWithCells],
+) -> int:
+    if not previous_components or not current_components:
+        return 0
+    matched = 0
+    used_current_ids: set[str] = set()
+    for previous in previous_components:
+        best_current: _ComponentWithCells | None = None
+        best_score = 10**9
+        for current in current_components:
+            if current.node.component_id in used_current_ids:
+                continue
+            if current.node.color_signature != previous.node.color_signature:
+                continue
+            area_gap = abs(int(current.node.area) - int(previous.node.area))
+            if area_gap > max(2, int(previous.node.area * 0.2)):
+                continue
+            centroid_gap = abs(int(current.node.centroid_x) - int(previous.node.centroid_x)) + abs(
+                int(current.node.centroid_y) - int(previous.node.centroid_y)
+            )
+            score = area_gap * 10 + centroid_gap
+            if score < best_score:
+                best_score = score
+                best_current = current
+        if best_current is None:
+            continue
+        shift = abs(int(best_current.node.centroid_x) - int(previous.node.centroid_x)) + abs(
+            int(best_current.node.centroid_y) - int(previous.node.centroid_y)
+        )
+        if shift > 0:
+            matched += 1
+        used_current_ids.add(best_current.node.component_id)
+    return int(matched)
+
+
+def _micro_object_change_type(
+    previous_frame: list[list[int]],
+    current_frame: list[list[int]],
+    *,
+    changed_pixel_count: int,
+    changed_area_ratio: float,
+) -> tuple[str, dict[str, Any]]:
+    if int(changed_pixel_count) <= 0:
+        return (
+            "NO_CHANGE",
+            {
+                "previous_same8_count": 0,
+                "current_same8_count": 0,
+                "object_count_delta": 0,
+                "translation_match_count": 0,
+            },
+        )
+
+    previous_background = _infer_background_color(previous_frame)
+    current_background = _infer_background_color(current_frame)
+    previous_components = _extract_components(
+        previous_frame,
+        background_color=previous_background,
+        connectivity=8,
+        same_color=True,
+        view_name="micro_prev_same8",
+    )
+    current_components = _extract_components(
+        current_frame,
+        background_color=current_background,
+        connectivity=8,
+        same_color=True,
+        view_name="micro_curr_same8",
+    )
+    object_count_delta = int(len(current_components) - len(previous_components))
+    translation_match_count = _translation_match_count_between_component_lists(
+        previous_components,
+        current_components,
+    )
+
+    if object_count_delta != 0:
+        object_type = "CC_COUNT_CHANGE"
+    elif translation_match_count > 0 and float(changed_area_ratio) < 0.35:
+        object_type = "CC_TRANSLATION"
+    elif float(changed_area_ratio) >= 0.35:
+        object_type = "GLOBAL_PATTERN_CHANGE"
+    elif int(changed_pixel_count) > 0 and float(changed_area_ratio) < 0.12:
+        object_type = "LOCAL_COLOR_CHANGE"
+    else:
+        object_type = "OBSERVED_UNCLASSIFIED"
+
+    witness = {
+        "previous_same8_count": int(len(previous_components)),
+        "current_same8_count": int(len(current_components)),
+        "object_count_delta": int(object_count_delta),
+        "translation_match_count": int(translation_match_count),
+    }
+    return object_type, witness
 
 
 def _build_owner_map(
