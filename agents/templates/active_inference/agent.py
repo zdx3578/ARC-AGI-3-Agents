@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import uuid
 from typing import Any
 
 from arcengine import FrameData, GameAction, GameState
@@ -117,6 +118,15 @@ class ActiveInferenceEFE(Agent):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self.episode_session_id = uuid.uuid4().hex[:12]
+        self.cross_episode_memory_hard_off = True
+        self.cross_episode_memory_enable_requested = _env_bool(
+            "ACTIVE_INFERENCE_ENABLE_CROSS_EPISODE_MEMORY",
+            False,
+        )
+        self.cross_episode_memory_override_blocked = bool(
+            self.cross_episode_memory_enable_requested
+        )
         self.MAX_ACTIONS = max(1, _env_int("ACTIVE_INFERENCE_MAX_ACTIONS", 80))
         self.component_connectivity = (
             4 if _env_int("ACTIVE_INFERENCE_COMPONENT_CONNECTIVITY", 8) == 4 else 8
@@ -148,6 +158,19 @@ class ActiveInferenceEFE(Agent):
         )
 
         explore_steps = max(1, _env_int("ACTIVE_INFERENCE_EXPLORE_STEPS", 20))
+        self.exploration_base_steps = int(explore_steps)
+        self.exploration_min_steps = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_EXPLORATION_MIN_STEPS", 20),
+        )
+        self.exploration_max_steps = max(
+            self.exploration_min_steps,
+            _env_int("ACTIVE_INFERENCE_EXPLORATION_MAX_STEPS", 120),
+        )
+        self.exploration_fraction = max(
+            0.0,
+            min(1.0, _env_float("ACTIVE_INFERENCE_EXPLORATION_FRACTION", 0.35)),
+        )
         exploit_entropy_threshold = max(
             0.0, _env_float("ACTIVE_INFERENCE_EXPLOIT_ENTROPY_THRESHOLD", 0.9)
         )
@@ -271,6 +294,82 @@ class ActiveInferenceEFE(Agent):
             },
         }
 
+    def _memory_policy_v1(self) -> dict[str, Any]:
+        return {
+            "schema_name": "active_inference_memory_policy_v1",
+            "schema_version": 1,
+            "episode_session_id": str(self.episode_session_id),
+            "cross_episode_memory": "off_hard",
+            "persistent_learning_store_used": False,
+            "enable_requested": bool(self.cross_episode_memory_enable_requested),
+            "override_blocked": bool(self.cross_episode_memory_override_blocked),
+        }
+
+    def _reasoning_policy_payloads_v1(
+        self,
+        packet: ObservationPacketV1 | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        remaining_budget = max(0, int(self.MAX_ACTIONS - int(self.action_counter)))
+        early_probe_budget_remaining = max(
+            0,
+            int(self.early_probe_budget - int(self.action_counter)),
+        )
+        effective_explore_steps = self._effective_explore_steps(packet)
+        exploration_policy_payload = self._exploration_policy_v1(
+            packet=packet,
+            effective_explore_steps=effective_explore_steps,
+            remaining_budget=remaining_budget,
+            early_probe_budget_remaining=early_probe_budget_remaining,
+        )
+        return self._memory_policy_v1(), exploration_policy_payload
+
+    def _effective_explore_steps(self, packet: ObservationPacketV1 | None) -> int:
+        available_action_count = 1
+        if packet is not None:
+            available_action_count = max(1, int(len(packet.available_actions)))
+        action_space_factor = available_action_count * 4
+        budget_factor = int(round(float(self.MAX_ACTIONS) * float(self.exploration_fraction)))
+        effective = max(
+            int(self.exploration_base_steps),
+            int(self.exploration_min_steps),
+            int(action_space_factor),
+            int(budget_factor),
+        )
+        effective = min(
+            int(self.exploration_max_steps),
+            int(self.MAX_ACTIONS),
+            int(effective),
+        )
+        return int(max(1, effective))
+
+    def _exploration_policy_v1(
+        self,
+        *,
+        packet: ObservationPacketV1 | None,
+        effective_explore_steps: int,
+        remaining_budget: int,
+        early_probe_budget_remaining: int,
+    ) -> dict[str, Any]:
+        available_action_count = int(len(packet.available_actions)) if packet is not None else 0
+        exploration_budget_remaining = max(
+            0,
+            int(effective_explore_steps - int(self.action_counter)),
+        )
+        return {
+            "schema_name": "active_inference_exploration_policy_v1",
+            "schema_version": 1,
+            "base_explore_steps": int(self.exploration_base_steps),
+            "effective_explore_steps": int(effective_explore_steps),
+            "exploration_min_steps": int(self.exploration_min_steps),
+            "exploration_max_steps": int(self.exploration_max_steps),
+            "exploration_fraction": float(self.exploration_fraction),
+            "available_action_count": int(available_action_count),
+            "remaining_budget": int(remaining_budget),
+            "exploration_budget_remaining": int(exploration_budget_remaining),
+            "early_probe_budget_config": int(self.early_probe_budget),
+            "early_probe_budget_remaining": int(early_probe_budget_remaining),
+        }
+
     def _control_schema_posterior(self) -> dict[str, dict[str, float]]:
         out: dict[str, dict[str, float]] = {}
         for action_id, counts in sorted(self._control_schema_counts.items()):
@@ -363,6 +462,9 @@ class ActiveInferenceEFE(Agent):
         }
 
     def _reasoning_for_forced_reset(self, packet: ObservationPacketV1) -> dict[str, Any]:
+        memory_policy_payload, exploration_policy_payload = (
+            self._reasoning_policy_payloads_v1(packet)
+        )
         return {
             "schema_name": "active_inference_reasoning_v2",
             "schema_version": 2,
@@ -386,6 +488,8 @@ class ActiveInferenceEFE(Agent):
             "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
             "no_change_streak": int(self._no_change_streak),
+            "memory_policy_v1": memory_policy_payload,
+            "exploration_policy_v1": exploration_policy_payload,
         }
 
     def _reasoning_for_failure(
@@ -395,6 +499,9 @@ class ActiveInferenceEFE(Agent):
         failure_code: str,
         failure_message: str,
     ) -> dict[str, Any]:
+        memory_policy_payload, exploration_policy_payload = (
+            self._reasoning_policy_payloads_v1(packet)
+        )
         packet_summary = (
             self._observation_summary_for_trace(packet) if packet is not None else None
         )
@@ -419,6 +526,8 @@ class ActiveInferenceEFE(Agent):
             "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
             "no_change_streak": int(self._no_change_streak),
+            "memory_policy_v1": memory_policy_payload,
+            "exploration_policy_v1": exploration_policy_payload,
         }
 
     def choose_action(
@@ -438,6 +547,7 @@ class ActiveInferenceEFE(Agent):
         selection_diagnostics: dict[str, Any] = {}
         action_space_constraint_report: dict[str, Any] = {}
         navigation_state_estimate: dict[str, Any] = {}
+        exploration_policy_payload: dict[str, Any] = {}
         phase = "control"
 
         diagnostics.start("observation_contract")
@@ -631,12 +741,20 @@ class ActiveInferenceEFE(Agent):
             0,
             int(self.early_probe_budget - int(self.action_counter)),
         )
+        effective_explore_steps = self._effective_explore_steps(packet)
+        exploration_policy_payload = self._exploration_policy_v1(
+            packet=packet,
+            effective_explore_steps=effective_explore_steps,
+            remaining_budget=remaining_budget,
+            early_probe_budget_remaining=early_probe_budget_remaining,
+        )
         diagnostics.start("phase_determination")
         try:
             phase = self.policy.determine_phase(
                 action_counter=self.action_counter,
                 remaining_budget=remaining_budget,
                 hypothesis_bank=self.hypothesis_bank,
+                explore_steps_override=effective_explore_steps,
             )
             diagnostics.finish_ok(
                 "phase_determination",
@@ -644,6 +762,10 @@ class ActiveInferenceEFE(Agent):
                     "phase": phase,
                     "posterior_entropy_bits": float(self.hypothesis_bank.posterior_entropy()),
                     "remaining_budget": int(remaining_budget),
+                    "effective_explore_steps": int(effective_explore_steps),
+                    "exploration_budget_remaining": int(
+                        exploration_policy_payload.get("exploration_budget_remaining", 0)
+                    ),
                     "early_probe_budget_remaining": int(early_probe_budget_remaining),
                 },
             )
@@ -882,6 +1004,11 @@ class ActiveInferenceEFE(Agent):
                     )
 
         if isinstance(action.reasoning, dict):
+            action.reasoning.setdefault("memory_policy_v1", self._memory_policy_v1())
+            action.reasoning.setdefault(
+                "exploration_policy_v1",
+                dict(exploration_policy_payload),
+            )
             action.reasoning.setdefault("stage_diagnostics_v1", diagnostics.to_dicts())
             action.reasoning.setdefault("bottleneck_stage_v1", diagnostics.bottleneck_stage())
 
@@ -922,6 +1049,8 @@ class ActiveInferenceEFE(Agent):
                     ),
                     "action_space_constraint_report_v1": dict(action_space_constraint_report),
                     "selection_diagnostics_v1": dict(selection_diagnostics),
+                    "memory_policy_v1": self._memory_policy_v1(),
+                    "exploration_policy_v1": dict(exploration_policy_payload),
                     "causal_event_signature_previous_step": (
                         causal_signature.to_dict() if causal_signature else None
                     ),
@@ -957,6 +1086,13 @@ class ActiveInferenceEFE(Agent):
                     "card_id": self.card_id,
                     "total_actions_taken": int(self.action_counter),
                     "early_probe_budget_config": int(self.early_probe_budget),
+                    "memory_policy_v1": self._memory_policy_v1(),
+                    "exploration_policy_config_v1": {
+                        "base_explore_steps": int(self.exploration_base_steps),
+                        "exploration_min_steps": int(self.exploration_min_steps),
+                        "exploration_max_steps": int(self.exploration_max_steps),
+                        "exploration_fraction": float(self.exploration_fraction),
+                    },
                     "final_hypothesis_summary": self.hypothesis_bank.summary(),
                     "final_posterior_delta_report": dict(
                         self.hypothesis_bank.last_posterior_delta_report

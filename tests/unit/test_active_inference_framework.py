@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from agents.templates.active_inference.diagnostics import StageDiagnosticsCollectorV1
+from agents.templates.active_inference.agent import ActiveInferenceEFE
 from agents.templates.active_inference.contracts import (
     ActionCandidateV1,
     FreeEnergyLedgerEntryV1,
@@ -211,6 +212,74 @@ def test_policy_early_probe_budget_forces_under_tried_action() -> None:
     assert selected.action_id == 2
     assert diagnostics["early_probe_applied"] is True
     assert diagnostics["tie_breaker_rule_applied"] == "early_probe_budget_least_tried"
+
+
+@pytest.mark.unit
+def test_agent_memory_policy_is_hard_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACTIVE_INFERENCE_TRACE_ENABLED", "0")
+    monkeypatch.setenv("ACTIVE_INFERENCE_ENABLE_CROSS_EPISODE_MEMORY", "1")
+    agent = ActiveInferenceEFE(
+        card_id="card-x",
+        game_id="ls20",
+        agent_name="activeinferenceefe",
+        ROOT_URL="http://localhost",
+        record=False,
+        arc_env=SimpleNamespace(),
+    )
+    memory_policy = agent._memory_policy_v1()
+    assert memory_policy["cross_episode_memory"] == "off_hard"
+    assert memory_policy["persistent_learning_store_used"] is False
+    assert memory_policy["enable_requested"] is True
+    assert memory_policy["override_blocked"] is True
+
+    diagnostics = StageDiagnosticsCollectorV1()
+    failure_reasoning = agent._reasoning_for_failure(
+        packet=None,
+        diagnostics=diagnostics,
+        failure_code="TEST_FAILURE",
+        failure_message="test",
+    )
+    assert failure_reasoning["memory_policy_v1"]["cross_episode_memory"] == "off_hard"
+    assert "exploration_policy_v1" in failure_reasoning
+
+
+@pytest.mark.unit
+def test_agent_effective_explore_steps_uses_budget_bounded_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ACTIVE_INFERENCE_TRACE_ENABLED", "0")
+    monkeypatch.setenv("ACTIVE_INFERENCE_MAX_ACTIONS", "100")
+    monkeypatch.setenv("ACTIVE_INFERENCE_EXPLORE_STEPS", "10")
+    monkeypatch.setenv("ACTIVE_INFERENCE_EXPLORATION_MIN_STEPS", "12")
+    monkeypatch.setenv("ACTIVE_INFERENCE_EXPLORATION_MAX_STEPS", "60")
+    monkeypatch.setenv("ACTIVE_INFERENCE_EXPLORATION_FRACTION", "0.4")
+    monkeypatch.setenv("ACTIVE_INFERENCE_EARLY_PROBE_BUDGET", "8")
+    agent = ActiveInferenceEFE(
+        card_id="card-x",
+        game_id="ls20",
+        agent_name="activeinferenceefe",
+        ROOT_URL="http://localhost",
+        record=False,
+        arc_env=SimpleNamespace(),
+    )
+    packet = build_observation_packet_v1(
+        _frame_data_stub(available_actions=[1, 2, 3, 4, 5, 6]),
+        game_id="ls20",
+        card_id="card-x",
+        action_counter=3,
+    )
+    effective = agent._effective_explore_steps(packet)
+    assert effective == 40
+
+    exploration_policy = agent._exploration_policy_v1(
+        packet=packet,
+        effective_explore_steps=effective,
+        remaining_budget=90,
+        early_probe_budget_remaining=5,
+    )
+    assert exploration_policy["effective_explore_steps"] == 40
+    assert exploration_policy["available_action_count"] == 6
+    assert exploration_policy["exploration_budget_remaining"] == 40
 
 
 @pytest.mark.unit

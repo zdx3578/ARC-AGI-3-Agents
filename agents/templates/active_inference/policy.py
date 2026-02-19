@@ -72,11 +72,15 @@ class ActiveInferencePolicyEvaluatorV1:
         action_counter: int,
         remaining_budget: int,
         hypothesis_bank: ActiveInferenceHypothesisBankV1,
+        explore_steps_override: int | None = None,
     ) -> str:
+        explore_steps = int(self.explore_steps)
+        if explore_steps_override is not None:
+            explore_steps = int(max(1, explore_steps_override))
         return determine_phase_v1(
             action_counter=action_counter,
             posterior_entropy_bits=hypothesis_bank.posterior_entropy(),
-            explore_steps=self.explore_steps,
+            explore_steps=explore_steps,
             exploit_entropy_threshold=self.exploit_entropy_threshold,
             remaining_budget=max(0, int(remaining_budget)),
         )

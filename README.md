@@ -49,6 +49,7 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 - action-selection tie diagnostics (`best_vs_second_best_delta_total_efe`, `tie_group_size`, `tie_breaker_rule_applied`)
 - navigation-state diagnostics (`tracked_agent_token_id`, `agent_pos_xy`, `delta_pos_xy`, `control_schema_posterior`)
 - least-tried probing in explore/explain phases, including early probing budget that forces action-space coverage in the first N steps
+- hard methodology guard: `cross-episode memory = off` (no persistent cross-run parameter learning; enforced in reasoning + trace)
 - JSONL trace emission for bottleneck analysis
 - stage diagnostics (`stage / duration_ms / status / reject_reason_v1`)
 - failure taxonomy in reasoning for non-silent fallback paths
@@ -66,11 +67,15 @@ Useful environment variables:
 - `ACTIVE_INFERENCE_COMPONENT_CONNECTIVITY` (`4` or `8`, default `8`)
 - `ACTIVE_INFERENCE_MAX_ACTION6_POINTS` (default `16`)
 - `ACTIVE_INFERENCE_EXPLORE_STEPS` (default `20`)
+- `ACTIVE_INFERENCE_EXPLORATION_MIN_STEPS` (default `20`)
+- `ACTIVE_INFERENCE_EXPLORATION_MAX_STEPS` (default `120`)
+- `ACTIVE_INFERENCE_EXPLORATION_FRACTION` (default `0.35`, used with `MAX_ACTIONS` to size early exploration without huge random budgets)
 - `ACTIVE_INFERENCE_EXPLOIT_ENTROPY_THRESHOLD` (default `0.9`)
 - `ACTIVE_INFERENCE_ROLLOUT_HORIZON` (default `2`)
 - `ACTIVE_INFERENCE_ROLLOUT_DISCOUNT` (default `0.55`)
 - `ACTIVE_INFERENCE_EARLY_PROBE_BUDGET` (default `8`, force early action-space coverage in explore/explain)
 - `ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS` (default `3`)
+- `ACTIVE_INFERENCE_ENABLE_CROSS_EPISODE_MEMORY` (default `false`; any `true` request is blocked and recorded as `override_blocked=true`, policy remains hard-off)
 - `ACTIVE_INFERENCE_TRACE_ENABLED` (default `true`)
 - `ACTIVE_INFERENCE_TRACE_CANDIDATE_LIMIT` (default `30`)
 - `ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION` (default `false`)
