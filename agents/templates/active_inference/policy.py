@@ -247,6 +247,8 @@ class ActiveInferencePolicyEvaluatorV1:
         hypothesis_bank: ActiveInferenceHypothesisBankV1,
         phase: str,
         remaining_budget: int,
+        action_select_count: dict[int, int] | None = None,
+        candidate_select_count: dict[str, int] | None = None,
     ) -> tuple[ActionCandidateV1, list[FreeEnergyLedgerEntryV1]]:
         entries = self.evaluate_candidates(
             packet=packet,
@@ -324,8 +326,42 @@ class ActiveInferencePolicyEvaluatorV1:
                 <= self.tie_epsilon
             )
         )
+        selected_entry = entries[0]
+        least_tried_probe_applied = False
+        tie_probe_candidates = []
         if tie_group_size > 1:
-            tie_breaker_rule_applied = "fixed_order(action_id,candidate_id)"
+            tie_probe_candidates = entries[:tie_group_size]
+            # In exploration/explanation phases, break score ties by probing least-tried actions.
+            if phase in ("explore", "explain"):
+                action_count_map = action_select_count or {}
+                candidate_count_map = candidate_select_count or {}
+                tie_probe_candidates.sort(
+                    key=lambda entry: (
+                        int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                        int(candidate_count_map.get(str(entry.candidate.candidate_id), 0)),
+                        int(entry.candidate.action_id),
+                        str(entry.candidate.candidate_id),
+                    )
+                )
+                selected_entry = tie_probe_candidates[0]
+                least_tried_probe_applied = True
+                if selected_entry is not entries[0]:
+                    entries.remove(selected_entry)
+                    entries.insert(0, selected_entry)
+
+        selected_action_usage_count = int(
+            (action_select_count or {}).get(int(entries[0].candidate.action_id), 0)
+        )
+        selected_candidate_usage_count = int(
+            (candidate_select_count or {}).get(str(entries[0].candidate.candidate_id), 0)
+        )
+        if tie_group_size > 1:
+            if least_tried_probe_applied:
+                tie_breaker_rule_applied = (
+                    "least_tried_probe(action_usage,candidate_usage,action_id,candidate_id)"
+                )
+            else:
+                tie_breaker_rule_applied = "fixed_order(action_id,candidate_id)"
         else:
             tie_breaker_rule_applied = "argmin_unique"
 
@@ -337,5 +373,24 @@ class ActiveInferencePolicyEvaluatorV1:
             "tie_group_size": tie_group_size,
             "tie_epsilon": float(self.tie_epsilon),
             "tie_breaker_rule_applied": tie_breaker_rule_applied,
+            "least_tried_probe_applied": bool(least_tried_probe_applied),
+            "selected_action_usage_count_before": int(selected_action_usage_count),
+            "selected_candidate_usage_count_before": int(selected_candidate_usage_count),
+            "tie_probe_candidates": [
+                {
+                    "candidate_id": str(entry.candidate.candidate_id),
+                    "action_id": int(entry.candidate.action_id),
+                    "action_usage_count_before": int(
+                        (action_select_count or {}).get(int(entry.candidate.action_id), 0)
+                    ),
+                    "candidate_usage_count_before": int(
+                        (candidate_select_count or {}).get(
+                            str(entry.candidate.candidate_id),
+                            0,
+                        )
+                    ),
+                }
+                for entry in tie_probe_candidates
+            ],
         }
         return entries[0].candidate, entries

@@ -48,6 +48,7 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 - Action6 proposal diagnostics (region coverage / redundancy / context diversity / hit-object rate)
 - action-selection tie diagnostics (`best_vs_second_best_delta_total_efe`, `tie_group_size`, `tie_breaker_rule_applied`)
 - navigation-state diagnostics (`tracked_agent_token_id`, `agent_pos_xy`, `delta_pos_xy`, `control_schema_posterior`)
+- least-tried probing tie-break in explore/explain phases (replaces fixed-order tie selection when scores are tied)
 - JSONL trace emission for bottleneck analysis
 - stage diagnostics (`stage / duration_ms / status / reject_reason_v1`)
 - failure taxonomy in reasoning for non-silent fallback paths

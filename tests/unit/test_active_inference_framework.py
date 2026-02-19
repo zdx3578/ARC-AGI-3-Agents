@@ -137,6 +137,8 @@ def test_policy_selection_reports_tie_diagnostics() -> None:
         hypothesis_bank=bank,
         phase="explore",
         remaining_budget=1,
+        action_select_count={int(candidate.action_id): 0 for candidate in candidates},
+        candidate_select_count={str(candidate.candidate_id): 0 for candidate in candidates},
     )
     assert selected.candidate_id
     assert entries
@@ -144,6 +146,7 @@ def test_policy_selection_reports_tie_diagnostics() -> None:
     assert "best_vs_second_best_delta_total_efe" in diagnostics
     assert "tie_group_size" in diagnostics
     assert "tie_breaker_rule_applied" in diagnostics
+    assert "least_tried_probe_applied" in diagnostics
 
 
 @pytest.mark.unit

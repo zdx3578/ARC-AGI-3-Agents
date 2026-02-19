@@ -166,6 +166,8 @@ class ActiveInferenceEFE(Agent):
         self._control_schema_counts: dict[str, dict[str, int]] = {}
         self._tracked_agent_token_digest: str | None = None
         self._latest_navigation_state_estimate: dict[str, Any] = {}
+        self._action_select_count: dict[int, int] = {}
+        self._candidate_select_count: dict[str, int] = {}
 
         self.trace_enabled = _env_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
         self.trace_recorder: ActiveInferenceTraceRecorderV1 | None = None
@@ -783,6 +785,8 @@ class ActiveInferenceEFE(Agent):
                             hypothesis_bank=self.hypothesis_bank,
                             phase=phase,
                             remaining_budget=remaining_budget,
+                            action_select_count=self._action_select_count,
+                            candidate_select_count=self._candidate_select_count,
                         )
                         if ranked_entries:
                             selection_diagnostics = dict(
@@ -914,6 +918,15 @@ class ActiveInferenceEFE(Agent):
                 }
             )
 
+        selected_action_id = int(selected_candidate.action_id)
+        selected_candidate_id = str(selected_candidate.candidate_id)
+        self._action_select_count[selected_action_id] = (
+            int(self._action_select_count.get(selected_action_id, 0)) + 1
+        )
+        self._candidate_select_count[selected_candidate_id] = (
+            int(self._candidate_select_count.get(selected_candidate_id, 0)) + 1
+        )
+
         self._previous_packet = packet
         self._previous_representation = representation
         self._previous_action_candidate = selected_candidate
@@ -940,6 +953,10 @@ class ActiveInferenceEFE(Agent):
                         self._latest_navigation_state_estimate
                     ),
                     "final_control_schema_posterior": self._control_schema_posterior(),
+                    "final_action_select_count": {
+                        str(key): int(value)
+                        for (key, value) in sorted(self._action_select_count.items())
+                    },
                     "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "final_no_change_streak": int(self._no_change_streak),
                 }
