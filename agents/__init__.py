@@ -11,6 +11,7 @@ from .templates.langgraph_thinking import LangGraphThinking
 from .templates.llm_agents import LLM, FastLLM, GuidedLLM, ReasoningLLM
 from .templates.multimodal import MultiModalLLM
 from .templates.catcsetarc_bridge_agent import CatCsetArcBridge
+from .templates.active_inference import ActiveInferenceEFE
 from .templates.random_agent import Random
 from .templates.reasoning_agent import ReasoningAgent
 from .templates.smolagents import SmolCodingAgent, SmolVisionAgent
@@ -38,6 +39,7 @@ __all__ = [
     "LangGraphThinking",
     "LangGraphRandom",
     "CatCsetArcBridge",
+    "ActiveInferenceEFE",
     "LLM",
     "FastLLM",
     "ReasoningLLM",

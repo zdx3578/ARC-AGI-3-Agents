@@ -31,6 +31,47 @@ uv run main.py --agent=random --game=ls20
 
 For more information, see the [documentation](https://three.arcprize.org/docs#quick-start) or the [tutorial video](https://youtu.be/xEVg9dcJMkw).
 
+## Active Inference / EFE Framework Agent
+
+This repository includes `activeinferenceefe`, a modular framework agent that
+implements an audit-first Active Inference loop for ARC-AGI-3:
+
+- observation contract (state, levels, available actions, frame)
+- object representation contract (connected components + Action6 proposals)
+- hypothesis-bank posterior updates (MDL-aware)
+- Expected Free Energy ledger per candidate (risk / ambiguity / information gain / action cost)
+- causal event signatures for action interventions
+- JSONL trace emission for bottleneck analysis
+- stage diagnostics (`stage / duration_ms / status / reject_reason_v1`)
+- failure taxonomy in reasoning for non-silent fallback paths
+
+Run it with:
+
+```bash
+uv run main.py --agent=activeinferenceefe --game=ls20
+```
+
+Useful environment variables:
+
+- `ACTIVE_INFERENCE_MAX_ACTIONS` (default `80`)
+- `ACTIVE_INFERENCE_COMPONENT_CONNECTIVITY` (`4` or `8`, default `8`)
+- `ACTIVE_INFERENCE_MAX_ACTION6_POINTS` (default `16`)
+- `ACTIVE_INFERENCE_EXPLORE_STEPS` (default `20`)
+- `ACTIVE_INFERENCE_EXPLOIT_ENTROPY_THRESHOLD` (default `0.9`)
+- `ACTIVE_INFERENCE_TRACE_ENABLED` (default `true`)
+- `ACTIVE_INFERENCE_TRACE_CANDIDATE_LIMIT` (default `30`)
+- `ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION` (default `false`)
+- `ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` (optional)
+
+`ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` format example:
+
+```bash
+export ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON='{
+  "explore": {"information_gain": 1.5},
+  "exploit": {"action_cost": 1.1, "risk": 1.3}
+}'
+```
+
 ## Changelog
 ## [0.9.3] - 2026-01-29
 **Note: This will be a breaking change is you use the fields outline below**
