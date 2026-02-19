@@ -138,6 +138,10 @@ class ActiveInferenceEFE(Agent):
             0.0,
             min(1.0, _env_float("ACTIVE_INFERENCE_ROLLOUT_DISCOUNT", 0.55)),
         )
+        self.early_probe_budget = max(
+            0,
+            _env_int("ACTIVE_INFERENCE_EARLY_PROBE_BUDGET", 8),
+        )
         self.no_change_stop_loss_steps = max(
             1,
             _env_int("ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS", 3),
@@ -623,6 +627,10 @@ class ActiveInferenceEFE(Agent):
             self._latest_navigation_state_estimate = {}
 
         remaining_budget = max(0, int(self.MAX_ACTIONS - int(self.action_counter)))
+        early_probe_budget_remaining = max(
+            0,
+            int(self.early_probe_budget - int(self.action_counter)),
+        )
         diagnostics.start("phase_determination")
         try:
             phase = self.policy.determine_phase(
@@ -636,6 +644,7 @@ class ActiveInferenceEFE(Agent):
                     "phase": phase,
                     "posterior_entropy_bits": float(self.hypothesis_bank.posterior_entropy()),
                     "remaining_budget": int(remaining_budget),
+                    "early_probe_budget_remaining": int(early_probe_budget_remaining),
                 },
             )
         except Exception as exc:
@@ -718,6 +727,7 @@ class ActiveInferenceEFE(Agent):
                     "representation_summary": representation.summary,
                     "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "remaining_budget": int(remaining_budget),
+                    "early_probe_budget_remaining": int(early_probe_budget_remaining),
                 }
             else:
                 diagnostics.finish_ok(
@@ -758,6 +768,7 @@ class ActiveInferenceEFE(Agent):
                             "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
                             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                             "remaining_budget": int(remaining_budget),
+                            "early_probe_budget_remaining": int(early_probe_budget_remaining),
                             "stage_diagnostics_v1": diagnostics.to_dicts(),
                             "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
                         }
@@ -787,6 +798,7 @@ class ActiveInferenceEFE(Agent):
                             remaining_budget=remaining_budget,
                             action_select_count=self._action_select_count,
                             candidate_select_count=self._candidate_select_count,
+                            early_probe_budget_remaining=early_probe_budget_remaining,
                         )
                         if ranked_entries:
                             selection_diagnostics = dict(
@@ -852,6 +864,7 @@ class ActiveInferenceEFE(Agent):
                             ),
                             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                             "remaining_budget": int(remaining_budget),
+                            "early_probe_budget_remaining": int(early_probe_budget_remaining),
                             "stage_diagnostics_v1": diagnostics.to_dicts(),
                             "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
                         }
@@ -892,6 +905,7 @@ class ActiveInferenceEFE(Agent):
                     "card_id": self.card_id,
                     "action_counter": int(self.action_counter),
                     "remaining_budget": int(remaining_budget),
+                    "early_probe_budget_remaining": int(early_probe_budget_remaining),
                     "no_change_streak": int(self._no_change_streak),
                     "phase": phase,
                     "observation_packet_summary": self._observation_summary_for_trace(packet),
@@ -942,6 +956,7 @@ class ActiveInferenceEFE(Agent):
                     "game_id": self.game_id,
                     "card_id": self.card_id,
                     "total_actions_taken": int(self.action_counter),
+                    "early_probe_budget_config": int(self.early_probe_budget),
                     "final_hypothesis_summary": self.hypothesis_bank.summary(),
                     "final_posterior_delta_report": dict(
                         self.hypothesis_bank.last_posterior_delta_report

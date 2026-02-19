@@ -3,6 +3,10 @@ from types import SimpleNamespace
 import pytest
 
 from agents.templates.active_inference.diagnostics import StageDiagnosticsCollectorV1
+from agents.templates.active_inference.contracts import (
+    ActionCandidateV1,
+    FreeEnergyLedgerEntryV1,
+)
 from agents.templates.active_inference.hypothesis_bank import (
     ActiveInferenceHypothesisBankV1,
     build_causal_event_signature_v1,
@@ -20,10 +24,11 @@ def _frame_data_stub(
     frame: list[list[int]] | None = None,
     levels_completed: int = 0,
     state_name: str = "NOT_FINISHED",
+    available_actions: list[object] | None = None,
 ) -> SimpleNamespace:
     frame_payload = frame or [[1, 1, 0], [1, 0, 0], [0, 2, 2]]
     return SimpleNamespace(
-        available_actions=[6, 6, "3", "bad"],
+        available_actions=available_actions or [6, 6, "3", "bad"],
         frame=[frame_payload],
         state=SimpleNamespace(name=state_name),
         levels_completed=levels_completed,
@@ -147,6 +152,65 @@ def test_policy_selection_reports_tie_diagnostics() -> None:
     assert "tie_group_size" in diagnostics
     assert "tie_breaker_rule_applied" in diagnostics
     assert "least_tried_probe_applied" in diagnostics
+
+
+@pytest.mark.unit
+def test_policy_early_probe_budget_forces_under_tried_action() -> None:
+    packet = build_observation_packet_v1(
+        _frame_data_stub(available_actions=[1, 2]),
+        game_id="ls20",
+        card_id="card-x",
+        action_counter=2,
+    )
+    representation = build_representation_state_v1(packet)
+    candidate_a = ActionCandidateV1(candidate_id="a1", action_id=1, source="test")
+    candidate_b = ActionCandidateV1(candidate_id="a2", action_id=2, source="test")
+    entry_a = FreeEnergyLedgerEntryV1(
+        schema_name="test",
+        schema_version=1,
+        phase="explore",
+        candidate=candidate_a,
+        risk=0.0,
+        ambiguity=0.0,
+        information_gain=0.0,
+        action_cost=1.0,
+        complexity_penalty=0.0,
+        total_efe=1.0,
+        predictive_signature_distribution={},
+        witness={},
+    )
+    entry_b = FreeEnergyLedgerEntryV1(
+        schema_name="test",
+        schema_version=1,
+        phase="explore",
+        candidate=candidate_b,
+        risk=0.0,
+        ambiguity=0.0,
+        information_gain=0.0,
+        action_cost=1.0,
+        complexity_penalty=0.0,
+        total_efe=2.0,
+        predictive_signature_distribution={},
+        witness={},
+    )
+
+    policy = ActiveInferencePolicyEvaluatorV1(rollout_horizon=1)
+    policy.evaluate_candidates = lambda **kwargs: [entry_a, entry_b]  # type: ignore[method-assign]
+    selected, entries = policy.select_action(
+        packet=packet,
+        representation=representation,
+        candidates=[candidate_a, candidate_b],
+        hypothesis_bank=ActiveInferenceHypothesisBankV1(),
+        phase="explore",
+        remaining_budget=1,
+        action_select_count={1: 5, 2: 0},
+        candidate_select_count={"a1": 5, "a2": 0},
+        early_probe_budget_remaining=4,
+    )
+    diagnostics = entries[0].witness["selection_diagnostics_v1"]
+    assert selected.action_id == 2
+    assert diagnostics["early_probe_applied"] is True
+    assert diagnostics["tie_breaker_rule_applied"] == "early_probe_budget_least_tried"
 
 
 @pytest.mark.unit

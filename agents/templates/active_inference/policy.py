@@ -249,6 +249,7 @@ class ActiveInferencePolicyEvaluatorV1:
         remaining_budget: int,
         action_select_count: dict[int, int] | None = None,
         candidate_select_count: dict[str, int] | None = None,
+        early_probe_budget_remaining: int = 0,
     ) -> tuple[ActionCandidateV1, list[FreeEnergyLedgerEntryV1]]:
         entries = self.evaluate_candidates(
             packet=packet,
@@ -294,6 +295,8 @@ class ActiveInferencePolicyEvaluatorV1:
                 )
             )
 
+        action_count_map = action_select_count or {}
+        candidate_count_map = candidate_select_count or {}
         best_score = float(
             selection_score_by_candidate.get(
                 entries[0].candidate.candidate_id,
@@ -329,12 +332,62 @@ class ActiveInferencePolicyEvaluatorV1:
         selected_entry = entries[0]
         least_tried_probe_applied = False
         tie_probe_candidates = []
+        early_probe_applied = False
+        early_probe_target_action_ids: list[int] = []
+        early_probe_candidate_pool: list[FreeEnergyLedgerEntryV1] = []
+        early_probe_min_action_usage = 0
+
+        early_probe_active = bool(
+            int(early_probe_budget_remaining) > 0 and phase in ("explore", "explain")
+        )
+        if early_probe_active:
+            available_action_ids = sorted(
+                {
+                    int(entry.candidate.action_id)
+                    for entry in entries
+                    if int(entry.candidate.action_id) in set(int(v) for v in packet.available_actions)
+                }
+            )
+            if available_action_ids:
+                early_probe_min_action_usage = min(
+                    int(action_count_map.get(action_id, 0))
+                    for action_id in available_action_ids
+                )
+                early_probe_target_action_ids = [
+                    int(action_id)
+                    for action_id in available_action_ids
+                    if int(action_count_map.get(action_id, 0)) == early_probe_min_action_usage
+                ]
+                early_probe_candidate_pool = [
+                    entry
+                    for entry in entries
+                    if int(entry.candidate.action_id) in set(early_probe_target_action_ids)
+                ]
+                if early_probe_candidate_pool:
+                    early_probe_candidate_pool.sort(
+                        key=lambda entry: (
+                            float(
+                                selection_score_by_candidate.get(
+                                    entry.candidate.candidate_id,
+                                    entry.total_efe,
+                                )
+                            ),
+                            int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                            int(candidate_count_map.get(str(entry.candidate.candidate_id), 0)),
+                            int(entry.candidate.action_id),
+                            str(entry.candidate.candidate_id),
+                        )
+                    )
+                    selected_entry = early_probe_candidate_pool[0]
+                    early_probe_applied = True
+                    if selected_entry is not entries[0]:
+                        entries.remove(selected_entry)
+                        entries.insert(0, selected_entry)
+
         if tie_group_size > 1:
             tie_probe_candidates = entries[:tie_group_size]
             # In exploration/explanation phases, break score ties by probing least-tried actions.
             if phase in ("explore", "explain"):
-                action_count_map = action_select_count or {}
-                candidate_count_map = candidate_select_count or {}
                 tie_probe_candidates.sort(
                     key=lambda entry: (
                         int(action_count_map.get(int(entry.candidate.action_id), 0)),
@@ -350,12 +403,14 @@ class ActiveInferencePolicyEvaluatorV1:
                     entries.insert(0, selected_entry)
 
         selected_action_usage_count = int(
-            (action_select_count or {}).get(int(entries[0].candidate.action_id), 0)
+            action_count_map.get(int(entries[0].candidate.action_id), 0)
         )
         selected_candidate_usage_count = int(
-            (candidate_select_count or {}).get(str(entries[0].candidate.candidate_id), 0)
+            candidate_count_map.get(str(entries[0].candidate.candidate_id), 0)
         )
-        if tie_group_size > 1:
+        if early_probe_applied:
+            tie_breaker_rule_applied = "early_probe_budget_least_tried"
+        elif tie_group_size > 1:
             if least_tried_probe_applied:
                 tie_breaker_rule_applied = (
                     "least_tried_probe(action_usage,candidate_usage,action_id,candidate_id)"
@@ -369,11 +424,22 @@ class ActiveInferencePolicyEvaluatorV1:
             "selection_metric": selection_metric,
             "best_score": float(best_score),
             "second_best_score": float(second_score),
+            "selected_score": float(
+                selection_score_by_candidate.get(
+                    entries[0].candidate.candidate_id,
+                    entries[0].total_efe,
+                )
+            ),
             "best_vs_second_best_delta_total_efe": float(second_score - best_score),
             "tie_group_size": tie_group_size,
             "tie_epsilon": float(self.tie_epsilon),
             "tie_breaker_rule_applied": tie_breaker_rule_applied,
             "least_tried_probe_applied": bool(least_tried_probe_applied),
+            "early_probe_budget_remaining": int(max(0, int(early_probe_budget_remaining))),
+            "early_probe_applied": bool(early_probe_applied),
+            "early_probe_target_action_ids": [int(v) for v in early_probe_target_action_ids],
+            "early_probe_min_action_usage": int(early_probe_min_action_usage),
+            "early_probe_candidate_pool_size": int(len(early_probe_candidate_pool)),
             "selected_action_usage_count_before": int(selected_action_usage_count),
             "selected_candidate_usage_count_before": int(selected_candidate_usage_count),
             "tie_probe_candidates": [
@@ -381,16 +447,32 @@ class ActiveInferencePolicyEvaluatorV1:
                     "candidate_id": str(entry.candidate.candidate_id),
                     "action_id": int(entry.candidate.action_id),
                     "action_usage_count_before": int(
-                        (action_select_count or {}).get(int(entry.candidate.action_id), 0)
+                        action_count_map.get(int(entry.candidate.action_id), 0)
                     ),
                     "candidate_usage_count_before": int(
-                        (candidate_select_count or {}).get(
+                        candidate_count_map.get(
                             str(entry.candidate.candidate_id),
                             0,
                         )
                     ),
                 }
                 for entry in tie_probe_candidates
+            ],
+            "early_probe_candidates": [
+                {
+                    "candidate_id": str(entry.candidate.candidate_id),
+                    "action_id": int(entry.candidate.action_id),
+                    "score": float(
+                        selection_score_by_candidate.get(
+                            entry.candidate.candidate_id,
+                            entry.total_efe,
+                        )
+                    ),
+                    "action_usage_count_before": int(
+                        action_count_map.get(int(entry.candidate.action_id), 0)
+                    ),
+                }
+                for entry in early_probe_candidate_pool[:8]
             ],
         }
         return entries[0].candidate, entries

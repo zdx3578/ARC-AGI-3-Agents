@@ -48,7 +48,7 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 - Action6 proposal diagnostics (region coverage / redundancy / context diversity / hit-object rate)
 - action-selection tie diagnostics (`best_vs_second_best_delta_total_efe`, `tie_group_size`, `tie_breaker_rule_applied`)
 - navigation-state diagnostics (`tracked_agent_token_id`, `agent_pos_xy`, `delta_pos_xy`, `control_schema_posterior`)
-- least-tried probing tie-break in explore/explain phases (replaces fixed-order tie selection when scores are tied)
+- least-tried probing in explore/explain phases, including early probing budget that forces action-space coverage in the first N steps
 - JSONL trace emission for bottleneck analysis
 - stage diagnostics (`stage / duration_ms / status / reject_reason_v1`)
 - failure taxonomy in reasoning for non-silent fallback paths
@@ -69,6 +69,7 @@ Useful environment variables:
 - `ACTIVE_INFERENCE_EXPLOIT_ENTROPY_THRESHOLD` (default `0.9`)
 - `ACTIVE_INFERENCE_ROLLOUT_HORIZON` (default `2`)
 - `ACTIVE_INFERENCE_ROLLOUT_DISCOUNT` (default `0.55`)
+- `ACTIVE_INFERENCE_EARLY_PROBE_BUDGET` (default `8`, force early action-space coverage in explore/explain)
 - `ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS` (default `3`)
 - `ACTIVE_INFERENCE_TRACE_ENABLED` (default `true`)
 - `ACTIVE_INFERENCE_TRACE_CANDIDATE_LIMIT` (default `30`)
