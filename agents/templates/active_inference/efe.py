@@ -54,6 +54,20 @@ def _base_signature_key(signature_key: str) -> str:
     return f"type={sig_type}|progress={progress}"
 
 
+def _signature_key_with_delta(signature_key: str) -> str:
+    sig_type = "OBSERVED_UNCLASSIFIED"
+    progress = "0"
+    delta = "na"
+    for part in str(signature_key).split("|"):
+        if part.startswith("type="):
+            sig_type = part.split("=", 1)[1]
+        elif part.startswith("progress="):
+            progress = part.split("=", 1)[1]
+        elif part.startswith("delta="):
+            delta = part.split("=", 1)[1]
+    return f"type={sig_type}|progress={progress}|delta={delta}"
+
+
 def determine_phase_v1(
     *,
     action_counter: int,
@@ -121,6 +135,8 @@ def preference_distribution_v1(packet: ObservationPacketV1, phase: str) -> dict[
         "type=CC_COUNT_CHANGE|progress=0": 0.10,
         "type=GLOBAL_PATTERN_CHANGE|progress=0": 0.08,
         "type=NO_CHANGE|progress=0": no_change_penalty_mass,
+        "type=NO_CHANGE|progress=0|delta=blocked": 0.01,
+        "type=NO_CHANGE|progress=0|delta=na": 0.06 if phase != "explore" else 0.08,
         "type=OBSERVED_UNCLASSIFIED|progress=0": 0.10,
         "type=METADATA_PROGRESS_CHANGE|progress=0": 0.05,
     }
@@ -141,7 +157,13 @@ def compute_risk_kl_v1(
         if p <= 0.0:
             continue
         base_key = _base_signature_key(signature_key)
-        q = float(pref.get(signature_key, pref.get(base_key, EPS)))
+        delta_key = _signature_key_with_delta(signature_key)
+        q = float(
+            pref.get(
+                signature_key,
+                pref.get(delta_key, pref.get(base_key, EPS)),
+            )
+        )
         term = p * math.log2(max(EPS, p) / max(EPS, q))
         terms[signature_key] = float(term)
         kl += term

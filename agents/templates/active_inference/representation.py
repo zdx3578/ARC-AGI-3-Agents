@@ -800,6 +800,36 @@ def _encode_click_context_bucket_v2(feature: dict[str, Any]) -> str:
     )
 
 
+def _local_pattern_hash_bucket(
+    frame: list[list[int]],
+    *,
+    x: int,
+    y: int,
+    radius: int = 1,
+) -> str:
+    height = int(len(frame))
+    width = int(len(frame[0])) if frame else 0
+    values: list[int] = []
+    for dy in range(-int(radius), int(radius) + 1):
+        for dx in range(-int(radius), int(radius) + 1):
+            ny = int(y) + int(dy)
+            nx = int(x) + int(dx)
+            if ny < 0 or nx < 0 or ny >= height or nx >= width:
+                values.append(-1)
+                continue
+            values.append(int(_color_value(frame[ny][nx])))
+    digest = hashlib.sha256(
+        repr(values).encode("utf-8", errors="ignore")
+    ).hexdigest()
+    return f"lp{digest[:3]}"
+
+
+def _encode_click_context_subcluster_v1(feature: dict[str, Any]) -> str:
+    base_bucket = str(feature.get("click_context_bucket_v2", "cv2:NA"))
+    local_hash = str(feature.get("local_pattern_hash_bucket", "lpNA"))
+    return f"{base_bucket}|sub={local_hash}"
+
+
 def _build_runtime_cache_for_context(
     *,
     frame: list[list[int]],
@@ -1246,6 +1276,12 @@ def _coordinate_context_feature_from_geometry(
         "nearest_object_digest_bucket": str(nearest_object_digest_bucket),
         "nearest_object_direction_bucket": str(nearest_object_direction_bucket),
         "nearest_object_distance_bucket": str(nearest_object_distance_bucket),
+        "local_pattern_hash_bucket": _local_pattern_hash_bucket(
+            packet.frame,
+            x=int(x),
+            y=int(y),
+            radius=1,
+        ),
     }
     feature["click_context_bucket"] = (
         f"hit={int(feature.get('hit_object', -1))}"
@@ -1254,6 +1290,7 @@ def _coordinate_context_feature_from_geometry(
         f"|region={int(feature.get('coarse_region_x', -1))}:{int(feature.get('coarse_region_y', -1))}"
     )
     feature["click_context_bucket_v2"] = _encode_click_context_bucket_v2(feature)
+    feature["click_context_subcluster_v1"] = _encode_click_context_subcluster_v1(feature)
     return feature
 
 
@@ -1417,8 +1454,10 @@ def build_action_candidates_v1(
                             "nearest_object_digest_bucket": "NA",
                             "nearest_object_direction_bucket": "NA",
                             "nearest_object_distance_bucket": "NA",
+                            "local_pattern_hash_bucket": "lpNA",
                             "click_context_bucket": "hit=-1|boundary=-1|dist=na|region=-1:-1",
                             "click_context_bucket_v2": "cv2:NA",
+                            "click_context_subcluster_v1": "cv2:NA|sub=lpNA",
                         }
                     },
                 )

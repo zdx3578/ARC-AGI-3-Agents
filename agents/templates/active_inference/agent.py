@@ -160,6 +160,10 @@ class ActiveInferenceEFE(Agent):
             0,
             _env_int("ACTIVE_INFERENCE_EARLY_PROBE_BUDGET", 8),
         )
+        self.action6_bucket_probe_min_attempts = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_ACTION6_BUCKET_PROBE_MIN_ATTEMPTS", 3),
+        )
         self.no_change_stop_loss_steps = max(
             1,
             _env_int("ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS", 3),
@@ -191,6 +195,7 @@ class ActiveInferenceEFE(Agent):
             rollout_discount=self.rollout_discount,
             ignore_action_cost=True,
             weight_overrides=weight_overrides,
+            action6_bucket_probe_min_attempts=self.action6_bucket_probe_min_attempts,
         )
         self.hypothesis_bank = ActiveInferenceHypothesisBankV1()
 
@@ -206,10 +211,14 @@ class ActiveInferenceEFE(Agent):
         self._action_select_count: dict[int, int] = {}
         self._candidate_select_count: dict[str, int] = {}
         self._cluster_select_count: dict[str, int] = {}
+        self._subcluster_select_count: dict[str, int] = {}
         self._navigation_attempt_count = 0
         self._navigation_blocked_count = 0
         self._navigation_moved_count = 0
+        self._navigation_action_stats: dict[str, dict[str, int]] = {}
         self._blocked_edge_counts: dict[str, int] = {}
+        self._edge_attempt_counts: dict[str, int] = {}
+        self._region_visit_counts: dict[str, int] = {}
         self._click_bucket_stats: dict[str, dict[str, int]] = {}
 
         self.trace_enabled = _env_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
@@ -431,6 +440,55 @@ class ActiveInferenceEFE(Agent):
             return f"a{action_id}"
         return f"a6|{self._click_context_bucket_from_candidate(candidate)}"
 
+    def _candidate_subcluster_id(self, candidate: ActionCandidateV1 | None) -> str:
+        if candidate is None:
+            return "na"
+        action_id = int(candidate.action_id)
+        if action_id != 6:
+            return f"a{action_id}"
+        feature = candidate.metadata.get("coordinate_context_feature", {})
+        if isinstance(feature, dict):
+            subcluster = str(feature.get("click_context_subcluster_v1", "")).strip()
+            if subcluster:
+                return f"a6|{subcluster}"
+        return self._candidate_cluster_id(candidate)
+
+    def _navigation_candidate_stats(self, action_id: int) -> dict[str, Any]:
+        action_key = str(int(action_id))
+        action_stats = self._navigation_action_stats.get(action_key, {})
+        attempts = int(action_stats.get("attempts", 0))
+        blocked = int(action_stats.get("blocked", 0))
+        moved = int(action_stats.get("moved", 0))
+        blocked_rate = float(blocked / float(max(1, attempts)))
+        moved_rate = float(moved / float(max(1, attempts)))
+
+        edge_key = "NA"
+        edge_attempts = 0
+        edge_blocked = 0
+        edge_blocked_rate = 0.0
+        revisit_count_current = 0
+        if self._last_known_agent_pos_region is not None:
+            rx, ry = self._last_known_agent_pos_region
+            region_key = f"{rx}:{ry}"
+            revisit_count_current = int(self._region_visit_counts.get(region_key, 0))
+            edge_key = f"region={rx}:{ry}|action={int(action_id)}"
+            edge_attempts = int(self._edge_attempt_counts.get(edge_key, 0))
+            edge_blocked = int(self._blocked_edge_counts.get(edge_key, 0))
+            edge_blocked_rate = float(edge_blocked / float(max(1, edge_attempts)))
+
+        return {
+            "action_attempts": int(attempts),
+            "action_blocked": int(blocked),
+            "action_moved": int(moved),
+            "action_blocked_rate": float(blocked_rate),
+            "action_moved_rate": float(moved_rate),
+            "edge_key": str(edge_key),
+            "edge_attempts": int(edge_attempts),
+            "edge_blocked": int(edge_blocked),
+            "edge_blocked_rate": float(edge_blocked_rate),
+            "region_revisit_count_current": int(revisit_count_current),
+        }
+
     def _update_operability_stats_v1(
         self,
         *,
@@ -443,23 +501,40 @@ class ActiveInferenceEFE(Agent):
         level_delta = int(getattr(causal_signature, "level_delta", 0))
         if action_id in (1, 2, 3, 4):
             self._navigation_attempt_count += 1
+            action_key = str(action_id)
+            action_stats = self._navigation_action_stats.setdefault(
+                action_key,
+                {"attempts": 0, "blocked": 0, "moved": 0},
+            )
+            action_stats["attempts"] = int(action_stats.get("attempts", 0) + 1)
+            edge_key = None
+            if self._last_known_agent_pos_region is not None:
+                rx, ry = self._last_known_agent_pos_region
+                edge_key = f"region={rx}:{ry}|action={action_id}"
+                self._edge_attempt_counts[edge_key] = int(
+                    self._edge_attempt_counts.get(edge_key, 0) + 1
+                )
             moved = bool(
                 navigation_state_estimate.get("matched", False)
                 and obs_change_type == "CC_TRANSLATION"
             )
             if moved:
                 self._navigation_moved_count += 1
+                action_stats["moved"] = int(action_stats.get("moved", 0) + 1)
                 region = navigation_state_estimate.get("agent_pos_region", {})
                 if isinstance(region, dict):
                     rx = int(region.get("x", -1))
                     ry = int(region.get("y", -1))
                     if rx >= 0 and ry >= 0:
                         self._last_known_agent_pos_region = (rx, ry)
+                        region_key = f"{rx}:{ry}"
+                        self._region_visit_counts[region_key] = int(
+                            self._region_visit_counts.get(region_key, 0) + 1
+                        )
             else:
                 self._navigation_blocked_count += 1
-                if self._last_known_agent_pos_region is not None:
-                    rx, ry = self._last_known_agent_pos_region
-                    edge_key = f"region={rx}:{ry}|action={action_id}"
+                action_stats["blocked"] = int(action_stats.get("blocked", 0) + 1)
+                if edge_key is not None:
                     self._blocked_edge_counts[edge_key] = (
                         int(self._blocked_edge_counts.get(edge_key, 0)) + 1
                     )
@@ -492,6 +567,18 @@ class ActiveInferenceEFE(Agent):
                 "non_no_change_rate": float(non_no_change / float(max(1, attempts))),
                 "progress_rate": float(progress / float(max(1, attempts))),
             }
+        navigation_action_summary: dict[str, Any] = {}
+        for action_key, stats in sorted(self._navigation_action_stats.items()):
+            attempts = int(stats.get("attempts", 0))
+            blocked = int(stats.get("blocked", 0))
+            moved = int(stats.get("moved", 0))
+            navigation_action_summary[str(action_key)] = {
+                "attempts": int(attempts),
+                "blocked": int(blocked),
+                "moved": int(moved),
+                "blocked_rate": float(blocked / float(max(1, attempts))),
+                "moved_rate": float(moved / float(max(1, attempts))),
+            }
         return {
             "schema_name": "active_inference_operability_diagnostics_v1",
             "schema_version": 1,
@@ -503,6 +590,14 @@ class ActiveInferenceEFE(Agent):
                 str(key): int(value)
                 for (key, value) in sorted(
                     self._blocked_edge_counts.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )
+            },
+            "navigation_action_stats": navigation_action_summary,
+            "region_visit_histogram": {
+                str(key): int(value)
+                for (key, value) in sorted(
+                    self._region_visit_counts.items(),
                     key=lambda item: (-int(item[1]), item[0]),
                 )
             },
@@ -1039,6 +1134,13 @@ class ActiveInferenceEFE(Agent):
                             candidate.metadata["candidate_cluster_id"] = self._candidate_cluster_id(
                                 candidate
                             )
+                            candidate.metadata["candidate_subcluster_id"] = (
+                                self._candidate_subcluster_id(candidate)
+                            )
+                            if int(candidate.action_id) in (1, 2, 3, 4):
+                                candidate.metadata["blocked_edge_observed_stats"] = (
+                                    self._navigation_candidate_stats(int(candidate.action_id))
+                                )
                             if int(candidate.action_id) == 6:
                                 click_bucket = self._click_context_bucket_from_candidate(candidate)
                                 candidate.metadata["click_bucket_observed_stats"] = dict(
@@ -1071,6 +1173,7 @@ class ActiveInferenceEFE(Agent):
                             action_select_count=self._action_select_count,
                             candidate_select_count=self._candidate_select_count,
                             cluster_select_count=self._cluster_select_count,
+                            subcluster_select_count=self._subcluster_select_count,
                             early_probe_budget_remaining=early_probe_budget_remaining,
                         )
                         if ranked_entries:
@@ -1220,6 +1323,7 @@ class ActiveInferenceEFE(Agent):
         selected_action_id = int(selected_candidate.action_id)
         selected_candidate_id = str(selected_candidate.candidate_id)
         selected_cluster_id = self._candidate_cluster_id(selected_candidate)
+        selected_subcluster_id = self._candidate_subcluster_id(selected_candidate)
         self._action_select_count[selected_action_id] = (
             int(self._action_select_count.get(selected_action_id, 0)) + 1
         )
@@ -1228,6 +1332,9 @@ class ActiveInferenceEFE(Agent):
         )
         self._cluster_select_count[selected_cluster_id] = (
             int(self._cluster_select_count.get(selected_cluster_id, 0)) + 1
+        )
+        self._subcluster_select_count[selected_subcluster_id] = (
+            int(self._subcluster_select_count.get(selected_subcluster_id, 0)) + 1
         )
 
         self._previous_packet = packet
@@ -1279,6 +1386,10 @@ class ActiveInferenceEFE(Agent):
                     "final_cluster_select_count": {
                         str(key): int(value)
                         for (key, value) in sorted(self._cluster_select_count.items())
+                    },
+                    "final_subcluster_select_count": {
+                        str(key): int(value)
+                        for (key, value) in sorted(self._subcluster_select_count.items())
                     },
                     "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "final_no_change_streak": int(self._no_change_streak),

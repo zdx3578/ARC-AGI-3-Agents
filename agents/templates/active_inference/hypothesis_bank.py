@@ -365,11 +365,14 @@ def build_causal_event_signature_v1(
     dominant_delta_bucket = str(translation_summary.get("dominant_delta_bucket", "na"))
 
     click_context_feature = executed_action.metadata.get("coordinate_context_feature", {})
-    click_context_bucket = (
-        _click_context_bucket_from_feature(click_context_feature)
-        if int(executed_action.action_id) == 6
-        else "na"
-    )
+    click_context_bucket = "na"
+    if int(executed_action.action_id) == 6:
+        click_context_bucket = str(
+            click_context_feature.get(
+                "click_context_subcluster_v1",
+                _click_context_bucket_from_feature(click_context_feature),
+            )
+        )
 
     obs_change_type = _classify_observed_change_type(
         changed_pixel_count=changed_pixels,
@@ -381,6 +384,37 @@ def build_causal_event_signature_v1(
         translation_match_count=translation_match_count,
         palette_delta_total=palette_delta_total,
     )
+    frame_chain_macro = (
+        current_packet.frame_chain_macro_signature
+        if isinstance(current_packet.frame_chain_macro_signature, dict)
+        else {}
+    )
+    non_no_change_object_transition_count = int(
+        frame_chain_macro.get("non_no_change_object_transition_count", 0)
+    )
+    micro_object_histogram = frame_chain_macro.get("micro_object_histogram", {})
+    micro_translation_count = int(
+        micro_object_histogram.get("CC_TRANSLATION", 0)
+        if isinstance(micro_object_histogram, dict)
+        else 0
+    )
+    is_navigation_action = int(executed_action.action_id) in (1, 2, 3, 4)
+    is_navigation_blocked = bool(
+        is_navigation_action
+        and int(level_delta) <= 0
+        and int(translation_match_count) <= 0
+        and str(obs_change_type) in ("NO_CHANGE", "LOCAL_COLOR_CHANGE", "OBSERVED_UNCLASSIFIED")
+    )
+    bounce_like_blocked = bool(
+        is_navigation_blocked
+        and str(obs_change_type) == "NO_CHANGE"
+        and (
+            int(non_no_change_object_transition_count) > 0
+            or int(micro_translation_count) > 0
+        )
+    )
+    if is_navigation_blocked:
+        dominant_delta_bucket = "blocked"
 
     tags: list[str] = [str(obs_change_type).lower()]
     if level_delta > 0:
@@ -389,6 +423,10 @@ def build_causal_event_signature_v1(
         tags.append("action6_intervention")
     if changed_object_count > 0:
         tags.append("object_change")
+    if is_navigation_blocked:
+        tags.append("navigation_blocked")
+    if bounce_like_blocked:
+        tags.append("navigation_bounce")
 
     cc_match_summary = {
         "previous_same8_count": int(
@@ -403,12 +441,18 @@ def build_causal_event_signature_v1(
             translation_summary.get("delta_bucket_histogram", {})
         ),
         "object_count_delta": int(object_count_delta),
+        "navigation_blocked": bool(is_navigation_blocked),
+        "navigation_bounce": bool(bounce_like_blocked),
+        "frame_chain_non_no_change_object_transition_count": int(
+            non_no_change_object_transition_count
+        ),
+        "frame_chain_micro_translation_count": int(micro_translation_count),
     }
 
     signature_key_v2 = _signature_key(
         str(obs_change_type),
         bool(level_delta > 0),
-        delta_bucket=(str(dominant_delta_bucket) if str(obs_change_type) == "CC_TRANSLATION" else "na"),
+        delta_bucket=(str(dominant_delta_bucket) if str(dominant_delta_bucket) != "na" else "na"),
         click_context_bucket=str(click_context_bucket),
     )
 
@@ -467,15 +511,22 @@ def _all_signature_keys() -> list[str]:
     out: list[str] = []
     for obs_type in OBS_CHANGE_TYPES:
         for progress in (0, 1):
-            delta_bucket = "dir_unknown" if obs_type == "CC_TRANSLATION" else "na"
-            out.append(
-                _signature_key(
-                    obs_type,
-                    bool(progress),
-                    delta_bucket=delta_bucket,
-                    click_context_bucket="na",
+            delta_buckets: list[str]
+            if obs_type == "CC_TRANSLATION":
+                delta_buckets = ["dir_l", "dir_r", "dir_u", "dir_d", "stay", "dir_unknown"]
+            elif obs_type == "NO_CHANGE":
+                delta_buckets = ["na", "blocked"]
+            else:
+                delta_buckets = ["na"]
+            for delta_bucket in delta_buckets:
+                out.append(
+                    _signature_key(
+                        obs_type,
+                        bool(progress),
+                        delta_bucket=delta_bucket,
+                        click_context_bucket="na",
+                    )
                 )
-            )
     return out
 
 
@@ -497,7 +548,16 @@ def _context_features(
     )
     if not isinstance(click_bucket_observed_stats, dict):
         click_bucket_observed_stats = {}
+    blocked_edge_observed_stats = candidate.metadata.get(
+        "blocked_edge_observed_stats",
+        {},
+    )
+    if not isinstance(blocked_edge_observed_stats, dict):
+        blocked_edge_observed_stats = {}
     click_context_bucket = _click_context_bucket_from_feature(coord_context)
+    click_context_subcluster = str(
+        coord_context.get("click_context_subcluster_v1", f"{click_context_bucket}|sub=lpNA")
+    )
     hit_object = int(coord_context.get("hit_object", -1))
     on_boundary = int(coord_context.get("on_boundary", -1))
     dist_bucket = str(coord_context.get("distance_to_nearest_object_bucket", "na"))
@@ -535,6 +595,17 @@ def _context_features(
     click_attempts = int(click_bucket_observed_stats.get("attempts", 0))
     click_non_no_change = int(click_bucket_observed_stats.get("non_no_change", 0))
     click_progress = int(click_bucket_observed_stats.get("progress", 0))
+    navigation_action_attempts = int(blocked_edge_observed_stats.get("action_attempts", 0))
+    navigation_action_blocked_rate = float(
+        max(0.0, min(1.0, float(blocked_edge_observed_stats.get("action_blocked_rate", 0.0))))
+    )
+    navigation_edge_attempts = int(blocked_edge_observed_stats.get("edge_attempts", 0))
+    navigation_edge_blocked_rate = float(
+        max(0.0, min(1.0, float(blocked_edge_observed_stats.get("edge_blocked_rate", 0.0))))
+    )
+    region_revisit_count_current = int(
+        blocked_edge_observed_stats.get("region_revisit_count_current", 0)
+    )
 
     return {
         "action_id": int(candidate.action_id),
@@ -545,12 +616,18 @@ def _context_features(
         "on_boundary": int(on_boundary),
         "distance_bucket": dist_bucket,
         "click_context_bucket": str(click_context_bucket),
+        "click_context_subcluster": str(click_context_subcluster),
         "observed_delta_bucket": str(observed_delta_bucket),
         "observed_delta_confidence": float(observed_delta_confidence),
         "object_count_bucket": object_count_bucket,
         "mixed8_count": int(mixed8_count),
         "levels_completed": int(packet.levels_completed),
         "progress_gap": int(max(0, packet.win_levels - packet.levels_completed)),
+        "navigation_action_attempts": int(navigation_action_attempts),
+        "navigation_action_blocked_rate": float(navigation_action_blocked_rate),
+        "navigation_edge_attempts": int(navigation_edge_attempts),
+        "navigation_edge_blocked_rate": float(navigation_edge_blocked_rate),
+        "region_revisit_count_current": int(region_revisit_count_current),
         "click_attempts": int(click_attempts),
         "click_non_no_change_rate": float(
             click_non_no_change / float(max(1, click_attempts))
@@ -643,7 +720,7 @@ def _signature_key_for_features(
     delta_bucket: str = "na",
 ) -> str:
     click_context_bucket = (
-        str(features.get("click_context_bucket", "na"))
+        str(features.get("click_context_subcluster", "na"))
         if int(features.get("is_action6", 0)) == 1
         else "na"
     )
@@ -668,6 +745,13 @@ def _predict_distribution_for_hypothesis(
     is_action7 = bool(int(features.get("is_action7", 0)) == 1)
     hit_object = int(features.get("hit_object", -1))
     progress_gap = int(features.get("progress_gap", 0))
+    navigation_action_blocked_rate = float(
+        max(0.0, min(1.0, float(features.get("navigation_action_blocked_rate", 0.0))))
+    )
+    navigation_edge_blocked_rate = float(
+        max(0.0, min(1.0, float(features.get("navigation_edge_blocked_rate", 0.0))))
+    )
+    region_revisit_count_current = int(features.get("region_revisit_count_current", 0))
     observed_delta_bucket = str(features.get("observed_delta_bucket", "dir_unknown"))
     observed_delta_confidence = float(
         max(0.0, min(1.0, float(features.get("observed_delta_confidence", 0.0))))
@@ -711,24 +795,60 @@ def _predict_distribution_for_hypothesis(
 
     elif family_id == "navigation":
         if action_id in (1, 2, 3, 4):
-            translation_mass = 0.42 + (0.34 * observed_delta_confidence)
-            no_change_mass = max(0.08, 0.30 - (0.18 * observed_delta_confidence))
-            local_mass = max(0.04, 0.12 - (0.05 * observed_delta_confidence))
+            blocked_rate = max(
+                float(navigation_action_blocked_rate),
+                float(navigation_edge_blocked_rate),
+            )
+            loop_pressure = float(
+                max(0.0, min(1.0, float(region_revisit_count_current) / 4.0))
+            )
+            blocked_mass = min(0.72, 0.08 + (0.48 * blocked_rate) + (0.16 * loop_pressure))
+            translation_mass = max(
+                0.12,
+                (0.42 + (0.34 * observed_delta_confidence)) * (1.0 - blocked_mass),
+            )
+            no_change_mass = max(
+                0.04,
+                (0.30 - (0.18 * observed_delta_confidence)) * (1.0 - blocked_mass),
+            )
+            local_mass = max(
+                0.03,
+                (0.12 - (0.05 * observed_delta_confidence)) * (1.0 - blocked_mass),
+            )
             translation_unknown_mass = min(
                 0.10,
-                max(0.0, (1.0 - (translation_mass + no_change_mass + local_mass)) * 0.45),
+                max(
+                    0.0,
+                    (
+                        1.0
+                        - (
+                            blocked_mass
+                            + translation_mass
+                            + no_change_mass
+                            + local_mass
+                        )
+                    )
+                    * 0.45,
+                ),
             )
             unknown_mass = max(
                 0.04,
                 1.0
                 - (
-                    translation_mass
+                    blocked_mass
+                    + translation_mass
                     + translation_unknown_mass
                     + no_change_mass
                     + local_mass
                 ),
             )
             distribution = {
+                _signature_key_for_features(
+                    obs_change_type="NO_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                    delta_bucket="blocked",
+                ): blocked_mass,
                 _signature_key_for_features(
                     obs_change_type="CC_TRANSLATION",
                     progress_flag=False,
@@ -769,7 +889,13 @@ def _predict_distribution_for_hypothesis(
                     obs_change_type="NO_CHANGE",
                     progress_flag=False,
                     features=features,
-                ): 0.48,
+                    delta_bucket="blocked",
+                ): 0.24,
+                _signature_key_for_features(
+                    obs_change_type="NO_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): 0.24,
                 _signature_key_for_features(
                     obs_change_type="OBSERVED_UNCLASSIFIED",
                     progress_flag=False,

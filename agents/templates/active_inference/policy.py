@@ -29,6 +29,7 @@ class ActiveInferencePolicyEvaluatorV1:
         tie_epsilon: float = 1.0e-6,
         ignore_action_cost: bool = True,
         weight_overrides: dict[str, dict[str, float]] | None = None,
+        action6_bucket_probe_min_attempts: int = 3,
     ) -> None:
         self.explore_steps = int(max(1, explore_steps))
         self.exploit_entropy_threshold = float(max(0.0, exploit_entropy_threshold))
@@ -38,6 +39,9 @@ class ActiveInferencePolicyEvaluatorV1:
         self.tie_epsilon = float(max(0.0, tie_epsilon))
         self.ignore_action_cost = bool(ignore_action_cost)
         self.weight_overrides = weight_overrides or {}
+        self.action6_bucket_probe_min_attempts = int(
+            max(1, action6_bucket_probe_min_attempts)
+        )
 
     def _candidate_cluster_id(self, candidate: ActionCandidateV1) -> str:
         metadata_cluster = str(candidate.metadata.get("candidate_cluster_id", "")).strip()
@@ -55,6 +59,23 @@ class ActiveInferencePolicyEvaluatorV1:
             if bucket_v1:
                 return f"a6|{bucket_v1}"
         return "a6|na"
+
+    def _candidate_subcluster_id(self, candidate: ActionCandidateV1) -> str:
+        metadata_subcluster = str(
+            candidate.metadata.get("candidate_subcluster_id", "")
+        ).strip()
+        if metadata_subcluster:
+            return metadata_subcluster
+        return self._candidate_cluster_id(candidate)
+
+    def _action6_bucket_probe_needed(self, candidate: ActionCandidateV1) -> bool:
+        if int(candidate.action_id) != 6:
+            return False
+        stats = candidate.metadata.get("click_bucket_observed_stats", {})
+        if not isinstance(stats, dict):
+            return True
+        attempts = int(stats.get("attempts", 0))
+        return attempts < int(self.action6_bucket_probe_min_attempts)
 
     def _weights_for_phase(self, phase: str) -> dict[str, float]:
         defaults = weights_for_phase_v1(phase)
@@ -279,6 +300,7 @@ class ActiveInferencePolicyEvaluatorV1:
         action_select_count: dict[int, int] | None = None,
         candidate_select_count: dict[str, int] | None = None,
         cluster_select_count: dict[str, int] | None = None,
+        subcluster_select_count: dict[str, int] | None = None,
         early_probe_budget_remaining: int = 0,
     ) -> tuple[ActionCandidateV1, list[FreeEnergyLedgerEntryV1]]:
         entries = self.evaluate_candidates(
@@ -328,8 +350,15 @@ class ActiveInferencePolicyEvaluatorV1:
         action_count_map = action_select_count or {}
         candidate_count_map = candidate_select_count or {}
         cluster_count_map = cluster_select_count or {}
+        subcluster_count_map = subcluster_select_count or {}
         cluster_id_by_candidate_id: dict[str, str] = {
             str(entry.candidate.candidate_id): self._candidate_cluster_id(entry.candidate)
+            for entry in entries
+        }
+        subcluster_id_by_candidate_id: dict[str, str] = {
+            str(entry.candidate.candidate_id): self._candidate_subcluster_id(
+                entry.candidate
+            )
             for entry in entries
         }
         best_score = float(
@@ -366,6 +395,7 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         selected_entry = entries[0]
         least_tried_probe_applied = False
+        exploit_action6_bucket_probe_applied = False
         tie_probe_candidates = []
         early_probe_applied = False
         early_probe_target_action_ids: list[int] = []
@@ -419,6 +449,17 @@ class ActiveInferencePolicyEvaluatorV1:
                                     0,
                                 )
                             ),
+                            int(
+                                subcluster_count_map.get(
+                                    str(
+                                        subcluster_id_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            self._candidate_subcluster_id(entry.candidate),
+                                        )
+                                    ),
+                                    0,
+                                )
+                            ),
                             int(candidate_count_map.get(str(entry.candidate.candidate_id), 0)),
                             int(entry.candidate.action_id),
                             str(entry.candidate.candidate_id),
@@ -433,7 +474,14 @@ class ActiveInferencePolicyEvaluatorV1:
         if tie_group_size > 1:
             tie_probe_candidates = entries[:tie_group_size]
             # In exploration/explanation phases, break score ties by probing least-tried actions.
-            if phase in ("explore", "explain"):
+            exploit_action6_probe_needed = bool(
+                phase == "exploit"
+                and any(
+                    self._action6_bucket_probe_needed(entry.candidate)
+                    for entry in tie_probe_candidates
+                )
+            )
+            if phase in ("explore", "explain") or exploit_action6_probe_needed:
                 tie_probe_candidates.sort(
                     key=lambda entry: (
                         int(action_count_map.get(int(entry.candidate.action_id), 0)),
@@ -448,6 +496,17 @@ class ActiveInferencePolicyEvaluatorV1:
                                 0,
                             )
                         ),
+                        int(
+                            subcluster_count_map.get(
+                                str(
+                                    subcluster_id_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        self._candidate_subcluster_id(entry.candidate),
+                                    )
+                                ),
+                                0,
+                            )
+                        ),
                         int(candidate_count_map.get(str(entry.candidate.candidate_id), 0)),
                         int(entry.candidate.action_id),
                         str(entry.candidate.candidate_id),
@@ -455,6 +514,7 @@ class ActiveInferencePolicyEvaluatorV1:
                 )
                 selected_entry = tie_probe_candidates[0]
                 least_tried_probe_applied = True
+                exploit_action6_bucket_probe_applied = bool(exploit_action6_probe_needed)
                 if selected_entry is not entries[0]:
                     entries.remove(selected_entry)
                     entries.insert(0, selected_entry)
@@ -469,6 +529,15 @@ class ActiveInferencePolicyEvaluatorV1:
             )
         )
         selected_cluster_usage_count = int(cluster_count_map.get(selected_cluster_id, 0))
+        selected_subcluster_id = str(
+            subcluster_id_by_candidate_id.get(
+                str(entries[0].candidate.candidate_id),
+                self._candidate_subcluster_id(entries[0].candidate),
+            )
+        )
+        selected_subcluster_usage_count = int(
+            subcluster_count_map.get(selected_subcluster_id, 0)
+        )
         selected_candidate_usage_count = int(
             candidate_count_map.get(str(entries[0].candidate.candidate_id), 0)
         )
@@ -476,9 +545,14 @@ class ActiveInferencePolicyEvaluatorV1:
             tie_breaker_rule_applied = "early_probe_budget_least_tried"
         elif tie_group_size > 1:
             if least_tried_probe_applied:
-                tie_breaker_rule_applied = (
-                    "least_tried_probe(action_usage,cluster_usage,candidate_usage,action_id,candidate_id)"
-                )
+                if exploit_action6_bucket_probe_applied:
+                    tie_breaker_rule_applied = (
+                        "exploit_action6_bucket_probe_least_tried(action_usage,cluster_usage,subcluster_usage,candidate_usage)"
+                    )
+                else:
+                    tie_breaker_rule_applied = (
+                        "least_tried_probe(action_usage,cluster_usage,subcluster_usage,candidate_usage,action_id,candidate_id)"
+                    )
             else:
                 tie_breaker_rule_applied = "fixed_order(action_id,candidate_id)"
         else:
@@ -499,6 +573,9 @@ class ActiveInferencePolicyEvaluatorV1:
             "tie_epsilon": float(self.tie_epsilon),
             "tie_breaker_rule_applied": tie_breaker_rule_applied,
             "least_tried_probe_applied": bool(least_tried_probe_applied),
+            "exploit_action6_bucket_probe_applied": bool(
+                exploit_action6_bucket_probe_applied
+            ),
             "early_probe_budget_remaining": int(max(0, int(early_probe_budget_remaining))),
             "early_probe_applied": bool(early_probe_applied),
             "early_probe_target_action_ids": [int(v) for v in early_probe_target_action_ids],
@@ -507,6 +584,10 @@ class ActiveInferencePolicyEvaluatorV1:
             "selected_action_usage_count_before": int(selected_action_usage_count),
             "selected_cluster_id": selected_cluster_id,
             "selected_cluster_usage_count_before": int(selected_cluster_usage_count),
+            "selected_subcluster_id": selected_subcluster_id,
+            "selected_subcluster_usage_count_before": int(
+                selected_subcluster_usage_count
+            ),
             "selected_candidate_usage_count_before": int(selected_candidate_usage_count),
             "tie_probe_candidates": [
                 {
@@ -518,6 +599,12 @@ class ActiveInferencePolicyEvaluatorV1:
                             self._candidate_cluster_id(entry.candidate),
                         )
                     ),
+                    "subcluster_id": str(
+                        subcluster_id_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            self._candidate_subcluster_id(entry.candidate),
+                        )
+                    ),
                     "action_usage_count_before": int(
                         action_count_map.get(int(entry.candidate.action_id), 0)
                     ),
@@ -527,6 +614,17 @@ class ActiveInferencePolicyEvaluatorV1:
                                 cluster_id_by_candidate_id.get(
                                     str(entry.candidate.candidate_id),
                                     self._candidate_cluster_id(entry.candidate),
+                                )
+                            ),
+                            0,
+                        )
+                    ),
+                    "subcluster_usage_count_before": int(
+                        subcluster_count_map.get(
+                            str(
+                                subcluster_id_by_candidate_id.get(
+                                    str(entry.candidate.candidate_id),
+                                    self._candidate_subcluster_id(entry.candidate),
                                 )
                             ),
                             0,
@@ -551,6 +649,12 @@ class ActiveInferencePolicyEvaluatorV1:
                             self._candidate_cluster_id(entry.candidate),
                         )
                     ),
+                    "subcluster_id": str(
+                        subcluster_id_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            self._candidate_subcluster_id(entry.candidate),
+                        )
+                    ),
                     "score": float(
                         selection_score_by_candidate.get(
                             entry.candidate.candidate_id,
@@ -566,6 +670,17 @@ class ActiveInferencePolicyEvaluatorV1:
                                 cluster_id_by_candidate_id.get(
                                     str(entry.candidate.candidate_id),
                                     self._candidate_cluster_id(entry.candidate),
+                                )
+                            ),
+                            0,
+                        )
+                    ),
+                    "subcluster_usage_count_before": int(
+                        subcluster_count_map.get(
+                            str(
+                                subcluster_id_by_candidate_id.get(
+                                    str(entry.candidate.candidate_id),
+                                    self._candidate_subcluster_id(entry.candidate),
                                 )
                             ),
                             0,
