@@ -827,7 +827,9 @@ def _local_pattern_hash_bucket(
 def _encode_click_context_subcluster_v1(feature: dict[str, Any]) -> str:
     base_bucket = str(feature.get("click_context_bucket_v2", "cv2:NA"))
     local_hash = str(feature.get("local_pattern_hash_bucket", "lpNA"))
-    return f"{base_bucket}|sub={local_hash}"
+    fine_x = str(feature.get("fine_region_x", "NA"))
+    fine_y = str(feature.get("fine_region_y", "NA"))
+    return f"{base_bucket}|fr={fine_x}_{fine_y}|sub={local_hash}"
 
 
 def _build_runtime_cache_for_context(
@@ -959,7 +961,6 @@ def _build_action6_coordinate_proposals(
     mixed8_components: list[_ComponentWithCells],
     frame_height: int,
     frame_width: int,
-    max_points: int,
 ) -> list[tuple[int, int]]:
     candidates: list[tuple[int, int]] = []
 
@@ -991,13 +992,109 @@ def _build_action6_coordinate_proposals(
     else:
         candidates.append((31, 31))
 
-    dedup = sorted(
-        {(_clamp_coord(x), _clamp_coord(y)) for (x, y) in candidates},
-        key=lambda p: (p[1], p[0]),
-    )
-    if max_points > 0:
-        dedup = dedup[:max_points]
+    dedup: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for (x, y) in candidates:
+        point = (_clamp_coord(x), _clamp_coord(y))
+        if point in seen:
+            continue
+        seen.add(point)
+        dedup.append(point)
     return dedup
+
+
+def _select_diverse_action6_points(
+    packet: ObservationPacketV1,
+    object_nodes: list[ObjectNodeV1],
+    frame_height: int,
+    frame_width: int,
+    background_color: int,
+    raw_points: list[tuple[int, int]],
+    max_points: int,
+    runtime_cache: dict[str, Any] | None = None,
+) -> list[tuple[int, int]]:
+    if int(max_points) <= 0 or not raw_points:
+        return []
+
+    feature_by_point: dict[tuple[int, int], dict[str, Any]] = {}
+    for (x, y) in raw_points:
+        feature_by_point[(int(x), int(y))] = _coordinate_context_feature_from_geometry(
+            packet,
+            object_nodes,
+            frame_height,
+            frame_width,
+            background_color,
+            int(x),
+            int(y),
+            runtime_cache,
+        )
+
+    selected: list[tuple[int, int]] = []
+    remaining = list(raw_points)
+    seen_regions: set[tuple[int, int]] = set()
+    seen_buckets: set[str] = set()
+    seen_subclusters: set[str] = set()
+    seen_object_digest: set[str] = set()
+    target_count = min(int(max_points), len(remaining))
+
+    while remaining and len(selected) < target_count:
+        best_index = 0
+        best_score = -10**9
+        for idx, point in enumerate(remaining):
+            feature = feature_by_point.get(point, {})
+            region = (
+                int(feature.get("coarse_region_x", -1)),
+                int(feature.get("coarse_region_y", -1)),
+            )
+            bucket_v2 = str(feature.get("click_context_bucket_v2", "cv2:NA"))
+            subcluster = str(
+                feature.get(
+                    "click_context_subcluster_v1",
+                    "cv2:NA|fr=NA_NA|sub=lpNA",
+                )
+            )
+            object_digest = str(feature.get("object_digest_bucket", "NA"))
+            hit_object = int(feature.get("hit_object", 0))
+            on_object_boundary = 1 if str(feature.get("on_object_boundary", "0")) == "1" else 0
+            dist_bucket = str(feature.get("distance_to_nearest_object_bucket", "na"))
+            dist_bonus = {"near": 0.20, "mid": 0.12, "far": 0.04}.get(dist_bucket, 0.06)
+
+            score = 0.0
+            score += 8.0 if subcluster not in seen_subclusters else 0.0
+            score += 4.0 if bucket_v2 not in seen_buckets else 0.0
+            score += 2.5 if region not in seen_regions else 0.0
+            score += 1.2 if object_digest not in seen_object_digest else 0.0
+            score += 0.6 * float(max(0, hit_object))
+            score += 0.4 * float(on_object_boundary)
+            score += float(dist_bonus)
+            # Deterministic tie-break for spread across fine grid cells.
+            score += 0.001 * float((int(point[0]) % 4) + (4 * (int(point[1]) % 4)))
+
+            if score > best_score:
+                best_score = score
+                best_index = idx
+
+        chosen = remaining.pop(best_index)
+        selected.append(chosen)
+        chosen_feature = feature_by_point.get(chosen, {})
+        seen_regions.add(
+            (
+                int(chosen_feature.get("coarse_region_x", -1)),
+                int(chosen_feature.get("coarse_region_y", -1)),
+            )
+        )
+        seen_buckets.add(str(chosen_feature.get("click_context_bucket_v2", "cv2:NA")))
+        seen_subclusters.add(
+            str(
+                chosen_feature.get(
+                    "click_context_subcluster_v1",
+                    "cv2:NA|fr=NA_NA|sub=lpNA",
+                )
+            )
+        )
+        seen_object_digest.add(str(chosen_feature.get("object_digest_bucket", "NA")))
+
+    return selected
 
 
 def _component_view_summary(components: list[_ComponentWithCells]) -> dict[str, Any]:
@@ -1050,12 +1147,11 @@ def build_representation_state_v1(
 
     object_components = same4 if int(connectivity) == 4 else same8
     object_nodes = _to_object_nodes_from_same8(object_components)
-    action6_points = _build_action6_coordinate_proposals(
+    raw_action6_points = _build_action6_coordinate_proposals(
         object_nodes,
         mixed8,
         frame_height,
         frame_width,
-        max_action6_points,
     )
 
     hierarchy_links = _build_hierarchy_links(same4, same8, mixed8)
@@ -1065,6 +1161,16 @@ def build_representation_state_v1(
         mixed8_components=mixed8,
         frame_height=frame_height,
         frame_width=frame_width,
+    )
+    action6_points = _select_diverse_action6_points(
+        packet,
+        object_nodes,
+        frame_height,
+        frame_width,
+        background_color,
+        raw_action6_points,
+        max_action6_points,
+        runtime_cache,
     )
 
     color_hist = Counter(int(obj.color) for obj in object_nodes)
@@ -1088,6 +1194,7 @@ def build_representation_state_v1(
         "touch_boundary_object_count": int(
             sum(1 for obj in object_nodes if obj.touches_boundary)
         ),
+        "action6_raw_coordinate_candidate_count": int(len(raw_action6_points)),
         "action6_coordinate_proposal_count": int(len(action6_points)),
         "action6_coordinate_proposal_coverage": float(proposal_coverage),
         "action6_candidate_diagnostics": proposal_diagnostics,
@@ -1273,6 +1380,8 @@ def _coordinate_context_feature_from_geometry(
         "distance_to_nearest_object_bucket": dist_bucket,
         "coarse_region_x": int(max(0, min(7, x // 8))),
         "coarse_region_y": int(max(0, min(7, y // 8))),
+        "fine_region_x": int(max(0, min(15, x // 4))),
+        "fine_region_y": int(max(0, min(15, y // 4))),
         "nearest_object_digest_bucket": str(nearest_object_digest_bucket),
         "nearest_object_direction_bucket": str(nearest_object_direction_bucket),
         "nearest_object_distance_bucket": str(nearest_object_distance_bucket),
@@ -1326,8 +1435,11 @@ def _action6_proposal_diagnostics(
         return {
             "proposal_count": 0,
             "unique_region_count": 0,
+            "unique_fine_region_count": 0,
             "unique_click_bucket_v2_count": 0,
+            "unique_click_subcluster_v1_count": 0,
             "region_coverage_ratio": 0.0,
+            "fine_region_coverage_ratio": 0.0,
             "redundancy_rate": 0.0,
             "hit_object_rate": 0.0,
             "on_boundary_rate": 0.0,
@@ -1336,8 +1448,10 @@ def _action6_proposal_diagnostics(
         }
 
     coarse_regions: set[tuple[int, int]] = set()
+    fine_regions: set[tuple[int, int]] = set()
     context_signatures: set[tuple[object, ...]] = set()
     click_bucket_v2_set: set[str] = set()
+    click_subcluster_v1_set: set[str] = set()
     hit_object_count = 0
     on_boundary_count = 0
     distance_hist: dict[str, int] = {}
@@ -1355,7 +1469,10 @@ def _action6_proposal_diagnostics(
         )
         cx = int(feature.get("coarse_region_x", -1))
         cy = int(feature.get("coarse_region_y", -1))
+        fx = int(feature.get("fine_region_x", -1))
+        fy = int(feature.get("fine_region_y", -1))
         coarse_regions.add((cx, cy))
+        fine_regions.add((fx, fy))
         context_signature = (
             int(feature.get("hit_object", 0)),
             int(feature.get("on_boundary", 0)),
@@ -1363,9 +1480,15 @@ def _action6_proposal_diagnostics(
             int(feature.get("hit_color", -1)),
             cx,
             cy,
+            int(feature.get("fine_region_x", -1)),
+            int(feature.get("fine_region_y", -1)),
+            str(feature.get("local_pattern_hash_bucket", "lpNA")),
         )
         context_signatures.add(context_signature)
         click_bucket_v2_set.add(str(feature.get("click_context_bucket_v2", "cv2:NA")))
+        click_subcluster_v1_set.add(
+            str(feature.get("click_context_subcluster_v1", "cv2:NA|fr=NA_NA|sub=lpNA"))
+        )
         if int(feature.get("hit_object", 0)) == 1:
             hit_object_count += 1
         if int(feature.get("on_boundary", 0)) == 1:
@@ -1378,8 +1501,11 @@ def _action6_proposal_diagnostics(
     return {
         "proposal_count": int(proposal_count),
         "unique_region_count": unique_region_count,
+        "unique_fine_region_count": int(len(fine_regions)),
         "unique_click_bucket_v2_count": int(len(click_bucket_v2_set)),
+        "unique_click_subcluster_v1_count": int(len(click_subcluster_v1_set)),
         "region_coverage_ratio": float(unique_region_count / 64.0),
+        "fine_region_coverage_ratio": float(len(fine_regions) / 256.0),
         "redundancy_rate": float(redundant_region_points / float(max(1, proposal_count))),
         "hit_object_rate": float(hit_object_count / float(max(1, proposal_count))),
         "on_boundary_rate": float(on_boundary_count / float(max(1, proposal_count))),
@@ -1451,13 +1577,15 @@ def build_action_candidates_v1(
                             "distance_to_nearest_object_bucket": "na",
                             "coarse_region_x": -1,
                             "coarse_region_y": -1,
+                            "fine_region_x": -1,
+                            "fine_region_y": -1,
                             "nearest_object_digest_bucket": "NA",
                             "nearest_object_direction_bucket": "NA",
                             "nearest_object_distance_bucket": "NA",
                             "local_pattern_hash_bucket": "lpNA",
                             "click_context_bucket": "hit=-1|boundary=-1|dist=na|region=-1:-1",
                             "click_context_bucket_v2": "cv2:NA",
-                            "click_context_subcluster_v1": "cv2:NA|sub=lpNA",
+                            "click_context_subcluster_v1": "cv2:NA|fr=NA_NA|sub=lpNA",
                         }
                     },
                 )

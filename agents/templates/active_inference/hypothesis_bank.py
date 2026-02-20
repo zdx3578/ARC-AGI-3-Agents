@@ -548,6 +548,12 @@ def _context_features(
     )
     if not isinstance(click_bucket_observed_stats, dict):
         click_bucket_observed_stats = {}
+    click_subcluster_observed_stats = candidate.metadata.get(
+        "click_subcluster_observed_stats",
+        {},
+    )
+    if not isinstance(click_subcluster_observed_stats, dict):
+        click_subcluster_observed_stats = {}
     blocked_edge_observed_stats = candidate.metadata.get(
         "blocked_edge_observed_stats",
         {},
@@ -556,7 +562,10 @@ def _context_features(
         blocked_edge_observed_stats = {}
     click_context_bucket = _click_context_bucket_from_feature(coord_context)
     click_context_subcluster = str(
-        coord_context.get("click_context_subcluster_v1", f"{click_context_bucket}|sub=lpNA")
+        coord_context.get(
+            "click_context_subcluster_v1",
+            f"{click_context_bucket}|fr=NA_NA|sub=lpNA",
+        )
     )
     hit_object = int(coord_context.get("hit_object", -1))
     on_boundary = int(coord_context.get("on_boundary", -1))
@@ -595,6 +604,11 @@ def _context_features(
     click_attempts = int(click_bucket_observed_stats.get("attempts", 0))
     click_non_no_change = int(click_bucket_observed_stats.get("non_no_change", 0))
     click_progress = int(click_bucket_observed_stats.get("progress", 0))
+    click_subcluster_attempts = int(click_subcluster_observed_stats.get("attempts", 0))
+    click_subcluster_non_no_change = int(
+        click_subcluster_observed_stats.get("non_no_change", 0)
+    )
+    click_subcluster_progress = int(click_subcluster_observed_stats.get("progress", 0))
     navigation_action_attempts = int(blocked_edge_observed_stats.get("action_attempts", 0))
     navigation_action_blocked_rate = float(
         max(0.0, min(1.0, float(blocked_edge_observed_stats.get("action_blocked_rate", 0.0))))
@@ -633,6 +647,13 @@ def _context_features(
             click_non_no_change / float(max(1, click_attempts))
         ),
         "click_progress_rate": float(click_progress / float(max(1, click_attempts))),
+        "click_subcluster_attempts": int(click_subcluster_attempts),
+        "click_subcluster_non_no_change_rate": float(
+            click_subcluster_non_no_change / float(max(1, click_subcluster_attempts))
+        ),
+        "click_subcluster_progress_rate": float(
+            click_subcluster_progress / float(max(1, click_subcluster_attempts))
+        ),
     }
 
 
@@ -910,14 +931,53 @@ def _predict_distribution_for_hypothesis(
         click_progress_rate = float(
             max(0.0, min(1.0, float(features.get("click_progress_rate", 0.0))))
         )
+        click_subcluster_attempts = int(features.get("click_subcluster_attempts", 0))
+        click_subcluster_non_no_change_rate = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    float(features.get("click_subcluster_non_no_change_rate", 0.0)),
+                ),
+            )
+        )
+        click_subcluster_progress_rate = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    float(features.get("click_subcluster_progress_rate", 0.0)),
+                ),
+            )
+        )
+        subcluster_conf = float(
+            click_subcluster_attempts / float(max(1, click_subcluster_attempts + 3))
+        )
+        effective_non_no_change_rate = (
+            (subcluster_conf * click_subcluster_non_no_change_rate)
+            + ((1.0 - subcluster_conf) * click_non_no_change_rate)
+        )
+        effective_progress_rate = (
+            (subcluster_conf * click_subcluster_progress_rate)
+            + ((1.0 - subcluster_conf) * click_progress_rate)
+        )
         if is_action6 and hit_object == 1:
-            local_mass = 0.44 + (0.28 * click_non_no_change_rate)
-            count_mass = 0.10 + (0.10 * click_non_no_change_rate)
-            progress_mass = 0.05 + (0.25 * click_progress_rate if progress_gap > 0 else 0.0)
+            local_mass = 0.40 + (0.32 * effective_non_no_change_rate)
+            count_mass = 0.10 + (0.12 * effective_non_no_change_rate)
+            progress_mass = 0.05 + (
+                0.25 * effective_progress_rate if progress_gap > 0 else 0.0
+            )
             remaining = max(0.0, 1.0 - (local_mass + count_mass + progress_mass))
-            translation_mass = min(0.16, remaining * 0.45)
-            no_change_mass = min(0.20, remaining * 0.35)
+            translation_mass = min(0.16, remaining * 0.44)
+            no_change_mass = min(0.20, remaining * 0.32)
+            uncertainty_bonus = (
+                0.12
+                if int(click_subcluster_attempts) <= 0
+                else (0.06 if int(click_subcluster_attempts) <= 1 else 0.0)
+            )
             unknown_mass = max(0.0, remaining - (translation_mass + no_change_mass))
+            unknown_mass = min(0.35, unknown_mass + uncertainty_bonus)
+            no_change_mass = max(0.04, no_change_mass - uncertainty_bonus)
             distribution = {
                 _signature_key_for_features(
                     obs_change_type="LOCAL_COLOR_CHANGE",
@@ -1021,14 +1081,47 @@ def _predict_distribution_for_hypothesis(
         click_progress_rate = float(
             max(0.0, min(1.0, float(features.get("click_progress_rate", 0.0))))
         )
+        click_subcluster_attempts = int(features.get("click_subcluster_attempts", 0))
+        click_subcluster_non_no_change_rate = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    float(features.get("click_subcluster_non_no_change_rate", 0.0)),
+                ),
+            )
+        )
+        click_subcluster_progress_rate = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    float(features.get("click_subcluster_progress_rate", 0.0)),
+                ),
+            )
+        )
+        subcluster_conf = float(
+            click_subcluster_attempts / float(max(1, click_subcluster_attempts + 3))
+        )
+        effective_non_no_change_rate = (
+            (subcluster_conf * click_subcluster_non_no_change_rate)
+            + ((1.0 - subcluster_conf) * click_non_no_change_rate)
+        )
+        effective_progress_rate = (
+            (subcluster_conf * click_subcluster_progress_rate)
+            + ((1.0 - subcluster_conf) * click_progress_rate)
+        )
         if (is_action6 and hit_object == 1 and progress_gap > 0) or (
             is_action5 and parameter_id == "on_confirm" and progress_gap > 0
         ):
-            progress_mass = 0.22 + (0.45 * click_progress_rate)
-            local_mass = 0.14 + (0.12 * click_non_no_change_rate)
+            progress_mass = 0.22 + (0.45 * effective_progress_rate)
+            local_mass = 0.14 + (0.12 * effective_non_no_change_rate)
             global_mass = 0.10
-            no_change_mass = max(0.04, 0.24 - (0.18 * click_non_no_change_rate))
+            no_change_mass = max(0.04, 0.24 - (0.18 * effective_non_no_change_rate))
             unknown_mass = max(0.04, 1.0 - (progress_mass + local_mass + global_mass + no_change_mass))
+            if int(click_subcluster_attempts) <= 0 and is_action6:
+                unknown_mass = min(0.40, unknown_mass + 0.10)
+                no_change_mass = max(0.04, no_change_mass - 0.10)
             distribution = {
                 _signature_key_for_features(
                     obs_change_type="METADATA_PROGRESS_CHANGE",
@@ -1057,9 +1150,12 @@ def _predict_distribution_for_hypothesis(
                 ): unknown_mass,
             }
         else:
-            local_mass = 0.16 + (0.26 * click_non_no_change_rate)
-            no_change_mass = 0.58 - (0.30 * click_non_no_change_rate)
+            local_mass = 0.16 + (0.26 * effective_non_no_change_rate)
+            no_change_mass = 0.58 - (0.30 * effective_non_no_change_rate)
             unknown_mass = max(0.06, 1.0 - (local_mass + no_change_mass))
+            if int(click_subcluster_attempts) <= 0 and is_action6:
+                unknown_mass = min(0.44, unknown_mass + 0.12)
+                no_change_mass = max(0.04, no_change_mass - 0.12)
             distribution = {
                 _signature_key_for_features(
                     obs_change_type="NO_CHANGE",

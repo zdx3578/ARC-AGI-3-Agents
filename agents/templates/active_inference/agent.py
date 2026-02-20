@@ -164,6 +164,14 @@ class ActiveInferenceEFE(Agent):
             1,
             _env_int("ACTIVE_INFERENCE_ACTION6_BUCKET_PROBE_MIN_ATTEMPTS", 3),
         )
+        self.action6_subcluster_probe_min_attempts = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_ACTION6_SUBCLUSTER_PROBE_MIN_ATTEMPTS", 2),
+        )
+        self.action6_probe_score_margin = max(
+            0.0,
+            _env_float("ACTIVE_INFERENCE_ACTION6_PROBE_SCORE_MARGIN", 0.06),
+        )
         self.no_change_stop_loss_steps = max(
             1,
             _env_int("ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS", 3),
@@ -196,6 +204,8 @@ class ActiveInferenceEFE(Agent):
             ignore_action_cost=True,
             weight_overrides=weight_overrides,
             action6_bucket_probe_min_attempts=self.action6_bucket_probe_min_attempts,
+            action6_subcluster_probe_min_attempts=self.action6_subcluster_probe_min_attempts,
+            action6_probe_score_margin=self.action6_probe_score_margin,
         )
         self.hypothesis_bank = ActiveInferenceHypothesisBankV1()
 
@@ -220,6 +230,7 @@ class ActiveInferenceEFE(Agent):
         self._edge_attempt_counts: dict[str, int] = {}
         self._region_visit_counts: dict[str, int] = {}
         self._click_bucket_stats: dict[str, dict[str, int]] = {}
+        self._click_subcluster_stats: dict[str, dict[str, int]] = {}
 
         self.trace_enabled = _env_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
         self.trace_recorder: ActiveInferenceTraceRecorderV1 | None = None
@@ -393,6 +404,13 @@ class ActiveInferenceEFE(Agent):
             "exploration_budget_remaining": int(exploration_budget_remaining),
             "early_probe_budget_config": int(self.early_probe_budget),
             "early_probe_budget_remaining": int(early_probe_budget_remaining),
+            "action6_bucket_probe_min_attempts": int(
+                self.action6_bucket_probe_min_attempts
+            ),
+            "action6_subcluster_probe_min_attempts": int(
+                self.action6_subcluster_probe_min_attempts
+            ),
+            "action6_probe_score_margin": float(self.action6_probe_score_margin),
             "action_cost_in_objective": "off_hard",
             "action_cost_enable_requested": bool(self.action_cost_objective_enable_requested),
             "action_cost_override_blocked": bool(
@@ -440,18 +458,26 @@ class ActiveInferenceEFE(Agent):
             return f"a{action_id}"
         return f"a6|{self._click_context_bucket_from_candidate(candidate)}"
 
+    def _click_context_subcluster_from_candidate(
+        self,
+        candidate: ActionCandidateV1 | None,
+    ) -> str:
+        if candidate is None:
+            return "cv2:NA|fr=NA_NA|sub=lpNA"
+        feature = candidate.metadata.get("coordinate_context_feature", {})
+        if isinstance(feature, dict):
+            subcluster = str(feature.get("click_context_subcluster_v1", "")).strip()
+            if subcluster:
+                return subcluster
+        return "cv2:NA|fr=NA_NA|sub=lpNA"
+
     def _candidate_subcluster_id(self, candidate: ActionCandidateV1 | None) -> str:
         if candidate is None:
             return "na"
         action_id = int(candidate.action_id)
         if action_id != 6:
             return f"a{action_id}"
-        feature = candidate.metadata.get("coordinate_context_feature", {})
-        if isinstance(feature, dict):
-            subcluster = str(feature.get("click_context_subcluster_v1", "")).strip()
-            if subcluster:
-                return f"a6|{subcluster}"
-        return self._candidate_cluster_id(candidate)
+        return f"a6|{self._click_context_subcluster_from_candidate(candidate)}"
 
     def _navigation_candidate_stats(self, action_id: int) -> dict[str, Any]:
         action_key = str(int(action_id))
@@ -551,6 +577,17 @@ class ActiveInferenceEFE(Agent):
             if level_delta > 0:
                 stats["progress"] = int(stats.get("progress", 0) + 1)
 
+            subcluster = self._click_context_subcluster_from_candidate(executed_candidate)
+            sub_stats = self._click_subcluster_stats.setdefault(
+                subcluster,
+                {"attempts": 0, "non_no_change": 0, "progress": 0},
+            )
+            sub_stats["attempts"] = int(sub_stats.get("attempts", 0) + 1)
+            if obs_change_type != "NO_CHANGE":
+                sub_stats["non_no_change"] = int(sub_stats.get("non_no_change", 0) + 1)
+            if level_delta > 0:
+                sub_stats["progress"] = int(sub_stats.get("progress", 0) + 1)
+
     def _operability_diagnostics_v1(self) -> dict[str, Any]:
         nav_attempts = int(self._navigation_attempt_count)
         nav_blocked = int(self._navigation_blocked_count)
@@ -561,6 +598,18 @@ class ActiveInferenceEFE(Agent):
             non_no_change = int(stats.get("non_no_change", 0))
             progress = int(stats.get("progress", 0))
             click_summary[str(bucket)] = {
+                "attempts": attempts,
+                "non_no_change": non_no_change,
+                "progress": progress,
+                "non_no_change_rate": float(non_no_change / float(max(1, attempts))),
+                "progress_rate": float(progress / float(max(1, attempts))),
+            }
+        click_subcluster_summary: dict[str, Any] = {}
+        for subcluster, stats in sorted(self._click_subcluster_stats.items()):
+            attempts = int(stats.get("attempts", 0))
+            non_no_change = int(stats.get("non_no_change", 0))
+            progress = int(stats.get("progress", 0))
+            click_subcluster_summary[str(subcluster)] = {
                 "attempts": attempts,
                 "non_no_change": non_no_change,
                 "progress": progress,
@@ -602,6 +651,7 @@ class ActiveInferenceEFE(Agent):
                 )
             },
             "click_bucket_effectiveness": click_summary,
+            "click_subcluster_effectiveness": click_subcluster_summary,
         }
 
     def _estimate_navigation_state(
@@ -1143,8 +1193,14 @@ class ActiveInferenceEFE(Agent):
                                 )
                             if int(candidate.action_id) == 6:
                                 click_bucket = self._click_context_bucket_from_candidate(candidate)
+                                click_subcluster = self._click_context_subcluster_from_candidate(
+                                    candidate
+                                )
                                 candidate.metadata["click_bucket_observed_stats"] = dict(
                                     self._click_bucket_stats.get(click_bucket, {})
+                                )
+                                candidate.metadata["click_subcluster_observed_stats"] = dict(
+                                    self._click_subcluster_stats.get(click_subcluster, {})
                                 )
 
                         diagnostics.finish_ok(
@@ -1359,6 +1415,13 @@ class ActiveInferenceEFE(Agent):
                         "exploration_min_steps": int(self.exploration_min_steps),
                         "exploration_max_steps": int(self.exploration_max_steps),
                         "exploration_fraction": float(self.exploration_fraction),
+                        "action6_bucket_probe_min_attempts": int(
+                            self.action6_bucket_probe_min_attempts
+                        ),
+                        "action6_subcluster_probe_min_attempts": int(
+                            self.action6_subcluster_probe_min_attempts
+                        ),
+                        "action6_probe_score_margin": float(self.action6_probe_score_margin),
                         "action_cost_in_objective": "off_hard",
                         "action_cost_enable_requested": bool(
                             self.action_cost_objective_enable_requested

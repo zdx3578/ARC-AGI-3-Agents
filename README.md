@@ -41,7 +41,7 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 - micro-signature dual channel (`micro_pixel_change_type` + `micro_object_change_type`)
 - signature-key v2 for posterior updates (`type/progress + translation_delta_bucket + click_context_bucket`)
 - object-anchored `click_context_bucket_v2` (`hit_type`, object digest bucket, relative position bucket, object-boundary flag, nearest-object fallback buckets)
-- Action6 `subcluster` refinement (`click_context_subcluster_v1` with local pattern hash) for bucket-internal tie breaking
+- Action6 `subcluster` refinement (`click_context_subcluster_v1` with fine-region + local pattern hash) for bucket-internal tie breaking
 - object representation contract (same-color and mixed-color connected components with 4/8 connectivity + hierarchy links + Action6 proposals)
 - world-model hypothesis bank (hidden mode state + rule-family/parameter version space)
 - posterior delta report per step (elimination/falsification reason buckets + survivor histograms)
@@ -49,12 +49,13 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 - Expected Free Energy ledger per candidate (risk / ambiguity / split information gain / action cost / complexity / VFE term)
 - causal event signatures for action interventions (`obs_change_type` diff semantics)
 - Action6 proposal diagnostics (region coverage / redundancy / context diversity / hit-object rate)
+- Action6 proposal diversity selection (greedy coverage across region / bucket / subcluster / object digest)
 - action-selection tie diagnostics (`best_vs_second_best_delta_total_efe`, `tie_group_size`, `tie_breaker_rule_applied`)
 - navigation-state diagnostics (`tracked_agent_token_id`, `agent_pos_xy`, `delta_pos_xy`, `control_schema_posterior`)
-- operability diagnostics (`navigation_blocked_rate`, blocked-edge histogram, Action6 click-bucket effectiveness)
+- operability diagnostics (`navigation_blocked_rate`, blocked-edge histogram, Action6 click-bucket + click-subcluster effectiveness)
 - navigation blocked outcome modeling (`delta=blocked`) wired into predictive signatures/risk preference
 - least-tried probing in explore/explain phases, including early probing budget that forces action-space coverage in the first N steps
-- cluster/subcluster-aware least-tried tie-break (`candidate_cluster_id` + `candidate_subcluster_id`) including exploit-phase Action6 bucket probing when tie persists
+- cluster/subcluster-aware least-tried tie-break (`candidate_cluster_id` + `candidate_subcluster_id`) including exploit-phase Action6 bucket/subcluster probing for tie and near-tie candidate sets
 - hard methodology guard: `cross-episode memory = off` (no persistent cross-run parameter learning; enforced in reasoning + trace)
 - hard objective guard: `action_cost_in_objective = off` (action cost is logged for audit, but excluded from action selection objective)
 - JSONL trace emission for bottleneck analysis
@@ -82,6 +83,8 @@ Useful environment variables:
 - `ACTIVE_INFERENCE_ROLLOUT_DISCOUNT` (default `0.55`)
 - `ACTIVE_INFERENCE_EARLY_PROBE_BUDGET` (default `8`, force early action-space coverage in explore/explain)
 - `ACTIVE_INFERENCE_ACTION6_BUCKET_PROBE_MIN_ATTEMPTS` (default `3`, minimum per-bucket attempts before exploit stops bucket probing tie-break)
+- `ACTIVE_INFERENCE_ACTION6_SUBCLUSTER_PROBE_MIN_ATTEMPTS` (default `2`, minimum per-subcluster attempts before exploit stops subcluster probing)
+- `ACTIVE_INFERENCE_ACTION6_PROBE_SCORE_MARGIN` (default `0.06`, exploit near-tie probing margin for Action6 candidate diversification)
 - `ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS` (default `3`)
 - `ACTIVE_INFERENCE_ENABLE_CROSS_EPISODE_MEMORY` (default `false`; any `true` request is blocked and recorded as `override_blocked=true`, policy remains hard-off)
 - `ACTIVE_INFERENCE_ENABLE_ACTION_COST_OBJECTIVE` (default `false`; any `true` request is blocked and recorded as `action_cost_override_blocked=true`, objective remains hard-off)
