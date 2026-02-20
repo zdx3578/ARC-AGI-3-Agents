@@ -78,14 +78,54 @@ def _normalize_distribution(values: dict[str, float]) -> dict[str, float]:
     return {key: max(0.0, float(v)) / total for (key, v) in values.items()}
 
 
-def _signature_key(obs_change_type: str, progress_flag: bool) -> str:
+def _base_signature_key(obs_change_type: str, progress_flag: bool) -> str:
     return f"type={obs_change_type}|progress={int(progress_flag)}"
 
 
+def _signature_key(
+    obs_change_type: str,
+    progress_flag: bool,
+    *,
+    delta_bucket: str = "na",
+    click_context_bucket: str = "na",
+) -> str:
+    return (
+        f"type={obs_change_type}|progress={int(progress_flag)}"
+        f"|delta={str(delta_bucket)}|click={str(click_context_bucket)}"
+    )
+
+
+def _signature_key_parts(signature_key: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for part in str(signature_key).split("|"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        out[str(key)] = str(value)
+    return out
+
+
+def _signature_progress_flag(signature_key: str) -> bool:
+    parts = _signature_key_parts(signature_key)
+    return str(parts.get("progress", "0")) == "1"
+
+
+def _signature_base_from_key(signature_key: str) -> str:
+    parts = _signature_key_parts(signature_key)
+    return _base_signature_key(
+        str(parts.get("type", "OBSERVED_UNCLASSIFIED")),
+        str(parts.get("progress", "0")) == "1",
+    )
+
+
 def signature_key_from_event(signature: CausalEventSignatureV1) -> str:
+    if str(signature.signature_key_v2):
+        return str(signature.signature_key_v2)
     return _signature_key(
         str(signature.obs_change_type),
         bool(int(signature.level_delta) > 0),
+        delta_bucket=str(signature.translation_delta_bucket or "na"),
+        click_context_bucket=str(signature.click_context_bucket or "na"),
     )
 
 
@@ -165,16 +205,52 @@ def _palette_delta_topk(
     return {str(color): int(diff) for (color, diff) in delta[:top_k]}
 
 
-def _component_translation_matches(
+def _delta_bucket_from_vector(dx: int, dy: int) -> str:
+    dx_i = int(dx)
+    dy_i = int(dy)
+    if dx_i == 0 and dy_i == 0:
+        return "stay"
+    if abs(dx_i) >= abs(dy_i):
+        if dx_i < 0:
+            return "dir_l"
+        if dx_i > 0:
+            return "dir_r"
+    if dy_i < 0:
+        return "dir_u"
+    if dy_i > 0:
+        return "dir_d"
+    return "dir_unknown"
+
+
+def _click_context_bucket_from_feature(feature: dict[str, Any]) -> str:
+    if not isinstance(feature, dict):
+        return "na"
+    hit = int(feature.get("hit_object", -1))
+    boundary = int(feature.get("on_boundary", -1))
+    dist_bucket = str(feature.get("distance_to_nearest_object_bucket", "na"))
+    coarse_x = int(feature.get("coarse_region_x", -1))
+    coarse_y = int(feature.get("coarse_region_y", -1))
+    return (
+        f"hit={hit}|boundary={boundary}|dist={dist_bucket}"
+        f"|region={coarse_x}:{coarse_y}"
+    )
+
+
+def _component_translation_summary(
     previous_representation: RepresentationStateV1,
     current_representation: RepresentationStateV1,
-) -> int:
+) -> dict[str, Any]:
     prev_nodes = previous_representation.component_views.get("same_color_8", [])
     curr_nodes = current_representation.component_views.get("same_color_8", [])
     if not prev_nodes or not curr_nodes:
-        return 0
+        return {
+            "translation_match_count": 0,
+            "dominant_delta_bucket": "na",
+            "delta_bucket_histogram": {},
+        }
 
     matched = 0
+    delta_histogram: dict[str, int] = {}
     used_curr: set[str] = set()
     for prev in prev_nodes:
         best = None
@@ -196,13 +272,28 @@ def _component_translation_matches(
                 best = curr
         if best is None:
             continue
-        shift = abs(int(prev.centroid_x) - int(best.centroid_x)) + abs(
-            int(prev.centroid_y) - int(best.centroid_y)
-        )
+        delta_x = int(best.centroid_x) - int(prev.centroid_x)
+        delta_y = int(best.centroid_y) - int(prev.centroid_y)
+        shift = abs(int(delta_x)) + abs(int(delta_y))
         if shift > 0:
             matched += 1
+            delta_bucket = _delta_bucket_from_vector(delta_x, delta_y)
+            delta_histogram[delta_bucket] = int(delta_histogram.get(delta_bucket, 0) + 1)
         used_curr.add(best.component_id)
-    return int(matched)
+    dominant_delta_bucket = "na"
+    if delta_histogram:
+        dominant_delta_bucket = sorted(
+            delta_histogram.items(),
+            key=lambda item: (-int(item[1]), item[0]),
+        )[0][0]
+    return {
+        "translation_match_count": int(matched),
+        "dominant_delta_bucket": str(dominant_delta_bucket),
+        "delta_bucket_histogram": {
+            str(key): int(value)
+            for (key, value) in sorted(delta_histogram.items())
+        },
+    }
 
 
 def _classify_observed_change_type(
@@ -264,9 +355,18 @@ def build_causal_event_signature_v1(
     palette_delta = _palette_delta_topk(previous_packet.frame, current_packet.frame)
     palette_delta_total = sum(abs(int(v)) for v in palette_delta.values())
 
-    translation_match_count = _component_translation_matches(
+    translation_summary = _component_translation_summary(
         previous_representation,
         current_representation,
+    )
+    translation_match_count = int(translation_summary.get("translation_match_count", 0))
+    dominant_delta_bucket = str(translation_summary.get("dominant_delta_bucket", "na"))
+
+    click_context_feature = executed_action.metadata.get("coordinate_context_feature", {})
+    click_context_bucket = (
+        _click_context_bucket_from_feature(click_context_feature)
+        if int(executed_action.action_id) == 6
+        else "na"
     )
 
     obs_change_type = _classify_observed_change_type(
@@ -296,8 +396,19 @@ def build_causal_event_signature_v1(
             len(current_representation.component_views.get("same_color_8", []))
         ),
         "translation_match_count": int(translation_match_count),
+        "dominant_delta_bucket": str(dominant_delta_bucket),
+        "delta_bucket_histogram": dict(
+            translation_summary.get("delta_bucket_histogram", {})
+        ),
         "object_count_delta": int(object_count_delta),
     }
+
+    signature_key_v2 = _signature_key(
+        str(obs_change_type),
+        bool(level_delta > 0),
+        delta_bucket=(str(dominant_delta_bucket) if str(obs_change_type) == "CC_TRANSLATION" else "na"),
+        click_context_bucket=str(click_context_bucket),
+    )
 
     digest_source = {
         "obs_change_type": obs_change_type,
@@ -309,6 +420,10 @@ def build_causal_event_signature_v1(
         "changed_object_count": changed_object_count,
         "palette_delta": palette_delta,
         "cc_match_summary": cc_match_summary,
+        "translation_delta_bucket": str(dominant_delta_bucket),
+        "click_context_bucket": str(click_context_bucket),
+        "signature_key_v2": str(signature_key_v2),
+        "executed_action_id": int(executed_action.action_id),
         "tags": sorted(tags),
     }
     signature_digest = hashlib.sha256(
@@ -328,6 +443,10 @@ def build_causal_event_signature_v1(
         event_tags=sorted(tags),
         palette_delta_topk=palette_delta,
         cc_match_summary=cc_match_summary,
+        translation_delta_bucket=str(dominant_delta_bucket),
+        click_context_bucket=str(click_context_bucket),
+        signature_key_v2=str(signature_key_v2),
+        executed_action_id=int(executed_action.action_id),
         signature_digest=signature_digest,
     )
 
@@ -346,7 +465,15 @@ def _all_signature_keys() -> list[str]:
     out: list[str] = []
     for obs_type in OBS_CHANGE_TYPES:
         for progress in (0, 1):
-            out.append(_signature_key(obs_type, bool(progress)))
+            delta_bucket = "dir_unknown" if obs_type == "CC_TRANSLATION" else "na"
+            out.append(
+                _signature_key(
+                    obs_type,
+                    bool(progress),
+                    delta_bucket=delta_bucket,
+                    click_context_bucket="na",
+                )
+            )
     return out
 
 
@@ -356,6 +483,19 @@ def _context_features(
     representation: RepresentationStateV1,
 ) -> dict[str, Any]:
     coord_context = candidate.metadata.get("coordinate_context_feature", {})
+    control_schema_observed_posterior = candidate.metadata.get(
+        "control_schema_observed_posterior",
+        {},
+    )
+    if not isinstance(control_schema_observed_posterior, dict):
+        control_schema_observed_posterior = {}
+    click_bucket_observed_stats = candidate.metadata.get(
+        "click_bucket_observed_stats",
+        {},
+    )
+    if not isinstance(click_bucket_observed_stats, dict):
+        click_bucket_observed_stats = {}
+    click_context_bucket = _click_context_bucket_from_feature(coord_context)
     hit_object = int(coord_context.get("hit_object", -1))
     on_boundary = int(coord_context.get("on_boundary", -1))
     dist_bucket = str(coord_context.get("distance_to_nearest_object_bucket", "na"))
@@ -376,6 +516,24 @@ def _context_features(
         .get("count", 0)
     )
 
+    observed_delta_bucket = "dir_unknown"
+    observed_delta_confidence = 0.0
+    if control_schema_observed_posterior:
+        ranked = sorted(
+            (
+                (_delta_bucket_from_control_key(str(key)), float(value))
+                for (key, value) in control_schema_observed_posterior.items()
+            ),
+            key=lambda item: (-float(item[1]), item[0]),
+        )
+        if ranked:
+            observed_delta_bucket = str(ranked[0][0])
+            observed_delta_confidence = float(max(0.0, min(1.0, ranked[0][1])))
+
+    click_attempts = int(click_bucket_observed_stats.get("attempts", 0))
+    click_non_no_change = int(click_bucket_observed_stats.get("non_no_change", 0))
+    click_progress = int(click_bucket_observed_stats.get("progress", 0))
+
     return {
         "action_id": int(candidate.action_id),
         "is_action6": int(candidate.action_id == 6),
@@ -384,10 +542,18 @@ def _context_features(
         "hit_object": int(hit_object),
         "on_boundary": int(on_boundary),
         "distance_bucket": dist_bucket,
+        "click_context_bucket": str(click_context_bucket),
+        "observed_delta_bucket": str(observed_delta_bucket),
+        "observed_delta_confidence": float(observed_delta_confidence),
         "object_count_bucket": object_count_bucket,
         "mixed8_count": int(mixed8_count),
         "levels_completed": int(packet.levels_completed),
         "progress_gap": int(max(0, packet.win_levels - packet.levels_completed)),
+        "click_attempts": int(click_attempts),
+        "click_non_no_change_rate": float(
+            click_non_no_change / float(max(1, click_attempts))
+        ),
+        "click_progress_rate": float(click_progress / float(max(1, click_attempts))),
     }
 
 
@@ -424,17 +590,67 @@ def _impossible_signature_keys(
     impossible: set[str] = set()
 
     if family_id == "no_op_guard":
-        impossible.add(_signature_key("METADATA_PROGRESS_CHANGE", True))
+        impossible.add(_base_signature_key("METADATA_PROGRESS_CHANGE", True))
 
     if family_id == "local_transform" and parameter_id == "require_hit_object":
         if int(features.get("hit_object", -1)) == 0:
-            impossible.add(_signature_key("LOCAL_COLOR_CHANGE", False))
-            impossible.add(_signature_key("CC_COUNT_CHANGE", False))
+            impossible.add(_base_signature_key("LOCAL_COLOR_CHANGE", False))
+            impossible.add(_base_signature_key("CC_COUNT_CHANGE", False))
 
     if family_id == "navigation":
-        impossible.add(_signature_key("METADATA_PROGRESS_CHANGE", True))
+        impossible.add(_base_signature_key("METADATA_PROGRESS_CHANGE", True))
 
     return impossible
+
+
+def _predicted_delta_bucket(action_id: int, parameter_id: str) -> str:
+    action = int(action_id)
+    if action not in (1, 2, 3, 4, 7):
+        return "dir_unknown"
+    if action == 7:
+        return "stay"
+    if parameter_id == "axis_shift":
+        mapping = {1: "dir_l", 2: "dir_r", 3: "dir_u", 4: "dir_d"}
+    else:
+        mapping = {1: "dir_u", 2: "dir_d", 3: "dir_l", 4: "dir_r"}
+    return str(mapping.get(action, "dir_unknown"))
+
+
+def _delta_bucket_from_control_key(delta_key: str) -> str:
+    dx = 0
+    dy = 0
+    for part in str(delta_key).split("|"):
+        if part.startswith("dx="):
+            try:
+                dx = int(part.split("=", 1)[1])
+            except Exception:
+                dx = 0
+        elif part.startswith("dy="):
+            try:
+                dy = int(part.split("=", 1)[1])
+            except Exception:
+                dy = 0
+    return _delta_bucket_from_vector(dx, dy)
+
+
+def _signature_key_for_features(
+    *,
+    obs_change_type: str,
+    progress_flag: bool,
+    features: dict[str, Any],
+    delta_bucket: str = "na",
+) -> str:
+    click_context_bucket = (
+        str(features.get("click_context_bucket", "na"))
+        if int(features.get("is_action6", 0)) == 1
+        else "na"
+    )
+    return _signature_key(
+        obs_change_type,
+        progress_flag,
+        delta_bucket=delta_bucket,
+        click_context_bucket=click_context_bucket,
+    )
 
 
 def _predict_distribution_for_hypothesis(
@@ -450,97 +666,310 @@ def _predict_distribution_for_hypothesis(
     is_action7 = bool(int(features.get("is_action7", 0)) == 1)
     hit_object = int(features.get("hit_object", -1))
     progress_gap = int(features.get("progress_gap", 0))
+    observed_delta_bucket = str(features.get("observed_delta_bucket", "dir_unknown"))
+    observed_delta_confidence = float(
+        max(0.0, min(1.0, float(features.get("observed_delta_confidence", 0.0))))
+    )
+    predicted_delta_bucket = _predicted_delta_bucket(action_id, parameter_id)
+    if observed_delta_bucket != "dir_unknown":
+        blend = 0.20 + (0.60 * observed_delta_confidence)
+        if parameter_id == "axis_shift":
+            predicted_delta_bucket = (
+                observed_delta_bucket
+                if blend >= 0.35
+                else predicted_delta_bucket
+            )
 
     distribution: dict[str, float] = {
-        _signature_key("OBSERVED_UNCLASSIFIED", False): 1.0
+        _signature_key_for_features(
+            obs_change_type="OBSERVED_UNCLASSIFIED",
+            progress_flag=False,
+            features=features,
+        ): 1.0
     }
 
     if family_id == "no_op_guard":
         distribution = {
-            _signature_key("NO_CHANGE", False): 0.86,
-            _signature_key("LOCAL_COLOR_CHANGE", False): 0.12,
-            _signature_key("OBSERVED_UNCLASSIFIED", False): 0.02,
+            _signature_key_for_features(
+                obs_change_type="NO_CHANGE",
+                progress_flag=False,
+                features=features,
+            ): 0.86,
+            _signature_key_for_features(
+                obs_change_type="LOCAL_COLOR_CHANGE",
+                progress_flag=False,
+                features=features,
+            ): 0.12,
+            _signature_key_for_features(
+                obs_change_type="OBSERVED_UNCLASSIFIED",
+                progress_flag=False,
+                features=features,
+            ): 0.02,
         }
 
     elif family_id == "navigation":
         if action_id in (1, 2, 3, 4):
+            translation_mass = 0.42 + (0.34 * observed_delta_confidence)
+            no_change_mass = max(0.08, 0.30 - (0.18 * observed_delta_confidence))
+            local_mass = max(0.04, 0.12 - (0.05 * observed_delta_confidence))
+            translation_unknown_mass = min(
+                0.10,
+                max(0.0, (1.0 - (translation_mass + no_change_mass + local_mass)) * 0.45),
+            )
+            unknown_mass = max(
+                0.04,
+                1.0
+                - (
+                    translation_mass
+                    + translation_unknown_mass
+                    + no_change_mass
+                    + local_mass
+                ),
+            )
             distribution = {
-                _signature_key("CC_TRANSLATION", False): 0.58,
-                _signature_key("NO_CHANGE", False): 0.22,
-                _signature_key("LOCAL_COLOR_CHANGE", False): 0.12,
-                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.08,
+                _signature_key_for_features(
+                    obs_change_type="CC_TRANSLATION",
+                    progress_flag=False,
+                    features=features,
+                    delta_bucket=predicted_delta_bucket,
+                ): translation_mass,
+                _signature_key_for_features(
+                    obs_change_type="CC_TRANSLATION",
+                    progress_flag=False,
+                    features=features,
+                    delta_bucket="dir_unknown",
+                ): translation_unknown_mass,
+                _signature_key_for_features(
+                    obs_change_type="NO_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): no_change_mass,
+                _signature_key_for_features(
+                    obs_change_type="LOCAL_COLOR_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): local_mass,
+                _signature_key_for_features(
+                    obs_change_type="OBSERVED_UNCLASSIFIED",
+                    progress_flag=False,
+                    features=features,
+                ): unknown_mass,
             }
         elif is_action7:
             distribution = {
-                _signature_key("CC_TRANSLATION", False): 0.34,
-                _signature_key("NO_CHANGE", False): 0.48,
-                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.18,
+                _signature_key_for_features(
+                    obs_change_type="CC_TRANSLATION",
+                    progress_flag=False,
+                    features=features,
+                    delta_bucket="stay",
+                ): 0.34,
+                _signature_key_for_features(
+                    obs_change_type="NO_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): 0.48,
+                _signature_key_for_features(
+                    obs_change_type="OBSERVED_UNCLASSIFIED",
+                    progress_flag=False,
+                    features=features,
+                ): 0.18,
             }
 
     elif family_id == "local_transform":
+        click_non_no_change_rate = float(
+            max(0.0, min(1.0, float(features.get("click_non_no_change_rate", 0.0))))
+        )
+        click_progress_rate = float(
+            max(0.0, min(1.0, float(features.get("click_progress_rate", 0.0))))
+        )
         if is_action6 and hit_object == 1:
+            local_mass = 0.44 + (0.28 * click_non_no_change_rate)
+            count_mass = 0.10 + (0.10 * click_non_no_change_rate)
+            progress_mass = 0.05 + (0.25 * click_progress_rate if progress_gap > 0 else 0.0)
+            remaining = max(0.0, 1.0 - (local_mass + count_mass + progress_mass))
+            translation_mass = min(0.16, remaining * 0.45)
+            no_change_mass = min(0.20, remaining * 0.35)
+            unknown_mass = max(0.0, remaining - (translation_mass + no_change_mass))
             distribution = {
-                _signature_key("LOCAL_COLOR_CHANGE", False): 0.56,
-                _signature_key("CC_COUNT_CHANGE", False): 0.16,
-                _signature_key("CC_TRANSLATION", False): 0.12,
-                _signature_key("NO_CHANGE", False): 0.08,
-                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.08,
+                _signature_key_for_features(
+                    obs_change_type="LOCAL_COLOR_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): local_mass,
+                _signature_key_for_features(
+                    obs_change_type="CC_COUNT_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): count_mass,
+                _signature_key_for_features(
+                    obs_change_type="CC_TRANSLATION",
+                    progress_flag=False,
+                    features=features,
+                    delta_bucket="dir_unknown",
+                ): translation_mass,
+                _signature_key_for_features(
+                    obs_change_type="NO_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): no_change_mass,
+                _signature_key_for_features(
+                    obs_change_type="OBSERVED_UNCLASSIFIED",
+                    progress_flag=False,
+                    features=features,
+                ): unknown_mass,
+                _signature_key_for_features(
+                    obs_change_type="METADATA_PROGRESS_CHANGE",
+                    progress_flag=True,
+                    features=features,
+                ): progress_mass,
             }
         elif is_action6 and hit_object == 0:
             if parameter_id == "require_hit_object":
                 distribution = {
-                    _signature_key("NO_CHANGE", False): 0.76,
-                    _signature_key("OBSERVED_UNCLASSIFIED", False): 0.24,
+                    _signature_key_for_features(
+                        obs_change_type="NO_CHANGE",
+                        progress_flag=False,
+                        features=features,
+                    ): 0.76,
+                    _signature_key_for_features(
+                        obs_change_type="OBSERVED_UNCLASSIFIED",
+                        progress_flag=False,
+                        features=features,
+                    ): 0.24,
                 }
             else:
                 distribution = {
-                    _signature_key("LOCAL_COLOR_CHANGE", False): 0.26,
-                    _signature_key("NO_CHANGE", False): 0.56,
-                    _signature_key("OBSERVED_UNCLASSIFIED", False): 0.18,
+                    _signature_key_for_features(
+                        obs_change_type="LOCAL_COLOR_CHANGE",
+                        progress_flag=False,
+                        features=features,
+                    ): 0.26,
+                    _signature_key_for_features(
+                        obs_change_type="NO_CHANGE",
+                        progress_flag=False,
+                        features=features,
+                    ): 0.56,
+                    _signature_key_for_features(
+                        obs_change_type="OBSERVED_UNCLASSIFIED",
+                        progress_flag=False,
+                        features=features,
+                    ): 0.18,
                 }
 
     elif family_id == "global_transform":
         if is_action5 or is_action6:
             distribution = {
-                _signature_key("GLOBAL_PATTERN_CHANGE", False): 0.46,
-                _signature_key("CC_COUNT_CHANGE", False): 0.22,
-                _signature_key("LOCAL_COLOR_CHANGE", False): 0.10,
-                _signature_key("NO_CHANGE", False): 0.10,
-                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.12,
+                _signature_key_for_features(
+                    obs_change_type="GLOBAL_PATTERN_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): 0.46,
+                _signature_key_for_features(
+                    obs_change_type="CC_COUNT_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): 0.22,
+                _signature_key_for_features(
+                    obs_change_type="LOCAL_COLOR_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): 0.10,
+                _signature_key_for_features(
+                    obs_change_type="NO_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): 0.10,
+                _signature_key_for_features(
+                    obs_change_type="OBSERVED_UNCLASSIFIED",
+                    progress_flag=False,
+                    features=features,
+                ): 0.12,
             }
 
     elif family_id == "progress_trigger":
+        click_non_no_change_rate = float(
+            max(0.0, min(1.0, float(features.get("click_non_no_change_rate", 0.0))))
+        )
+        click_progress_rate = float(
+            max(0.0, min(1.0, float(features.get("click_progress_rate", 0.0))))
+        )
         if (is_action6 and hit_object == 1 and progress_gap > 0) or (
             is_action5 and parameter_id == "on_confirm" and progress_gap > 0
         ):
+            progress_mass = 0.22 + (0.45 * click_progress_rate)
+            local_mass = 0.14 + (0.12 * click_non_no_change_rate)
+            global_mass = 0.10
+            no_change_mass = max(0.04, 0.24 - (0.18 * click_non_no_change_rate))
+            unknown_mass = max(0.04, 1.0 - (progress_mass + local_mass + global_mass + no_change_mass))
             distribution = {
-                _signature_key("METADATA_PROGRESS_CHANGE", True): 0.42,
-                _signature_key("LOCAL_COLOR_CHANGE", False): 0.16,
-                _signature_key("GLOBAL_PATTERN_CHANGE", False): 0.12,
-                _signature_key("NO_CHANGE", False): 0.14,
-                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.16,
+                _signature_key_for_features(
+                    obs_change_type="METADATA_PROGRESS_CHANGE",
+                    progress_flag=True,
+                    features=features,
+                ): progress_mass,
+                _signature_key_for_features(
+                    obs_change_type="LOCAL_COLOR_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): local_mass,
+                _signature_key_for_features(
+                    obs_change_type="GLOBAL_PATTERN_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): global_mass,
+                _signature_key_for_features(
+                    obs_change_type="NO_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): no_change_mass,
+                _signature_key_for_features(
+                    obs_change_type="OBSERVED_UNCLASSIFIED",
+                    progress_flag=False,
+                    features=features,
+                ): unknown_mass,
             }
         else:
+            local_mass = 0.16 + (0.26 * click_non_no_change_rate)
+            no_change_mass = 0.58 - (0.30 * click_non_no_change_rate)
+            unknown_mass = max(0.06, 1.0 - (local_mass + no_change_mass))
             distribution = {
-                _signature_key("NO_CHANGE", False): 0.44,
-                _signature_key("LOCAL_COLOR_CHANGE", False): 0.24,
-                _signature_key("OBSERVED_UNCLASSIFIED", False): 0.32,
+                _signature_key_for_features(
+                    obs_change_type="NO_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): no_change_mass,
+                _signature_key_for_features(
+                    obs_change_type="LOCAL_COLOR_CHANGE",
+                    progress_flag=False,
+                    features=features,
+                ): local_mass,
+                _signature_key_for_features(
+                    obs_change_type="OBSERVED_UNCLASSIFIED",
+                    progress_flag=False,
+                    features=features,
+                ): unknown_mass,
             }
 
     if mode_id == "confirm":
-        distribution[_signature_key("METADATA_PROGRESS_CHANGE", True)] = (
-            distribution.get(_signature_key("METADATA_PROGRESS_CHANGE", True), 0.0) + 0.06
+        progress_key = _signature_key_for_features(
+            obs_change_type="METADATA_PROGRESS_CHANGE",
+            progress_flag=True,
+            features=features,
+        )
+        distribution[progress_key] = (
+            distribution.get(progress_key, 0.0) + 0.06
         )
 
-    impossible = _impossible_signature_keys(family_id, parameter_id, features)
-    for key in impossible:
-        distribution[key] = 0.0
+    impossible_base_keys = _impossible_signature_keys(family_id, parameter_id, features)
+    for key in list(distribution.keys()):
+        if _signature_base_from_key(key) in impossible_base_keys:
+            distribution[key] = 0.0
 
     return _normalize_distribution(distribution)
 
 
 def _transition_mode(mode_id: str, action_id: int, observed_signature_key: str) -> str:
-    if observed_signature_key.endswith("progress=1"):
+    if _signature_progress_flag(observed_signature_key):
         return "confirm"
     if action_id in (1, 2, 3, 4):
         return "navigate"
@@ -552,7 +981,7 @@ def _transition_mode(mode_id: str, action_id: int, observed_signature_key: str) 
 
 
 def _mode_transition_soft_confidence(action_id: int, observed_signature_key: str) -> float:
-    if observed_signature_key.endswith("progress=1"):
+    if _signature_progress_flag(observed_signature_key):
         return 0.95
     if int(action_id) in (1, 2, 3, 4, 7):
         return 0.72
@@ -909,7 +1338,7 @@ class ActiveInferenceHypothesisBankV1:
                 hypothesis.parameter_id,
                 features,
             )
-            if observed_signature_key in impossible_keys:
+            if _signature_base_from_key(observed_signature_key) in impossible_keys:
                 reason = "impossible_constraint"
             elif likelihood <= EPS:
                 reason = "zero_likelihood"
@@ -1136,6 +1565,9 @@ class ActiveInferenceHypothesisBankV1:
         report["action_counter"] = int(current_packet.action_counter)
         report["state_transition"] = str(observed_signature.state_transition)
         report["level_delta"] = int(observed_signature.level_delta)
+        report["signature_key_v2"] = str(observed_signature_key)
+        report["translation_delta_bucket"] = str(observed_signature.translation_delta_bucket)
+        report["click_context_bucket"] = str(observed_signature.click_context_bucket)
         self.posterior_by_hypothesis_id = posterior_after
         self.last_update = dict(self.posterior_by_hypothesis_id)
         self.last_posterior_delta_report = report

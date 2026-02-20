@@ -43,6 +43,17 @@ def normalize_distribution(values: dict[str, float]) -> dict[str, float]:
     }
 
 
+def _base_signature_key(signature_key: str) -> str:
+    sig_type = "OBSERVED_UNCLASSIFIED"
+    progress = "0"
+    for part in str(signature_key).split("|"):
+        if part.startswith("type="):
+            sig_type = part.split("=", 1)[1]
+        elif part.startswith("progress="):
+            progress = part.split("=", 1)[1]
+    return f"type={sig_type}|progress={progress}"
+
+
 def determine_phase_v1(
     *,
     action_counter: int,
@@ -129,7 +140,8 @@ def compute_risk_kl_v1(
         p = float(pred_probability)
         if p <= 0.0:
             continue
-        q = float(pref.get(signature_key, EPS))
+        base_key = _base_signature_key(signature_key)
+        q = float(pref.get(signature_key, pref.get(base_key, EPS)))
         term = p * math.log2(max(EPS, p) / max(EPS, q))
         terms[signature_key] = float(term)
         kl += term

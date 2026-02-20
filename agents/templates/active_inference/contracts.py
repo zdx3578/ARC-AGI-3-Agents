@@ -236,6 +236,10 @@ class CausalEventSignatureV1:
     changed_area_ratio: float = 0.0
     palette_delta_topk: dict[str, int] = field(default_factory=dict)
     cc_match_summary: dict[str, Any] = field(default_factory=dict)
+    translation_delta_bucket: str = "na"
+    click_context_bucket: str = "na"
+    signature_key_v2: str = ""
+    executed_action_id: int = -1
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -252,6 +256,10 @@ class CausalEventSignatureV1:
                 str(k): int(v) for (k, v) in self.palette_delta_topk.items()
             },
             "cc_match_summary": self.cc_match_summary,
+            "translation_delta_bucket": self.translation_delta_bucket,
+            "click_context_bucket": self.click_context_bucket,
+            "signature_key_v2": self.signature_key_v2,
+            "executed_action_id": int(self.executed_action_id),
             "signature_digest": self.signature_digest,
         }
         if self.changed_bbox is not None:

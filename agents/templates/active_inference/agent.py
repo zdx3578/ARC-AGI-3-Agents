@@ -201,9 +201,15 @@ class ActiveInferenceEFE(Agent):
         self._available_actions_history: list[list[int]] = []
         self._control_schema_counts: dict[str, dict[str, int]] = {}
         self._tracked_agent_token_digest: str | None = None
+        self._last_known_agent_pos_region: tuple[int, int] | None = None
         self._latest_navigation_state_estimate: dict[str, Any] = {}
         self._action_select_count: dict[int, int] = {}
         self._candidate_select_count: dict[str, int] = {}
+        self._navigation_attempt_count = 0
+        self._navigation_blocked_count = 0
+        self._navigation_moved_count = 0
+        self._blocked_edge_counts: dict[str, int] = {}
+        self._click_bucket_stats: dict[str, dict[str, int]] = {}
 
         self.trace_enabled = _env_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
         self.trace_recorder: ActiveInferenceTraceRecorderV1 | None = None
@@ -396,6 +402,102 @@ class ActiveInferenceEFE(Agent):
             }
         return out
 
+    def _click_context_bucket_from_candidate(
+        self,
+        candidate: ActionCandidateV1 | None,
+    ) -> str:
+        if candidate is None:
+            return "na"
+        feature = candidate.metadata.get("coordinate_context_feature", {})
+        if not isinstance(feature, dict):
+            return "na"
+        hit = int(feature.get("hit_object", -1))
+        boundary = int(feature.get("on_boundary", -1))
+        dist_bucket = str(feature.get("distance_to_nearest_object_bucket", "na"))
+        coarse_x = int(feature.get("coarse_region_x", -1))
+        coarse_y = int(feature.get("coarse_region_y", -1))
+        return (
+            f"hit={hit}|boundary={boundary}|dist={dist_bucket}|region={coarse_x}:{coarse_y}"
+        )
+
+    def _update_operability_stats_v1(
+        self,
+        *,
+        executed_candidate: ActionCandidateV1,
+        causal_signature: Any,
+        navigation_state_estimate: dict[str, Any],
+    ) -> None:
+        action_id = int(executed_candidate.action_id)
+        obs_change_type = str(getattr(causal_signature, "obs_change_type", "OBSERVED_UNCLASSIFIED"))
+        level_delta = int(getattr(causal_signature, "level_delta", 0))
+        if action_id in (1, 2, 3, 4):
+            self._navigation_attempt_count += 1
+            moved = bool(
+                navigation_state_estimate.get("matched", False)
+                and obs_change_type == "CC_TRANSLATION"
+            )
+            if moved:
+                self._navigation_moved_count += 1
+                region = navigation_state_estimate.get("agent_pos_region", {})
+                if isinstance(region, dict):
+                    rx = int(region.get("x", -1))
+                    ry = int(region.get("y", -1))
+                    if rx >= 0 and ry >= 0:
+                        self._last_known_agent_pos_region = (rx, ry)
+            else:
+                self._navigation_blocked_count += 1
+                if self._last_known_agent_pos_region is not None:
+                    rx, ry = self._last_known_agent_pos_region
+                    edge_key = f"region={rx}:{ry}|action={action_id}"
+                    self._blocked_edge_counts[edge_key] = (
+                        int(self._blocked_edge_counts.get(edge_key, 0)) + 1
+                    )
+
+        if action_id == 6:
+            bucket = self._click_context_bucket_from_candidate(executed_candidate)
+            stats = self._click_bucket_stats.setdefault(
+                bucket,
+                {"attempts": 0, "non_no_change": 0, "progress": 0},
+            )
+            stats["attempts"] = int(stats.get("attempts", 0) + 1)
+            if obs_change_type != "NO_CHANGE":
+                stats["non_no_change"] = int(stats.get("non_no_change", 0) + 1)
+            if level_delta > 0:
+                stats["progress"] = int(stats.get("progress", 0) + 1)
+
+    def _operability_diagnostics_v1(self) -> dict[str, Any]:
+        nav_attempts = int(self._navigation_attempt_count)
+        nav_blocked = int(self._navigation_blocked_count)
+        nav_moved = int(self._navigation_moved_count)
+        click_summary: dict[str, Any] = {}
+        for bucket, stats in sorted(self._click_bucket_stats.items()):
+            attempts = int(stats.get("attempts", 0))
+            non_no_change = int(stats.get("non_no_change", 0))
+            progress = int(stats.get("progress", 0))
+            click_summary[str(bucket)] = {
+                "attempts": attempts,
+                "non_no_change": non_no_change,
+                "progress": progress,
+                "non_no_change_rate": float(non_no_change / float(max(1, attempts))),
+                "progress_rate": float(progress / float(max(1, attempts))),
+            }
+        return {
+            "schema_name": "active_inference_operability_diagnostics_v1",
+            "schema_version": 1,
+            "navigation_attempt_count": nav_attempts,
+            "navigation_moved_count": nav_moved,
+            "navigation_blocked_count": nav_blocked,
+            "navigation_blocked_rate": float(nav_blocked / float(max(1, nav_attempts))),
+            "blocked_edge_histogram": {
+                str(key): int(value)
+                for (key, value) in sorted(
+                    self._blocked_edge_counts.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )
+            },
+            "click_bucket_effectiveness": click_summary,
+        }
+
     def _estimate_navigation_state(
         self,
         previous_representation: RepresentationStateV1,
@@ -504,6 +606,7 @@ class ActiveInferenceEFE(Agent):
             "no_change_streak": int(self._no_change_streak),
             "memory_policy_v1": memory_policy_payload,
             "exploration_policy_v1": exploration_policy_payload,
+            "operability_diagnostics_v1": self._operability_diagnostics_v1(),
         }
 
     def _reasoning_for_failure(
@@ -542,6 +645,7 @@ class ActiveInferenceEFE(Agent):
             "no_change_streak": int(self._no_change_streak),
             "memory_policy_v1": memory_policy_payload,
             "exploration_policy_v1": exploration_policy_payload,
+            "operability_diagnostics_v1": self._operability_diagnostics_v1(),
         }
 
     def choose_action(
@@ -707,6 +811,11 @@ class ActiveInferenceEFE(Agent):
                     representation,
                     self._previous_action_candidate,
                 )
+                self._update_operability_stats_v1(
+                    executed_candidate=self._previous_action_candidate,
+                    causal_signature=causal_signature,
+                    navigation_state_estimate=navigation_state_estimate,
+                )
                 self._latest_navigation_state_estimate = dict(navigation_state_estimate)
                 if str(causal_signature.obs_change_type) == "NO_CHANGE":
                     self._no_change_streak += 1
@@ -734,6 +843,7 @@ class ActiveInferenceEFE(Agent):
                             posterior_report.get("mode_transition_soft_confidence", 0.0)
                         ),
                         "navigation_state_estimate_v1": dict(navigation_state_estimate),
+                        "operability_diagnostics_v1": self._operability_diagnostics_v1(),
                     },
                 )
             else:
@@ -909,6 +1019,18 @@ class ActiveInferenceEFE(Agent):
                             "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
                         }
                     else:
+                        control_schema = self._control_schema_posterior()
+                        for candidate in candidates:
+                            action_key = str(int(candidate.action_id))
+                            candidate.metadata["control_schema_observed_posterior"] = dict(
+                                control_schema.get(action_key, {})
+                            )
+                            if int(candidate.action_id) == 6:
+                                click_bucket = self._click_context_bucket_from_candidate(candidate)
+                                candidate.metadata["click_bucket_observed_stats"] = dict(
+                                    self._click_bucket_stats.get(click_bucket, {})
+                                )
+
                         diagnostics.finish_ok(
                             "candidate_generation",
                             {
@@ -1023,6 +1145,10 @@ class ActiveInferenceEFE(Agent):
                 "exploration_policy_v1",
                 dict(exploration_policy_payload),
             )
+            action.reasoning.setdefault(
+                "operability_diagnostics_v1",
+                self._operability_diagnostics_v1(),
+            )
             action.reasoning.setdefault("stage_diagnostics_v1", diagnostics.to_dicts())
             action.reasoning.setdefault("bottleneck_stage_v1", diagnostics.bottleneck_stage())
 
@@ -1065,6 +1191,7 @@ class ActiveInferenceEFE(Agent):
                     "selection_diagnostics_v1": dict(selection_diagnostics),
                     "memory_policy_v1": self._memory_policy_v1(),
                     "exploration_policy_v1": dict(exploration_policy_payload),
+                    "operability_diagnostics_v1": self._operability_diagnostics_v1(),
                     "causal_event_signature_previous_step": (
                         causal_signature.to_dict() if causal_signature else None
                     ),
@@ -1124,6 +1251,7 @@ class ActiveInferenceEFE(Agent):
                     "final_navigation_state_estimate_v1": dict(
                         self._latest_navigation_state_estimate
                     ),
+                    "final_operability_diagnostics_v1": self._operability_diagnostics_v1(),
                     "final_control_schema_posterior": self._control_schema_posterior(),
                     "final_action_select_count": {
                         str(key): int(value)

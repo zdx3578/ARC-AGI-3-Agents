@@ -39,6 +39,7 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 - observation contract (state, levels, available actions, frame)
 - frame-chain diagnostics (1-N frame digests + micro/macro transition signatures)
 - micro-signature dual channel (`micro_pixel_change_type` + `micro_object_change_type`)
+- signature-key v2 for posterior updates (`type/progress + translation_delta_bucket + click_context_bucket`)
 - object representation contract (same-color and mixed-color connected components with 4/8 connectivity + hierarchy links + Action6 proposals)
 - world-model hypothesis bank (hidden mode state + rule-family/parameter version space)
 - posterior delta report per step (elimination/falsification reason buckets + survivor histograms)
@@ -48,6 +49,7 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 - Action6 proposal diagnostics (region coverage / redundancy / context diversity / hit-object rate)
 - action-selection tie diagnostics (`best_vs_second_best_delta_total_efe`, `tie_group_size`, `tie_breaker_rule_applied`)
 - navigation-state diagnostics (`tracked_agent_token_id`, `agent_pos_xy`, `delta_pos_xy`, `control_schema_posterior`)
+- operability diagnostics (`navigation_blocked_rate`, blocked-edge histogram, Action6 click-bucket effectiveness)
 - least-tried probing in explore/explain phases, including early probing budget that forces action-space coverage in the first N steps
 - hard methodology guard: `cross-episode memory = off` (no persistent cross-run parameter learning; enforced in reasoning + trace)
 - hard objective guard: `action_cost_in_objective = off` (action cost is logged for audit, but excluded from action selection objective)
