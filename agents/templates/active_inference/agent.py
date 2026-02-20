@@ -189,6 +189,22 @@ class ActiveInferenceEFE(Agent):
             1,
             _env_int("ACTIVE_INFERENCE_ACTION6_STAGNATION_STEP_THRESHOLD", 12),
         )
+        self.stagnation_probe_trigger_steps = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_STAGNATION_PROBE_TRIGGER_STEPS", 24),
+        )
+        self.stagnation_probe_score_margin = max(
+            0.0,
+            _env_float("ACTIVE_INFERENCE_STAGNATION_PROBE_SCORE_MARGIN", 0.22),
+        )
+        self.stagnation_probe_min_action_usage_gap = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_STAGNATION_PROBE_MIN_ACTION_USAGE_GAP", 8),
+        )
+        self.stagnation_stop_loss_steps = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_STAGNATION_STOP_LOSS_STEPS", 80),
+        )
         self.no_change_stop_loss_steps = max(
             1,
             _env_int("ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS", 3),
@@ -227,6 +243,9 @@ class ActiveInferenceEFE(Agent):
             action6_probe_score_margin=self.action6_probe_score_margin,
             action6_explore_probe_score_margin=self.action6_explore_probe_score_margin,
             action6_stagnation_step_threshold=self.action6_stagnation_step_threshold,
+            stagnation_probe_trigger_steps=self.stagnation_probe_trigger_steps,
+            stagnation_probe_score_margin=self.stagnation_probe_score_margin,
+            stagnation_probe_min_action_usage_gap=self.stagnation_probe_min_action_usage_gap,
         )
         self.hypothesis_bank = ActiveInferenceHypothesisBankV1()
 
@@ -234,6 +253,7 @@ class ActiveInferenceEFE(Agent):
         self._previous_representation: RepresentationStateV1 | None = None
         self._previous_action_candidate: ActionCandidateV1 | None = None
         self._no_change_streak = 0
+        self._stagnation_streak = 0
         self._available_actions_history: list[list[int]] = []
         self._control_schema_counts: dict[str, dict[str, int]] = {}
         self._tracked_agent_token_digest: str | None = None
@@ -755,6 +775,12 @@ class ActiveInferenceEFE(Agent):
                 self.action6_subcluster_probe_min_attempts
             ),
             "action6_probe_score_margin": float(self.action6_probe_score_margin),
+            "stagnation_probe_trigger_steps": int(self.stagnation_probe_trigger_steps),
+            "stagnation_probe_score_margin": float(self.stagnation_probe_score_margin),
+            "stagnation_probe_min_action_usage_gap": int(
+                self.stagnation_probe_min_action_usage_gap
+            ),
+            "stagnation_stop_loss_steps": int(self.stagnation_stop_loss_steps),
             "action_cost_in_objective": "off_hard",
             "action_cost_enable_requested": bool(self.action_cost_objective_enable_requested),
             "action_cost_override_blocked": bool(
@@ -1099,6 +1125,19 @@ class ActiveInferenceEFE(Agent):
             "control_schema_posterior": self._control_schema_posterior(),
         }
 
+    def _is_progress_proxy_event(self, signature: Any) -> bool:
+        # Keep the proxy conservative: only reset stagnation on strong progress signals.
+        try:
+            level_delta = int(getattr(signature, "level_delta", 0))
+        except Exception:
+            level_delta = 0
+        if level_delta > 0:
+            return True
+        state_transition = str(getattr(signature, "state_transition", ""))
+        if state_transition.endswith("->WIN"):
+            return True
+        return False
+
     def _reasoning_for_forced_reset(self, packet: ObservationPacketV1) -> dict[str, Any]:
         memory_policy_payload, exploration_policy_payload = (
             self._reasoning_policy_payloads_v1(packet)
@@ -1128,6 +1167,7 @@ class ActiveInferenceEFE(Agent):
             "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
             "no_change_streak": int(self._no_change_streak),
+            "stagnation_streak": int(self._stagnation_streak),
             "memory_policy_v1": memory_policy_payload,
             "exploration_policy_v1": exploration_policy_payload,
             "operability_diagnostics_v1": self._operability_diagnostics_v1(),
@@ -1169,6 +1209,7 @@ class ActiveInferenceEFE(Agent):
             "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
             "no_change_streak": int(self._no_change_streak),
+            "stagnation_streak": int(self._stagnation_streak),
             "memory_policy_v1": memory_policy_payload,
             "exploration_policy_v1": exploration_policy_payload,
             "operability_diagnostics_v1": self._operability_diagnostics_v1(),
@@ -1356,10 +1397,15 @@ class ActiveInferenceEFE(Agent):
                     navigation_state_estimate=navigation_state_estimate,
                 )
                 self._latest_navigation_state_estimate = dict(navigation_state_estimate)
+                progress_proxy_event = self._is_progress_proxy_event(causal_signature)
                 if str(causal_signature.obs_change_type) == "NO_CHANGE":
                     self._no_change_streak += 1
                 else:
                     self._no_change_streak = 0
+                if progress_proxy_event:
+                    self._stagnation_streak = 0
+                else:
+                    self._stagnation_streak += 1
                 posterior_report = dict(self.hypothesis_bank.last_posterior_delta_report)
                 diagnostics.finish_ok(
                     "causal_update",
@@ -1369,6 +1415,8 @@ class ActiveInferenceEFE(Agent):
                         "event_tags": list(causal_signature.event_tags),
                         "obs_change_type": str(causal_signature.obs_change_type),
                         "no_change_streak": int(self._no_change_streak),
+                        "stagnation_streak": int(self._stagnation_streak),
+                        "progress_proxy_event": bool(progress_proxy_event),
                         "active_hypothesis_count_before": int(
                             posterior_report.get("active_hypothesis_count_before", 0)
                         ),
@@ -1393,11 +1441,16 @@ class ActiveInferenceEFE(Agent):
                 )
             else:
                 self._no_change_streak = 0
+                self._stagnation_streak = 0
                 self._latest_navigation_state_estimate = {}
                 self._latest_transition_record = {}
                 diagnostics.finish_ok(
                     "causal_update",
-                    {"updated": False, "reason": "insufficient_history"},
+                    {
+                        "updated": False,
+                        "reason": "insufficient_history",
+                        "stagnation_streak": int(self._stagnation_streak),
+                    },
                 )
         except Exception as exc:
             diagnostics.finish_rejected(
@@ -1454,6 +1507,8 @@ class ActiveInferenceEFE(Agent):
                 action_id=0,
                 source="state_guard",
             )
+            self._no_change_streak = 0
+            self._stagnation_streak = 0
             action = GameAction.RESET
             action.reasoning = self._reasoning_for_forced_reset(packet)
             diagnostics.finish_ok(
@@ -1468,7 +1523,29 @@ class ActiveInferenceEFE(Agent):
             diagnostics.start("stop_loss_guard")
             stop_loss_applied = False
             stop_loss_candidate: ActionCandidateV1 | None = None
+            stop_loss_reason = "none"
             if self._no_change_streak >= self.no_change_stop_loss_steps:
+                stop_loss_reason = "no_change_streak_threshold"
+                if 7 in packet.available_actions:
+                    stop_loss_candidate = ActionCandidateV1(
+                        candidate_id="a7_stop_loss",
+                        action_id=7,
+                        source="stop_loss_guard",
+                    )
+                elif 0 in packet.available_actions:
+                    stop_loss_candidate = ActionCandidateV1(
+                        candidate_id="reset_stop_loss",
+                        action_id=0,
+                        source="stop_loss_guard",
+                    )
+                else:
+                    stop_loss_candidate = ActionCandidateV1(
+                        candidate_id="reset_stop_loss",
+                        action_id=0,
+                        source="stop_loss_guard",
+                    )
+            elif self._stagnation_streak >= self.stagnation_stop_loss_steps:
+                stop_loss_reason = "stagnation_streak_threshold"
                 if 7 in packet.available_actions:
                     stop_loss_candidate = ActionCandidateV1(
                         candidate_id="a7_stop_loss",
@@ -1500,17 +1577,22 @@ class ActiveInferenceEFE(Agent):
                     {
                         "triggered": True,
                         "no_change_streak": int(self._no_change_streak),
+                        "stagnation_streak": int(self._stagnation_streak),
                         "threshold": int(self.no_change_stop_loss_steps),
+                        "stagnation_threshold": int(self.stagnation_stop_loss_steps),
+                        "reason": str(stop_loss_reason),
                         "selected_action_id": int(selected_candidate.action_id),
                     },
                 )
                 self._no_change_streak = 0
+                self._stagnation_streak = 0
                 action.reasoning = {
                     "schema_name": "active_inference_reasoning_v2",
                     "schema_version": 2,
                     "phase": phase,
                     "selected_candidate": selected_candidate.to_dict(),
                     "reason": "stop_loss_guard_triggered",
+                    "stop_loss_reason": str(stop_loss_reason),
                     "hypothesis_summary": self.hypothesis_bank.summary(),
                     "posterior_delta_report_previous_step": dict(
                         self.hypothesis_bank.last_posterior_delta_report
@@ -1525,6 +1607,8 @@ class ActiveInferenceEFE(Agent):
                     "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "remaining_budget": int(remaining_budget),
                     "early_probe_budget_remaining": int(early_probe_budget_remaining),
+                    "no_change_streak": int(self._no_change_streak),
+                    "stagnation_streak": int(self._stagnation_streak),
                 }
             else:
                 diagnostics.finish_ok(
@@ -1532,7 +1616,9 @@ class ActiveInferenceEFE(Agent):
                     {
                         "triggered": False,
                         "no_change_streak": int(self._no_change_streak),
+                        "stagnation_streak": int(self._stagnation_streak),
                         "threshold": int(self.no_change_stop_loss_steps),
+                        "stagnation_threshold": int(self.stagnation_stop_loss_steps),
                     },
                 )
 
@@ -1572,6 +1658,8 @@ class ActiveInferenceEFE(Agent):
                             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                             "remaining_budget": int(remaining_budget),
                             "early_probe_budget_remaining": int(early_probe_budget_remaining),
+                            "no_change_streak": int(self._no_change_streak),
+                            "stagnation_streak": int(self._stagnation_streak),
                             "stage_diagnostics_v1": diagnostics.to_dicts(),
                             "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
                         }
@@ -1640,6 +1728,7 @@ class ActiveInferenceEFE(Agent):
                             subcluster_select_count=self._subcluster_select_count,
                             early_probe_budget_remaining=early_probe_budget_remaining,
                             no_change_streak=self._no_change_streak,
+                            stagnation_streak=self._stagnation_streak,
                         )
                         if ranked_entries:
                             selection_diagnostics = dict(
@@ -1746,6 +1835,8 @@ class ActiveInferenceEFE(Agent):
                 "operability_diagnostics_v1",
                 self._operability_diagnostics_v1(),
             )
+            action.reasoning.setdefault("no_change_streak", int(self._no_change_streak))
+            action.reasoning.setdefault("stagnation_streak", int(self._stagnation_streak))
             action.reasoning.setdefault("stage_diagnostics_v1", diagnostics.to_dicts())
             action.reasoning.setdefault("bottleneck_stage_v1", diagnostics.bottleneck_stage())
 
@@ -1771,6 +1862,7 @@ class ActiveInferenceEFE(Agent):
                     "remaining_budget": int(remaining_budget),
                     "early_probe_budget_remaining": int(early_probe_budget_remaining),
                     "no_change_streak": int(self._no_change_streak),
+                    "stagnation_streak": int(self._stagnation_streak),
                     "phase": phase,
                     "observation_packet_summary": self._observation_summary_for_trace(packet),
                     "representation_state": representation_payload,
@@ -1887,6 +1979,7 @@ class ActiveInferenceEFE(Agent):
                     },
                     "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "final_no_change_streak": int(self._no_change_streak),
+                    "final_stagnation_streak": int(self._stagnation_streak),
                 }
             )
             self.trace_recorder.close()

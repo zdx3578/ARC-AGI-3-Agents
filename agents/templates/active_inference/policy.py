@@ -34,6 +34,9 @@ class ActiveInferencePolicyEvaluatorV1:
         action6_probe_score_margin: float = 0.06,
         action6_explore_probe_score_margin: float = 0.12,
         action6_stagnation_step_threshold: int = 12,
+        stagnation_probe_trigger_steps: int = 24,
+        stagnation_probe_score_margin: float = 0.22,
+        stagnation_probe_min_action_usage_gap: int = 8,
         rollout_max_candidates: int = 8,
         rollout_only_in_exploit: bool = True,
     ) -> None:
@@ -57,6 +60,11 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         self.action6_stagnation_step_threshold = int(
             max(1, action6_stagnation_step_threshold)
+        )
+        self.stagnation_probe_trigger_steps = int(max(1, stagnation_probe_trigger_steps))
+        self.stagnation_probe_score_margin = float(max(0.0, stagnation_probe_score_margin))
+        self.stagnation_probe_min_action_usage_gap = int(
+            max(1, stagnation_probe_min_action_usage_gap)
         )
         self.rollout_max_candidates = int(max(1, rollout_max_candidates))
         self.rollout_only_in_exploit = bool(rollout_only_in_exploit)
@@ -115,6 +123,54 @@ class ActiveInferencePolicyEvaluatorV1:
             sub_attempts < int(self.action6_subcluster_probe_min_attempts)
         )
         return bool(bucket_needed or subcluster_needed)
+
+    def _predicted_probability_mass(
+        self,
+        entry: FreeEnergyLedgerEntryV1,
+        *,
+        signature_filter: str,
+    ) -> float:
+        predictive = entry.predictive_signature_distribution
+        if not isinstance(predictive, dict):
+            return 0.0
+        mass = 0.0
+        for signature_key, probability in predictive.items():
+            if signature_filter in str(signature_key):
+                try:
+                    mass += float(probability)
+                except Exception:
+                    continue
+        return float(max(0.0, min(1.0, mass)))
+
+    def _candidate_object_interaction_rank(
+        self,
+        candidate: ActionCandidateV1,
+    ) -> tuple[int, int, int]:
+        if int(candidate.action_id) != 6:
+            return (2, 2, 2)
+        feature = candidate.metadata.get("coordinate_context_feature", {})
+        if not isinstance(feature, dict):
+            return (1, 1, 1)
+        hit_object = int(feature.get("hit_object", -1))
+        on_object_boundary_raw = feature.get("on_object_boundary", feature.get("on_boundary", 0))
+        on_object_boundary = str(on_object_boundary_raw).strip() in ("1", "true", "True")
+        distance_bucket = str(
+            feature.get(
+                "distance_to_nearest_object_bucket",
+                "na",
+            )
+        )
+        distance_rank = {
+            "near": 0,
+            "mid": 1,
+            "far": 2,
+        }.get(distance_bucket, 3)
+        # Lower is better in sort ordering.
+        return (
+            0 if hit_object == 1 else 1,
+            0 if on_object_boundary else 1,
+            int(distance_rank),
+        )
 
     def _weights_for_phase(self, phase: str) -> dict[str, float]:
         defaults = weights_for_phase_v1(phase)
@@ -341,6 +397,7 @@ class ActiveInferencePolicyEvaluatorV1:
         subcluster_select_count: dict[str, int] | None = None,
         early_probe_budget_remaining: int = 0,
         no_change_streak: int = 0,
+        stagnation_streak: int = 0,
     ) -> tuple[ActionCandidateV1, list[FreeEnergyLedgerEntryV1]]:
         entries = self.evaluate_candidates(
             packet=packet,
@@ -536,6 +593,9 @@ class ActiveInferencePolicyEvaluatorV1:
                                     0,
                                 )
                             ),
+                            int(self._candidate_object_interaction_rank(entry.candidate)[0]),
+                            int(self._candidate_object_interaction_rank(entry.candidate)[1]),
+                            int(self._candidate_object_interaction_rank(entry.candidate)[2]),
                             int(candidate_count_map.get(str(entry.candidate.candidate_id), 0)),
                             int(entry.candidate.action_id),
                             str(entry.candidate.candidate_id),
@@ -601,6 +661,9 @@ class ActiveInferencePolicyEvaluatorV1:
                                 0,
                             )
                         ),
+                        int(self._candidate_object_interaction_rank(entry.candidate)[0]),
+                        int(self._candidate_object_interaction_rank(entry.candidate)[1]),
+                        int(self._candidate_object_interaction_rank(entry.candidate)[2]),
                         int(candidate_count_map.get(str(entry.candidate.candidate_id), 0)),
                         int(entry.candidate.action_id),
                         str(entry.candidate.candidate_id),
@@ -683,6 +746,9 @@ class ActiveInferencePolicyEvaluatorV1:
                                 0,
                             )
                         ),
+                        int(self._candidate_object_interaction_rank(entry.candidate)[0]),
+                        int(self._candidate_object_interaction_rank(entry.candidate)[1]),
+                        int(self._candidate_object_interaction_rank(entry.candidate)[2]),
                         int(candidate_count_map.get(str(entry.candidate.candidate_id), 0)),
                         float(
                             selection_score_by_candidate.get(
@@ -771,6 +837,9 @@ class ActiveInferencePolicyEvaluatorV1:
                                 0,
                             )
                         ),
+                        int(self._candidate_object_interaction_rank(entry.candidate)[0]),
+                        int(self._candidate_object_interaction_rank(entry.candidate)[1]),
+                        int(self._candidate_object_interaction_rank(entry.candidate)[2]),
                         int(
                             cluster_count_map.get(
                                 str(
@@ -810,6 +879,129 @@ class ActiveInferencePolicyEvaluatorV1:
                     entries.remove(selected_entry)
                     entries.insert(0, selected_entry)
 
+        navigation_stagnation_probe_applied = False
+        navigation_probe_candidates: list[FreeEnergyLedgerEntryV1] = []
+        navigation_stagnated = bool(
+            int(stagnation_streak) >= int(self.stagnation_probe_trigger_steps)
+            and int(packet.levels_completed) <= 0
+        )
+        navigation_actions_available = sorted(
+            {int(v) for v in packet.available_actions if int(v) in (1, 2, 3, 4)}
+        )
+        navigation_usage_gap = 0
+        if navigation_actions_available:
+            usage_values = [
+                int(action_count_map.get(int(action_id), 0))
+                for action_id in navigation_actions_available
+            ]
+            if usage_values:
+                navigation_usage_gap = int(max(usage_values) - min(usage_values))
+        if (
+            not early_probe_applied
+            and not least_tried_probe_applied
+            and str(phase) == "exploit"
+            and navigation_stagnated
+            and len(navigation_actions_available) >= 2
+            and (
+                int(navigation_usage_gap) >= int(self.stagnation_probe_min_action_usage_gap)
+                or int(stagnation_streak)
+                >= int(self.stagnation_probe_trigger_steps + 10)
+            )
+        ):
+            navigation_candidates_all = [
+                entry
+                for entry in entries
+                if int(entry.candidate.action_id) in (1, 2, 3, 4)
+            ]
+            if len(navigation_candidates_all) >= 2:
+                best_navigation_score = min(
+                    float(
+                        selection_score_by_candidate.get(
+                            entry.candidate.candidate_id,
+                            entry.total_efe,
+                        )
+                    )
+                    for entry in navigation_candidates_all
+                )
+                navigation_probe_candidates = [
+                    entry
+                    for entry in navigation_candidates_all
+                    if (
+                        float(
+                            selection_score_by_candidate.get(
+                                entry.candidate.candidate_id,
+                                entry.total_efe,
+                            )
+                        )
+                        - best_navigation_score
+                    )
+                    <= float(self.stagnation_probe_score_margin)
+                ]
+                if len(navigation_probe_candidates) < 2:
+                    navigation_probe_candidates = sorted(
+                        navigation_candidates_all,
+                        key=lambda entry: (
+                            float(
+                                selection_score_by_candidate.get(
+                                    entry.candidate.candidate_id,
+                                    entry.total_efe,
+                                )
+                            ),
+                            int(entry.candidate.action_id),
+                            str(entry.candidate.candidate_id),
+                        ),
+                    )[: min(3, len(navigation_candidates_all))]
+                if len(navigation_probe_candidates) >= 2:
+                    navigation_probe_candidates.sort(
+                        key=lambda entry: (
+                            int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                            int(
+                                self._candidate_transition_stats(entry.candidate).get(
+                                    "state_action_visit_count",
+                                    0,
+                                )
+                            ),
+                            int(
+                                self._candidate_transition_stats(entry.candidate).get(
+                                    "state_visit_count",
+                                    0,
+                                )
+                            ),
+                            int(
+                                self._candidate_transition_stats(entry.candidate).get(
+                                    "state_outgoing_edge_count",
+                                    0,
+                                )
+                            ),
+                            float(
+                                self._predicted_probability_mass(
+                                    entry,
+                                    signature_filter="|delta=blocked",
+                                )
+                            ),
+                            float(
+                                self._predicted_probability_mass(
+                                    entry,
+                                    signature_filter="type=NO_CHANGE|progress=0",
+                                )
+                            ),
+                            float(
+                                selection_score_by_candidate.get(
+                                    entry.candidate.candidate_id,
+                                    entry.total_efe,
+                                )
+                            ),
+                            int(entry.candidate.action_id),
+                            str(entry.candidate.candidate_id),
+                        )
+                    )
+                    selected_entry = navigation_probe_candidates[0]
+                    navigation_stagnation_probe_applied = True
+                    least_tried_probe_applied = True
+                    if selected_entry is not entries[0]:
+                        entries.remove(selected_entry)
+                        entries.insert(0, selected_entry)
+
         selected_action_usage_count = int(
             action_count_map.get(int(entries[0].candidate.action_id), 0)
         )
@@ -835,6 +1027,10 @@ class ActiveInferencePolicyEvaluatorV1:
         selected_transition_stats = self._candidate_transition_stats(entries[0].candidate)
         if early_probe_applied:
             tie_breaker_rule_applied = "early_probe_budget_least_tried"
+        elif navigation_stagnation_probe_applied:
+            tie_breaker_rule_applied = (
+                "navigation_stagnation_probe_least_tried(action_usage,state_action,state,edge,blocked,nochange,score)"
+            )
         elif action6_only_stagnation_probe_applied:
             tie_breaker_rule_applied = (
                 "action6_only_stagnation_probe_least_tried(state_action,state,edge,cluster,subcluster,candidate,score)"
@@ -884,6 +1080,12 @@ class ActiveInferencePolicyEvaluatorV1:
             "action6_stagnation_step_threshold": int(
                 self.action6_stagnation_step_threshold
             ),
+            "stagnation_streak": int(stagnation_streak),
+            "stagnation_probe_trigger_steps": int(self.stagnation_probe_trigger_steps),
+            "stagnation_probe_score_margin": float(self.stagnation_probe_score_margin),
+            "stagnation_probe_min_action_usage_gap": int(
+                self.stagnation_probe_min_action_usage_gap
+            ),
             "rollout_applied": bool(rollout_applied),
             "rollout_skip_reason": str(rollout_skip_reason),
             "rollout_max_candidates": int(self.rollout_max_candidates),
@@ -897,6 +1099,12 @@ class ActiveInferencePolicyEvaluatorV1:
             "action6_stagnated": bool(action6_stagnated),
             "action6_only_stagnation_probe_applied": bool(
                 action6_only_stagnation_probe_applied
+            ),
+            "navigation_actions_available": [int(v) for v in navigation_actions_available],
+            "navigation_usage_gap": int(navigation_usage_gap),
+            "navigation_stagnated": bool(navigation_stagnated),
+            "navigation_stagnation_probe_applied": bool(
+                navigation_stagnation_probe_applied
             ),
             "selected_action_usage_count_before": int(selected_action_usage_count),
             "selected_cluster_id": selected_cluster_id,
@@ -1124,6 +1332,52 @@ class ActiveInferencePolicyEvaluatorV1:
                     ),
                 }
                 for entry in action6_only_probe_candidates[:12]
+            ],
+            "navigation_probe_candidates": [
+                {
+                    "candidate_id": str(entry.candidate.candidate_id),
+                    "action_id": int(entry.candidate.action_id),
+                    "score": float(
+                        selection_score_by_candidate.get(
+                            entry.candidate.candidate_id,
+                            entry.total_efe,
+                        )
+                    ),
+                    "predicted_blocked_probability": float(
+                        self._predicted_probability_mass(
+                            entry,
+                            signature_filter="|delta=blocked",
+                        )
+                    ),
+                    "predicted_no_change_probability": float(
+                        self._predicted_probability_mass(
+                            entry,
+                            signature_filter="type=NO_CHANGE|progress=0",
+                        )
+                    ),
+                    "action_usage_count_before": int(
+                        action_count_map.get(int(entry.candidate.action_id), 0)
+                    ),
+                    "state_visit_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_visit_count",
+                            0,
+                        )
+                    ),
+                    "state_action_visit_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_action_visit_count",
+                            0,
+                        )
+                    ),
+                    "state_outgoing_edge_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_outgoing_edge_count",
+                            0,
+                        )
+                    ),
+                }
+                for entry in navigation_probe_candidates[:12]
             ],
             "early_probe_candidates": [
                 {
