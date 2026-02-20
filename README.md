@@ -109,6 +109,42 @@ export ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON='{
 }'
 ```
 
+## Team Run Profiles
+
+For this project, keep two standard run profiles so diagnostics are comparable:
+
+- Short debugging/analysis runs: around `300` actions per game.
+- Long stress/optimization runs: around `3000` actions per game.
+
+Example (single game):
+
+```bash
+ACTIVE_INFERENCE_MAX_ACTIONS=300 uv run main.py --agent=activeinferenceefe --game=ls20 --tags=profile,debug300
+ACTIVE_INFERENCE_MAX_ACTIONS=3000 uv run main.py --agent=activeinferenceefe --game=ls20 --tags=profile,long3000
+```
+
+### 2080 / 2080-out3TS Batch Example
+
+On remote machines (`2080` and `2080-out3TS`), run from:
+
+```bash
+cd /home/zdx/github/VSAHDC/ARC-AGI-3-Agents
+```
+
+Use repeated exploration with `500` actions per game:
+
+```bash
+for game in ls20 ft09 vc33; do
+  for run in 1 2 3 4 5; do
+    ACTIVE_INFERENCE_MAX_ACTIONS=500 \
+    uv run main.py \
+      --agent=activeinferenceefe \
+      --game="$game" \
+      --tags=remote2080,repeat500,run${run}
+  done
+done
+```
+
 ## Changelog
 ## [0.9.3] - 2026-01-29
 **Note: This will be a breaking change is you use the fields outline below**
