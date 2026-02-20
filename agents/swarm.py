@@ -75,16 +75,31 @@ class Swarm:
         # create all the agents
         for i in range(len(self.GAMES)):
             g = self.GAMES[i % len(self.GAMES)]
+            arc_env = self._arc.make(g, scorecard_id=self.card_id)
+            if arc_env is None:
+                logger.error(
+                    "Skipping game '%s': failed to initialize environment. "
+                    "Check OPERATION_MODE/ENVIRONMENTS_DIR or API connectivity.",
+                    g,
+                )
+                continue
             a = self.agent_class(
                 card_id=self.card_id,
                 game_id=g,
                 agent_name=self.agent_name,
                 ROOT_URL=self.ROOT_URL,
                 record=True,
-                arc_env=self._arc.make(g, scorecard_id=self.card_id),
+                arc_env=arc_env,
                 tags=self.tags,
             )
             self.agents.append(a)
+
+        if not self.agents:
+            logger.error("No playable environments were initialized.")
+            card_id = self.card_id
+            scorecard = self.close_scorecard(card_id)
+            self.cleanup(scorecard)
+            return scorecard
 
         # create all the threads
         for a in self.agents:

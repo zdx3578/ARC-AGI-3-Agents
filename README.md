@@ -123,6 +123,26 @@ ACTIVE_INFERENCE_MAX_ACTIONS=300 uv run main.py --agent=activeinferenceefe --gam
 ACTIVE_INFERENCE_MAX_ACTIONS=3000 uv run main.py --agent=activeinferenceefe --game=ls20 --tags=profile,long3000
 ```
 
+### Offline / API-502 Fallback
+
+If `https://three.arcprize.org/api/games` is unavailable (for example `502`), you can still run
+with explicit `--game` ids. The runner no longer hard-fails on game-list fetch.
+
+```bash
+uv run main.py --agent=random --game=ls20
+```
+
+To force local-only execution (no online API calls), use:
+
+```bash
+OPERATION_MODE=offline ENVIRONMENTS_DIR=environment_files \
+uv run main.py --agent=random --game=ls20
+```
+
+Notes:
+- `OPERATION_MODE=offline` requires local environments in `ENVIRONMENTS_DIR`.
+- If a game is not present locally, the run now exits cleanly with a clear "No playable environments" error.
+
 ### 2080 / 2080-out3TS Batch Example
 
 On remote machines (`2080` and `2080-out3TS`), run from:

@@ -1,5 +1,23 @@
 # ruff: noqa: E402
+import os
+
 from dotenv import load_dotenv
+
+# Preserve explicit runtime environment overrides (e.g. OPERATION_MODE=offline uv run ...)
+# before loading dotenv files.
+_RUNTIME_ENV_OVERRIDES = {
+    key: os.environ[key]
+    for key in (
+        "ARC_API_KEY",
+        "ARC_BASE_URL",
+        "OPERATION_MODE",
+        "ENVIRONMENTS_DIR",
+        "RECORDINGS_DIR",
+        "ONLINE_ONLY",
+        "OFFLINE_ONLY",
+    )
+    if key in os.environ
+}
 
 load_dotenv(dotenv_path=".env.example")
 load_dotenv(dotenv_path=".env", override=True)
@@ -7,7 +25,6 @@ load_dotenv(dotenv_path=".env", override=True)
 import argparse
 import json
 import logging
-import os
 import signal
 import sys
 import threading
@@ -18,6 +35,9 @@ from typing import Optional
 from arc_agi import Arcade
 from agents import AVAILABLE_AGENTS, Swarm
 from agents.tracing import initialize as init_agentops
+
+# Re-apply runtime overrides after imports so explicit shell vars keep highest precedence.
+os.environ.update(_RUNTIME_ENV_OVERRIDES)
 
 logger = logging.getLogger()
 
