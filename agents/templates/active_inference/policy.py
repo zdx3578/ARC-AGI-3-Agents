@@ -32,6 +32,10 @@ class ActiveInferencePolicyEvaluatorV1:
         action6_bucket_probe_min_attempts: int = 3,
         action6_subcluster_probe_min_attempts: int = 2,
         action6_probe_score_margin: float = 0.06,
+        action6_explore_probe_score_margin: float = 0.12,
+        action6_stagnation_step_threshold: int = 12,
+        rollout_max_candidates: int = 8,
+        rollout_only_in_exploit: bool = True,
     ) -> None:
         self.explore_steps = int(max(1, explore_steps))
         self.exploit_entropy_threshold = float(max(0.0, exploit_entropy_threshold))
@@ -48,6 +52,14 @@ class ActiveInferencePolicyEvaluatorV1:
             max(1, action6_subcluster_probe_min_attempts)
         )
         self.action6_probe_score_margin = float(max(0.0, action6_probe_score_margin))
+        self.action6_explore_probe_score_margin = float(
+            max(0.0, action6_explore_probe_score_margin)
+        )
+        self.action6_stagnation_step_threshold = int(
+            max(1, action6_stagnation_step_threshold)
+        )
+        self.rollout_max_candidates = int(max(1, rollout_max_candidates))
+        self.rollout_only_in_exploit = bool(rollout_only_in_exploit)
 
     def _candidate_cluster_id(self, candidate: ActionCandidateV1) -> str:
         metadata_cluster = str(candidate.metadata.get("candidate_cluster_id", "")).strip()
@@ -177,16 +189,15 @@ class ActiveInferencePolicyEvaluatorV1:
                 predictive_distribution,
                 preference_distribution,
             )
-            ambiguity = hypothesis_bank.expected_ambiguity(
-                packet,
-                candidate,
-                representation,
+            ambiguity = hypothesis_bank.expected_ambiguity_from_stats(
+                stats,
             )
 
-            ig_split = hypothesis_bank.split_information_gain(
+            ig_split = hypothesis_bank.split_information_gain_from_stats(
                 packet,
                 candidate,
                 representation,
+                stats,
             )
             ig_action_semantics = float(ig_split.get("action_semantics", 0.0))
             ig_mechanism_dynamics = float(ig_split.get("mechanism_dynamics", 0.0))
@@ -329,6 +340,7 @@ class ActiveInferencePolicyEvaluatorV1:
         cluster_select_count: dict[str, int] | None = None,
         subcluster_select_count: dict[str, int] | None = None,
         early_probe_budget_remaining: int = 0,
+        no_change_streak: int = 0,
     ) -> tuple[ActionCandidateV1, list[FreeEnergyLedgerEntryV1]]:
         entries = self.evaluate_candidates(
             packet=packet,
@@ -346,10 +358,25 @@ class ActiveInferencePolicyEvaluatorV1:
             return fallback, []
 
         selection_metric = "total_efe"
+        rollout_applied = False
+        rollout_skip_reason = "disabled"
         selection_score_by_candidate: dict[str, float] = {
             entry.candidate.candidate_id: float(entry.total_efe) for entry in entries
         }
-        if int(remaining_budget) >= 2:
+        rollout_eligible = True
+        if int(remaining_budget) < 2:
+            rollout_eligible = False
+            rollout_skip_reason = "remaining_budget_lt_2"
+        elif int(self.rollout_horizon) < 2:
+            rollout_eligible = False
+            rollout_skip_reason = "rollout_horizon_lt_2"
+        elif self.rollout_only_in_exploit and str(phase) != "exploit":
+            rollout_eligible = False
+            rollout_skip_reason = "phase_not_exploit"
+        elif len(entries) > int(self.rollout_max_candidates):
+            rollout_eligible = False
+            rollout_skip_reason = "candidate_count_exceeds_limit"
+        if rollout_eligible:
             rollout_scores = self._rollout_score_by_candidate(
                 packet=packet,
                 representation=representation,
@@ -359,6 +386,8 @@ class ActiveInferencePolicyEvaluatorV1:
                 entries=entries,
             )
             selection_metric = "rollout_total_efe"
+            rollout_applied = True
+            rollout_skip_reason = ""
             selection_score_by_candidate = {
                 entry.candidate.candidate_id: float(
                     rollout_scores.get(entry.candidate.candidate_id, entry.total_efe)
@@ -672,6 +701,115 @@ class ActiveInferencePolicyEvaluatorV1:
                     entries.remove(selected_entry)
                     entries.insert(0, selected_entry)
 
+        action6_only_stagnation_probe_applied = False
+        action6_only_probe_candidates: list[FreeEnergyLedgerEntryV1] = []
+        available_action_set = {int(v) for v in packet.available_actions}
+        action6_only_space = bool(available_action_set) and available_action_set == {6}
+        action6_stagnated = bool(
+            int(packet.levels_completed) <= 0
+            and (
+                int(no_change_streak) >= 2
+                or int(packet.action_counter) >= int(self.action6_stagnation_step_threshold)
+            )
+        )
+        if (
+            not early_probe_applied
+            and not least_tried_probe_applied
+            and action6_only_space
+            and action6_stagnated
+            and int(early_probe_budget_remaining) <= 0
+            and len(entries) > 1
+        ):
+            best_entry = entries[0]
+            best_entry_score = float(
+                selection_score_by_candidate.get(
+                    best_entry.candidate.candidate_id,
+                    best_entry.total_efe,
+                )
+            )
+            probe_margin = max(
+                float(self.action6_probe_score_margin),
+                float(self.action6_explore_probe_score_margin),
+            )
+            action6_only_probe_candidates = [
+                entry
+                for entry in entries
+                if int(entry.candidate.action_id) == 6
+                and (
+                    float(
+                        selection_score_by_candidate.get(
+                            entry.candidate.candidate_id,
+                            entry.total_efe,
+                        )
+                    )
+                    - best_entry_score
+                )
+                <= probe_margin
+            ]
+            need_probe = any(
+                self._action6_bucket_probe_needed(entry.candidate)
+                for entry in action6_only_probe_candidates
+            )
+            if len(action6_only_probe_candidates) > 1 and need_probe:
+                action6_only_probe_candidates.sort(
+                    key=lambda entry: (
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_action_visit_count",
+                                0,
+                            )
+                        ),
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_visit_count",
+                                0,
+                            )
+                        ),
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_outgoing_edge_count",
+                                0,
+                            )
+                        ),
+                        int(
+                            cluster_count_map.get(
+                                str(
+                                    cluster_id_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        self._candidate_cluster_id(entry.candidate),
+                                    )
+                                ),
+                                0,
+                            )
+                        ),
+                        int(
+                            subcluster_count_map.get(
+                                str(
+                                    subcluster_id_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        self._candidate_subcluster_id(entry.candidate),
+                                    )
+                                ),
+                                0,
+                            )
+                        ),
+                        int(candidate_count_map.get(str(entry.candidate.candidate_id), 0)),
+                        float(
+                            selection_score_by_candidate.get(
+                                entry.candidate.candidate_id,
+                                entry.total_efe,
+                            )
+                        ),
+                        str(entry.candidate.candidate_id),
+                    )
+                )
+                selected_entry = action6_only_probe_candidates[0]
+                action6_only_stagnation_probe_applied = True
+                least_tried_probe_applied = True
+                if selected_entry is not entries[0]:
+                    entries.remove(selected_entry)
+                    entries.insert(0, selected_entry)
+
         selected_action_usage_count = int(
             action_count_map.get(int(entries[0].candidate.action_id), 0)
         )
@@ -697,6 +835,10 @@ class ActiveInferencePolicyEvaluatorV1:
         selected_transition_stats = self._candidate_transition_stats(entries[0].candidate)
         if early_probe_applied:
             tie_breaker_rule_applied = "early_probe_budget_least_tried"
+        elif action6_only_stagnation_probe_applied:
+            tie_breaker_rule_applied = (
+                "action6_only_stagnation_probe_least_tried(state_action,state,edge,cluster,subcluster,candidate,score)"
+            )
         elif tie_group_size > 1:
             if least_tried_probe_applied:
                 if exploit_action6_bucket_probe_applied:
@@ -736,11 +878,26 @@ class ActiveInferencePolicyEvaluatorV1:
             ),
             "near_tie_probe_applied": bool(near_tie_probe_applied),
             "action6_probe_score_margin": float(self.action6_probe_score_margin),
+            "action6_explore_probe_score_margin": float(
+                self.action6_explore_probe_score_margin
+            ),
+            "action6_stagnation_step_threshold": int(
+                self.action6_stagnation_step_threshold
+            ),
+            "rollout_applied": bool(rollout_applied),
+            "rollout_skip_reason": str(rollout_skip_reason),
+            "rollout_max_candidates": int(self.rollout_max_candidates),
+            "rollout_only_in_exploit": bool(self.rollout_only_in_exploit),
             "early_probe_budget_remaining": int(max(0, int(early_probe_budget_remaining))),
             "early_probe_applied": bool(early_probe_applied),
             "early_probe_target_action_ids": [int(v) for v in early_probe_target_action_ids],
             "early_probe_min_action_usage": int(early_probe_min_action_usage),
             "early_probe_candidate_pool_size": int(len(early_probe_candidate_pool)),
+            "action6_only_space": bool(action6_only_space),
+            "action6_stagnated": bool(action6_stagnated),
+            "action6_only_stagnation_probe_applied": bool(
+                action6_only_stagnation_probe_applied
+            ),
             "selected_action_usage_count_before": int(selected_action_usage_count),
             "selected_cluster_id": selected_cluster_id,
             "selected_cluster_usage_count_before": int(selected_cluster_usage_count),
@@ -896,6 +1053,77 @@ class ActiveInferencePolicyEvaluatorV1:
                     ),
                 }
                 for entry in near_tie_probe_candidates[:12]
+            ],
+            "action6_only_probe_candidates": [
+                {
+                    "candidate_id": str(entry.candidate.candidate_id),
+                    "action_id": int(entry.candidate.action_id),
+                    "cluster_id": str(
+                        cluster_id_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            self._candidate_cluster_id(entry.candidate),
+                        )
+                    ),
+                    "subcluster_id": str(
+                        subcluster_id_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            self._candidate_subcluster_id(entry.candidate),
+                        )
+                    ),
+                    "score": float(
+                        selection_score_by_candidate.get(
+                            entry.candidate.candidate_id,
+                            entry.total_efe,
+                        )
+                    ),
+                    "action_usage_count_before": int(
+                        action_count_map.get(int(entry.candidate.action_id), 0)
+                    ),
+                    "cluster_usage_count_before": int(
+                        cluster_count_map.get(
+                            str(
+                                cluster_id_by_candidate_id.get(
+                                    str(entry.candidate.candidate_id),
+                                    self._candidate_cluster_id(entry.candidate),
+                                )
+                            ),
+                            0,
+                        )
+                    ),
+                    "subcluster_usage_count_before": int(
+                        subcluster_count_map.get(
+                            str(
+                                subcluster_id_by_candidate_id.get(
+                                    str(entry.candidate.candidate_id),
+                                    self._candidate_subcluster_id(entry.candidate),
+                                )
+                            ),
+                            0,
+                        )
+                    ),
+                    "candidate_usage_count_before": int(
+                        candidate_count_map.get(str(entry.candidate.candidate_id), 0)
+                    ),
+                    "state_visit_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_visit_count",
+                            0,
+                        )
+                    ),
+                    "state_action_visit_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_action_visit_count",
+                            0,
+                        )
+                    ),
+                    "state_outgoing_edge_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_outgoing_edge_count",
+                            0,
+                        )
+                    ),
+                }
+                for entry in action6_only_probe_candidates[:12]
             ],
             "early_probe_candidates": [
                 {

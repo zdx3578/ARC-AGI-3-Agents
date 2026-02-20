@@ -1525,6 +1525,18 @@ class ActiveInferenceHypothesisBankV1:
             representation,
             posterior=posterior_used,
         )
+        return self.expected_ambiguity_from_stats(
+            stats,
+            posterior=posterior_used,
+        )
+
+    def expected_ambiguity_from_stats(
+        self,
+        stats: dict[str, Any],
+        *,
+        posterior: dict[str, float] | None = None,
+    ) -> float:
+        posterior_used = posterior or self.posterior_by_hypothesis_id
         per_h = stats["per_hypothesis_distribution"]
         ambiguity = 0.0
         for hypothesis_id, distribution in per_h.items():
@@ -1730,7 +1742,37 @@ class ActiveInferenceHypothesisBankV1:
             representation,
             posterior=posterior_used,
         )
+        return self.split_information_gain_from_stats(
+            packet,
+            candidate,
+            representation,
+            stats,
+            posterior=posterior_used,
+        )
+
+    def split_information_gain_from_stats(
+        self,
+        packet: ObservationPacketV1,
+        candidate: ActionCandidateV1,
+        representation: RepresentationStateV1,
+        stats: dict[str, Any],
+        *,
+        posterior: dict[str, float] | None = None,
+    ) -> dict[str, float]:
+        posterior_used = posterior or self.posterior_by_hypothesis_id
         predictive_distribution = stats["predictive_distribution"]
+        posterior_after_by_signature: dict[str, dict[str, float]] = {}
+        for signature_key, probability in predictive_distribution.items():
+            p = float(probability)
+            if p <= 0.0:
+                continue
+            posterior_after_by_signature[signature_key] = self.posterior_after_signature(
+                packet,
+                candidate,
+                representation,
+                signature_key,
+                posterior=posterior_used,
+            )
 
         out: dict[str, float] = {}
         for partition_key in (
@@ -1747,13 +1789,9 @@ class ActiveInferenceHypothesisBankV1:
                 p = float(probability)
                 if p <= 0.0:
                     continue
-                posterior_after = self.posterior_after_signature(
-                    packet,
-                    candidate,
-                    representation,
-                    signature_key,
-                    posterior=posterior_used,
-                )
+                posterior_after = posterior_after_by_signature.get(signature_key)
+                if posterior_after is None:
+                    continue
                 expected_posterior_entropy += p * self.partition_entropy(
                     partition_key,
                     posterior=posterior_after,

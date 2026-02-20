@@ -157,6 +157,14 @@ class ActiveInferenceEFE(Agent):
             0.0,
             min(1.0, _env_float("ACTIVE_INFERENCE_ROLLOUT_DISCOUNT", 0.55)),
         )
+        self.rollout_max_candidates = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_ROLLOUT_MAX_CANDIDATES", 8),
+        )
+        self.rollout_only_in_exploit = _env_bool(
+            "ACTIVE_INFERENCE_ROLLOUT_ONLY_IN_EXPLOIT",
+            True,
+        )
         self.early_probe_budget = max(
             0,
             _env_int("ACTIVE_INFERENCE_EARLY_PROBE_BUDGET", 8),
@@ -172,6 +180,14 @@ class ActiveInferenceEFE(Agent):
         self.action6_probe_score_margin = max(
             0.0,
             _env_float("ACTIVE_INFERENCE_ACTION6_PROBE_SCORE_MARGIN", 0.06),
+        )
+        self.action6_explore_probe_score_margin = max(
+            0.0,
+            _env_float("ACTIVE_INFERENCE_ACTION6_EXPLORE_PROBE_SCORE_MARGIN", 0.12),
+        )
+        self.action6_stagnation_step_threshold = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_ACTION6_STAGNATION_STEP_THRESHOLD", 12),
         )
         self.no_change_stop_loss_steps = max(
             1,
@@ -202,11 +218,15 @@ class ActiveInferenceEFE(Agent):
             top_k_reasoning=self.top_k_reasoning,
             rollout_horizon=self.rollout_horizon,
             rollout_discount=self.rollout_discount,
+            rollout_max_candidates=self.rollout_max_candidates,
+            rollout_only_in_exploit=self.rollout_only_in_exploit,
             ignore_action_cost=True,
             weight_overrides=weight_overrides,
             action6_bucket_probe_min_attempts=self.action6_bucket_probe_min_attempts,
             action6_subcluster_probe_min_attempts=self.action6_subcluster_probe_min_attempts,
             action6_probe_score_margin=self.action6_probe_score_margin,
+            action6_explore_probe_score_margin=self.action6_explore_probe_score_margin,
+            action6_stagnation_step_threshold=self.action6_stagnation_step_threshold,
         )
         self.hypothesis_bank = ActiveInferenceHypothesisBankV1()
 
@@ -1619,6 +1639,7 @@ class ActiveInferenceEFE(Agent):
                             cluster_select_count=self._cluster_select_count,
                             subcluster_select_count=self._subcluster_select_count,
                             early_probe_budget_remaining=early_probe_budget_remaining,
+                            no_change_streak=self._no_change_streak,
                         )
                         if ranked_entries:
                             selection_diagnostics = dict(
