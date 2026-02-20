@@ -39,6 +39,23 @@ class ActiveInferencePolicyEvaluatorV1:
         self.ignore_action_cost = bool(ignore_action_cost)
         self.weight_overrides = weight_overrides or {}
 
+    def _candidate_cluster_id(self, candidate: ActionCandidateV1) -> str:
+        metadata_cluster = str(candidate.metadata.get("candidate_cluster_id", "")).strip()
+        if metadata_cluster:
+            return metadata_cluster
+        action_id = int(candidate.action_id)
+        if action_id != 6:
+            return f"a{action_id}"
+        feature = candidate.metadata.get("coordinate_context_feature", {})
+        if isinstance(feature, dict):
+            bucket_v2 = str(feature.get("click_context_bucket_v2", "")).strip()
+            if bucket_v2:
+                return f"a6|{bucket_v2}"
+            bucket_v1 = str(feature.get("click_context_bucket", "")).strip()
+            if bucket_v1:
+                return f"a6|{bucket_v1}"
+        return "a6|na"
+
     def _weights_for_phase(self, phase: str) -> dict[str, float]:
         defaults = weights_for_phase_v1(phase)
         out = {
@@ -261,6 +278,7 @@ class ActiveInferencePolicyEvaluatorV1:
         remaining_budget: int,
         action_select_count: dict[int, int] | None = None,
         candidate_select_count: dict[str, int] | None = None,
+        cluster_select_count: dict[str, int] | None = None,
         early_probe_budget_remaining: int = 0,
     ) -> tuple[ActionCandidateV1, list[FreeEnergyLedgerEntryV1]]:
         entries = self.evaluate_candidates(
@@ -309,6 +327,11 @@ class ActiveInferencePolicyEvaluatorV1:
 
         action_count_map = action_select_count or {}
         candidate_count_map = candidate_select_count or {}
+        cluster_count_map = cluster_select_count or {}
+        cluster_id_by_candidate_id: dict[str, str] = {
+            str(entry.candidate.candidate_id): self._candidate_cluster_id(entry.candidate)
+            for entry in entries
+        }
         best_score = float(
             selection_score_by_candidate.get(
                 entries[0].candidate.candidate_id,
@@ -385,6 +408,17 @@ class ActiveInferencePolicyEvaluatorV1:
                                 )
                             ),
                             int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                            int(
+                                cluster_count_map.get(
+                                    str(
+                                        cluster_id_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            self._candidate_cluster_id(entry.candidate),
+                                        )
+                                    ),
+                                    0,
+                                )
+                            ),
                             int(candidate_count_map.get(str(entry.candidate.candidate_id), 0)),
                             int(entry.candidate.action_id),
                             str(entry.candidate.candidate_id),
@@ -403,6 +437,17 @@ class ActiveInferencePolicyEvaluatorV1:
                 tie_probe_candidates.sort(
                     key=lambda entry: (
                         int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                        int(
+                            cluster_count_map.get(
+                                str(
+                                    cluster_id_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        self._candidate_cluster_id(entry.candidate),
+                                    )
+                                ),
+                                0,
+                            )
+                        ),
                         int(candidate_count_map.get(str(entry.candidate.candidate_id), 0)),
                         int(entry.candidate.action_id),
                         str(entry.candidate.candidate_id),
@@ -417,6 +462,13 @@ class ActiveInferencePolicyEvaluatorV1:
         selected_action_usage_count = int(
             action_count_map.get(int(entries[0].candidate.action_id), 0)
         )
+        selected_cluster_id = str(
+            cluster_id_by_candidate_id.get(
+                str(entries[0].candidate.candidate_id),
+                self._candidate_cluster_id(entries[0].candidate),
+            )
+        )
+        selected_cluster_usage_count = int(cluster_count_map.get(selected_cluster_id, 0))
         selected_candidate_usage_count = int(
             candidate_count_map.get(str(entries[0].candidate.candidate_id), 0)
         )
@@ -425,7 +477,7 @@ class ActiveInferencePolicyEvaluatorV1:
         elif tie_group_size > 1:
             if least_tried_probe_applied:
                 tie_breaker_rule_applied = (
-                    "least_tried_probe(action_usage,candidate_usage,action_id,candidate_id)"
+                    "least_tried_probe(action_usage,cluster_usage,candidate_usage,action_id,candidate_id)"
                 )
             else:
                 tie_breaker_rule_applied = "fixed_order(action_id,candidate_id)"
@@ -453,13 +505,32 @@ class ActiveInferencePolicyEvaluatorV1:
             "early_probe_min_action_usage": int(early_probe_min_action_usage),
             "early_probe_candidate_pool_size": int(len(early_probe_candidate_pool)),
             "selected_action_usage_count_before": int(selected_action_usage_count),
+            "selected_cluster_id": selected_cluster_id,
+            "selected_cluster_usage_count_before": int(selected_cluster_usage_count),
             "selected_candidate_usage_count_before": int(selected_candidate_usage_count),
             "tie_probe_candidates": [
                 {
                     "candidate_id": str(entry.candidate.candidate_id),
                     "action_id": int(entry.candidate.action_id),
+                    "cluster_id": str(
+                        cluster_id_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            self._candidate_cluster_id(entry.candidate),
+                        )
+                    ),
                     "action_usage_count_before": int(
                         action_count_map.get(int(entry.candidate.action_id), 0)
+                    ),
+                    "cluster_usage_count_before": int(
+                        cluster_count_map.get(
+                            str(
+                                cluster_id_by_candidate_id.get(
+                                    str(entry.candidate.candidate_id),
+                                    self._candidate_cluster_id(entry.candidate),
+                                )
+                            ),
+                            0,
+                        )
                     ),
                     "candidate_usage_count_before": int(
                         candidate_count_map.get(
@@ -474,6 +545,12 @@ class ActiveInferencePolicyEvaluatorV1:
                 {
                     "candidate_id": str(entry.candidate.candidate_id),
                     "action_id": int(entry.candidate.action_id),
+                    "cluster_id": str(
+                        cluster_id_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            self._candidate_cluster_id(entry.candidate),
+                        )
+                    ),
                     "score": float(
                         selection_score_by_candidate.get(
                             entry.candidate.candidate_id,
@@ -482,6 +559,17 @@ class ActiveInferencePolicyEvaluatorV1:
                     ),
                     "action_usage_count_before": int(
                         action_count_map.get(int(entry.candidate.action_id), 0)
+                    ),
+                    "cluster_usage_count_before": int(
+                        cluster_count_map.get(
+                            str(
+                                cluster_id_by_candidate_id.get(
+                                    str(entry.candidate.candidate_id),
+                                    self._candidate_cluster_id(entry.candidate),
+                                )
+                            ),
+                            0,
+                        )
                     ),
                 }
                 for entry in early_probe_candidate_pool[:8]

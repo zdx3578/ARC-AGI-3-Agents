@@ -130,6 +130,7 @@ class RepresentationStateV1:
     summary: dict[str, Any]
     component_views: dict[str, list[ComponentNodeV1]] = field(default_factory=dict)
     hierarchy_links: list[dict[str, Any]] = field(default_factory=list)
+    runtime_cache: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {

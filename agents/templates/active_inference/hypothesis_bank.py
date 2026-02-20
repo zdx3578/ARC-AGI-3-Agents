@@ -225,6 +225,8 @@ def _delta_bucket_from_vector(dx: int, dy: int) -> str:
 def _click_context_bucket_from_feature(feature: dict[str, Any]) -> str:
     if not isinstance(feature, dict):
         return "na"
+    if str(feature.get("click_context_bucket_v2", "")).strip():
+        return str(feature.get("click_context_bucket_v2"))
     hit = int(feature.get("hit_object", -1))
     boundary = int(feature.get("on_boundary", -1))
     dist_bucket = str(feature.get("distance_to_nearest_object_bucket", "na"))

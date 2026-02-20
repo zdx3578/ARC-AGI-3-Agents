@@ -205,6 +205,7 @@ class ActiveInferenceEFE(Agent):
         self._latest_navigation_state_estimate: dict[str, Any] = {}
         self._action_select_count: dict[int, int] = {}
         self._candidate_select_count: dict[str, int] = {}
+        self._cluster_select_count: dict[str, int] = {}
         self._navigation_attempt_count = 0
         self._navigation_blocked_count = 0
         self._navigation_moved_count = 0
@@ -411,6 +412,8 @@ class ActiveInferenceEFE(Agent):
         feature = candidate.metadata.get("coordinate_context_feature", {})
         if not isinstance(feature, dict):
             return "na"
+        if str(feature.get("click_context_bucket_v2", "")).strip():
+            return str(feature.get("click_context_bucket_v2"))
         hit = int(feature.get("hit_object", -1))
         boundary = int(feature.get("on_boundary", -1))
         dist_bucket = str(feature.get("distance_to_nearest_object_bucket", "na"))
@@ -419,6 +422,14 @@ class ActiveInferenceEFE(Agent):
         return (
             f"hit={hit}|boundary={boundary}|dist={dist_bucket}|region={coarse_x}:{coarse_y}"
         )
+
+    def _candidate_cluster_id(self, candidate: ActionCandidateV1 | None) -> str:
+        if candidate is None:
+            return "na"
+        action_id = int(candidate.action_id)
+        if action_id != 6:
+            return f"a{action_id}"
+        return f"a6|{self._click_context_bucket_from_candidate(candidate)}"
 
     def _update_operability_stats_v1(
         self,
@@ -1025,6 +1036,9 @@ class ActiveInferenceEFE(Agent):
                             candidate.metadata["control_schema_observed_posterior"] = dict(
                                 control_schema.get(action_key, {})
                             )
+                            candidate.metadata["candidate_cluster_id"] = self._candidate_cluster_id(
+                                candidate
+                            )
                             if int(candidate.action_id) == 6:
                                 click_bucket = self._click_context_bucket_from_candidate(candidate)
                                 candidate.metadata["click_bucket_observed_stats"] = dict(
@@ -1056,6 +1070,7 @@ class ActiveInferenceEFE(Agent):
                             remaining_budget=remaining_budget,
                             action_select_count=self._action_select_count,
                             candidate_select_count=self._candidate_select_count,
+                            cluster_select_count=self._cluster_select_count,
                             early_probe_budget_remaining=early_probe_budget_remaining,
                         )
                         if ranked_entries:
@@ -1204,11 +1219,15 @@ class ActiveInferenceEFE(Agent):
 
         selected_action_id = int(selected_candidate.action_id)
         selected_candidate_id = str(selected_candidate.candidate_id)
+        selected_cluster_id = self._candidate_cluster_id(selected_candidate)
         self._action_select_count[selected_action_id] = (
             int(self._action_select_count.get(selected_action_id, 0)) + 1
         )
         self._candidate_select_count[selected_candidate_id] = (
             int(self._candidate_select_count.get(selected_candidate_id, 0)) + 1
+        )
+        self._cluster_select_count[selected_cluster_id] = (
+            int(self._cluster_select_count.get(selected_cluster_id, 0)) + 1
         )
 
         self._previous_packet = packet
@@ -1256,6 +1275,10 @@ class ActiveInferenceEFE(Agent):
                     "final_action_select_count": {
                         str(key): int(value)
                         for (key, value) in sorted(self._action_select_count.items())
+                    },
+                    "final_cluster_select_count": {
+                        str(key): int(value)
+                        for (key, value) in sorted(self._cluster_select_count.items())
                     },
                     "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                     "final_no_change_streak": int(self._no_change_streak),

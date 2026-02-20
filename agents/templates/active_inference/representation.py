@@ -11,8 +11,8 @@ from arcengine import FrameData
 from .contracts import (
     ActionCandidateV1,
     ComponentNodeV1,
-    ObservationPacketV1,
     ObjectNodeV1,
+    ObservationPacketV1,
     RepresentationStateV1,
 )
 
@@ -552,6 +552,310 @@ def _build_owner_map(
     return owner
 
 
+def _component_index_by_id(
+    components: list[_ComponentWithCells],
+) -> dict[str, _ComponentWithCells]:
+    return {str(comp.node.component_id): comp for comp in components}
+
+
+def _component_cell_sets(
+    components: list[_ComponentWithCells],
+) -> dict[str, set[tuple[int, int]]]:
+    return {
+        str(comp.node.component_id): set(comp.cells)
+        for comp in components
+    }
+
+
+def _touch_border_mask(
+    node: ComponentNodeV1,
+    frame_height: int,
+    frame_width: int,
+) -> str:
+    n = "1" if int(node.bbox_min_y) <= 0 else "0"
+    e = "1" if int(node.bbox_max_x) >= int(frame_width) - 1 else "0"
+    s = "1" if int(node.bbox_max_y) >= int(frame_height) - 1 else "0"
+    w = "1" if int(node.bbox_min_x) <= 0 else "0"
+    return f"N{n}E{e}S{s}W{w}"
+
+
+def _area_bucket(area: int) -> int:
+    return int(max(0, min(12, int(math.log2(max(1, int(area)))))))
+
+
+def _aspect_bucket(width: int, height: int) -> str:
+    w = max(1, int(width))
+    h = max(1, int(height))
+    ratio = float(w) / float(h)
+    if ratio >= 1.5:
+        return "W"
+    if ratio <= (1.0 / 1.5):
+        return "T"
+    return "S"
+
+
+def _palette_bucket(color_signature: list[int]) -> str:
+    count = int(len(color_signature))
+    if count <= 1:
+        return "1"
+    if count == 2:
+        return "2"
+    if count == 3:
+        return "3"
+    return "4p"
+
+
+def _hole_count_for_component(
+    component: _ComponentWithCells,
+) -> int:
+    node = component.node
+    min_x = int(node.bbox_min_x)
+    min_y = int(node.bbox_min_y)
+    max_x = int(node.bbox_max_x)
+    max_y = int(node.bbox_max_y)
+    width = int(max_x - min_x + 1)
+    height = int(max_y - min_y + 1)
+    if width <= 2 or height <= 2:
+        return 0
+
+    occupied = {
+        (int(cy) - min_y, int(cx) - min_x)
+        for (cy, cx) in component.cells
+    }
+    visited: set[tuple[int, int]] = set()
+    boundary_background: deque[tuple[int, int]] = deque()
+
+    def _enqueue_if_background(ly: int, lx: int) -> None:
+        if (ly, lx) in visited:
+            return
+        if (ly, lx) in occupied:
+            return
+        visited.add((ly, lx))
+        boundary_background.append((ly, lx))
+
+    for lx in range(width):
+        _enqueue_if_background(0, lx)
+        _enqueue_if_background(height - 1, lx)
+    for ly in range(height):
+        _enqueue_if_background(ly, 0)
+        _enqueue_if_background(ly, width - 1)
+
+    while boundary_background:
+        ly, lx = boundary_background.popleft()
+        for (ny, nx) in _neighbors(ly, lx, height, width, 4):
+            if (ny, nx) in visited:
+                continue
+            if (ny, nx) in occupied:
+                continue
+            visited.add((ny, nx))
+            boundary_background.append((ny, nx))
+
+    holes = 0
+    for ly in range(height):
+        for lx in range(width):
+            if (ly, lx) in occupied or (ly, lx) in visited:
+                continue
+            holes += 1
+            flood = deque([(ly, lx)])
+            visited.add((ly, lx))
+            while flood:
+                fy, fx = flood.popleft()
+                for (ny, nx) in _neighbors(fy, fx, height, width, 4):
+                    if (ny, nx) in visited or (ny, nx) in occupied:
+                        continue
+                    visited.add((ny, nx))
+                    flood.append((ny, nx))
+    return int(holes)
+
+
+def _hole_bucket(hole_count: int) -> str:
+    if int(hole_count) <= 0:
+        return "0"
+    if int(hole_count) == 1:
+        return "1"
+    if int(hole_count) == 2:
+        return "2"
+    return "3p"
+
+
+def _top_color_for_component(
+    component: _ComponentWithCells,
+    frame: list[list[int]],
+) -> int:
+    hist: dict[int, int] = {}
+    for (cy, cx) in component.cells:
+        if cy < 0 or cx < 0:
+            continue
+        if cy >= len(frame):
+            continue
+        row = frame[cy]
+        if cx >= len(row):
+            continue
+        color = int(row[cx])
+        hist[color] = int(hist.get(color, 0) + 1)
+    if not hist:
+        return int(component.node.color_signature[0]) if component.node.color_signature else -1
+    return int(
+        sorted(hist.items(), key=lambda item: (-int(item[1]), int(item[0])))[0][0]
+    )
+
+
+def _component_digest_bucket(
+    component: _ComponentWithCells,
+    *,
+    frame: list[list[int]],
+    frame_height: int,
+    frame_width: int,
+    hole_count: int,
+) -> str:
+    node = component.node
+    width = int(node.bbox_max_x) - int(node.bbox_min_x) + 1
+    height = int(node.bbox_max_y) - int(node.bbox_min_y) + 1
+    top_color = _top_color_for_component(component, frame)
+    return (
+        f"tc{int(top_color)}"
+        f"_ab{_area_bucket(int(node.area))}"
+        f"_asp{_aspect_bucket(width, height)}"
+        f"_pal{_palette_bucket(list(node.color_signature))}"
+        f"_h{_hole_bucket(int(hole_count))}"
+        f"_tb{_touch_border_mask(node, frame_height, frame_width)}"
+    )
+
+
+def _relative_pos_bucket(
+    x: int,
+    y: int,
+    node: ComponentNodeV1,
+) -> str:
+    width = max(1, int(node.bbox_max_x) - int(node.bbox_min_x) + 1)
+    height = max(1, int(node.bbox_max_y) - int(node.bbox_min_y) + 1)
+    u = float(int(x) - int(node.bbox_min_x) + 0.5) / float(width)
+    v = float(int(y) - int(node.bbox_min_y) + 0.5) / float(height)
+    x_bucket = "L" if u < (1.0 / 3.0) else ("R" if u >= (2.0 / 3.0) else "C")
+    y_bucket = "T" if v < (1.0 / 3.0) else ("B" if v >= (2.0 / 3.0) else "M")
+    return f"{x_bucket}{y_bucket}"
+
+
+def _dist_to_centroid_bucket(
+    x: int,
+    y: int,
+    node: ComponentNodeV1,
+) -> str:
+    dist = math.sqrt(
+        (float(int(x) - int(node.centroid_x)) ** 2)
+        + (float(int(y) - int(node.centroid_y)) ** 2)
+    )
+    norm = max(1.0, math.sqrt(float(max(1, int(node.area)))))
+    ratio = dist / norm
+    if ratio < 0.75:
+        return "0"
+    if ratio < 1.5:
+        return "1"
+    if ratio < 2.5:
+        return "2"
+    return "3p"
+
+
+def _direction_bucket(dx: int, dy: int) -> str:
+    if int(dx) == 0 and int(dy) == 0:
+        return "C"
+    sx = 0 if int(dx) == 0 else (1 if int(dx) > 0 else -1)
+    sy = 0 if int(dy) == 0 else (1 if int(dy) > 0 else -1)
+    mapping = {
+        (0, -1): "N",
+        (1, -1): "NE",
+        (1, 0): "E",
+        (1, 1): "SE",
+        (0, 1): "S",
+        (-1, 1): "SW",
+        (-1, 0): "W",
+        (-1, -1): "NW",
+    }
+    return mapping.get((sx, sy), "UNK")
+
+
+def _nearest_distance_bucket(dist: float) -> str:
+    if float(dist) < 2.5:
+        return "0"
+    if float(dist) < 6.0:
+        return "1"
+    if float(dist) < 12.0:
+        return "2"
+    return "3p"
+
+
+def _encode_click_context_bucket_v2(feature: dict[str, Any]) -> str:
+    return (
+        "cv2:"
+        f"reg={feature.get('coarse_region_x', 'NA')}_{feature.get('coarse_region_y', 'NA')}"
+        f"|hit={feature.get('hit_type', 'none')}"
+        f"|c={feature.get('hit_color', -1)}"
+        f"|od={feature.get('object_digest_bucket', 'NA')}"
+        f"|rp={feature.get('rel_pos_bucket', 'NA')}"
+        f"|ob={feature.get('on_object_boundary', 'NA')}"
+        f"|dc={feature.get('dist_to_centroid_bucket', 'NA')}"
+        f"|nod={feature.get('nearest_object_digest_bucket', 'NA')}"
+        f"|ndir={feature.get('nearest_object_direction_bucket', 'NA')}"
+        f"|nd={feature.get('nearest_object_distance_bucket', 'NA')}"
+    )
+
+
+def _build_runtime_cache_for_context(
+    *,
+    frame: list[list[int]],
+    same8_components: list[_ComponentWithCells],
+    mixed8_components: list[_ComponentWithCells],
+    frame_height: int,
+    frame_width: int,
+) -> dict[str, Any]:
+    same8_owner = _build_owner_map(same8_components)
+    mixed8_owner = _build_owner_map(mixed8_components)
+    same8_by_id = _component_index_by_id(same8_components)
+    mixed8_by_id = _component_index_by_id(mixed8_components)
+    same8_cell_sets = _component_cell_sets(same8_components)
+    mixed8_cell_sets = _component_cell_sets(mixed8_components)
+    same8_holes = {
+        str(comp.node.component_id): int(_hole_count_for_component(comp))
+        for comp in same8_components
+    }
+    mixed8_holes = {
+        str(comp.node.component_id): int(_hole_count_for_component(comp))
+        for comp in mixed8_components
+    }
+    same8_digest = {
+        str(comp.node.component_id): _component_digest_bucket(
+            comp,
+            frame=frame,
+            frame_height=frame_height,
+            frame_width=frame_width,
+            hole_count=int(same8_holes.get(str(comp.node.component_id), 0)),
+        )
+        for comp in same8_components
+    }
+    mixed8_digest = {
+        str(comp.node.component_id): _component_digest_bucket(
+            comp,
+            frame=frame,
+            frame_height=frame_height,
+            frame_width=frame_width,
+            hole_count=int(mixed8_holes.get(str(comp.node.component_id), 0)),
+        )
+        for comp in mixed8_components
+    }
+    return {
+        "same8_owner": same8_owner,
+        "mixed8_owner": mixed8_owner,
+        "same8_by_id": same8_by_id,
+        "mixed8_by_id": mixed8_by_id,
+        "same8_cell_sets": same8_cell_sets,
+        "mixed8_cell_sets": mixed8_cell_sets,
+        "same8_holes": same8_holes,
+        "mixed8_holes": mixed8_holes,
+        "same8_digest": same8_digest,
+        "mixed8_digest": mixed8_digest,
+    }
+
+
 def _build_hierarchy_links(
     same4: list[_ComponentWithCells],
     same8: list[_ComponentWithCells],
@@ -725,6 +1029,13 @@ def build_representation_state_v1(
     )
 
     hierarchy_links = _build_hierarchy_links(same4, same8, mixed8)
+    runtime_cache = _build_runtime_cache_for_context(
+        frame=frame,
+        same8_components=same8,
+        mixed8_components=mixed8,
+        frame_height=frame_height,
+        frame_width=frame_width,
+    )
 
     color_hist = Counter(int(obj.color) for obj in object_nodes)
     object_areas = sorted(int(obj.area) for obj in object_nodes)
@@ -737,6 +1048,7 @@ def build_representation_state_v1(
         frame_width,
         background_color,
         action6_points,
+        runtime_cache,
     )
 
     summary: dict[str, Any] = {
@@ -766,6 +1078,7 @@ def build_representation_state_v1(
         },
         "object_primary_view": "same_color_4" if int(connectivity) == 4 else "same_color_8",
         "hierarchy_link_count": int(len(hierarchy_links)),
+        "click_context_bucket_schema": "cv2",
     }
 
     return RepresentationStateV1(
@@ -784,6 +1097,7 @@ def build_representation_state_v1(
             "mixed_color_8": [comp.node for comp in mixed8],
         },
         hierarchy_links=hierarchy_links,
+        runtime_cache=runtime_cache,
     )
 
 
@@ -804,11 +1118,13 @@ def _coordinate_context_feature_from_geometry(
     background_color: int,
     x: int,
     y: int,
+    runtime_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    runtime = runtime_cache or {}
     in_bounds = 0 <= y < int(frame_height) and 0 <= x < int(frame_width)
     color_at_point = int(packet.frame[y][x]) if in_bounds else int(background_color)
-    hit_object = bool(in_bounds and color_at_point != int(background_color))
-    on_boundary = bool(
+    hit_object_by_color = bool(in_bounds and color_at_point != int(background_color))
+    on_frame_boundary = bool(
         in_bounds
         and (x == 0 or y == 0 or x == int(frame_width) - 1 or y == int(frame_height) - 1)
     )
@@ -820,14 +1136,125 @@ def _coordinate_context_feature_from_geometry(
     else:
         dist_bucket = "far"
 
-    return {
+    same8_owner = runtime.get("same8_owner", {})
+    mixed8_owner = runtime.get("mixed8_owner", {})
+    same8_by_id = runtime.get("same8_by_id", {})
+    mixed8_by_id = runtime.get("mixed8_by_id", {})
+    same8_cell_sets = runtime.get("same8_cell_sets", {})
+    mixed8_cell_sets = runtime.get("mixed8_cell_sets", {})
+    same8_digest = runtime.get("same8_digest", {})
+    mixed8_digest = runtime.get("mixed8_digest", {})
+
+    anchor_view = "none"
+    anchor_component_id = ""
+    if in_bounds and isinstance(same8_owner, dict):
+        anchor_component_id = str(same8_owner.get((int(y), int(x)), ""))
+    if anchor_component_id:
+        anchor_view = "same8"
+    elif in_bounds and isinstance(mixed8_owner, dict):
+        mixed_candidate = str(mixed8_owner.get((int(y), int(x)), ""))
+        if mixed_candidate:
+            anchor_component_id = mixed_candidate
+            anchor_view = "mixed8"
+
+    anchor_component: _ComponentWithCells | None = None
+    anchor_cells: set[tuple[int, int]] = set()
+    object_digest_bucket = "NA"
+    rel_pos_bucket = "NA"
+    on_object_boundary = "NA"
+    dist_to_centroid_bucket = "NA"
+    if anchor_view == "same8":
+        anchor_component = same8_by_id.get(anchor_component_id)
+        anchor_cells = same8_cell_sets.get(anchor_component_id, set())
+        object_digest_bucket = str(same8_digest.get(anchor_component_id, "NA"))
+    elif anchor_view == "mixed8":
+        anchor_component = mixed8_by_id.get(anchor_component_id)
+        anchor_cells = mixed8_cell_sets.get(anchor_component_id, set())
+        object_digest_bucket = str(mixed8_digest.get(anchor_component_id, "NA"))
+
+    if anchor_component is not None:
+        rel_pos_bucket = _relative_pos_bucket(int(x), int(y), anchor_component.node)
+        dist_to_centroid_bucket = _dist_to_centroid_bucket(
+            int(x),
+            int(y),
+            anchor_component.node,
+        )
+        if (int(y), int(x)) in anchor_cells:
+            boundary = False
+            for (ny, nx) in _neighbors(
+                int(y),
+                int(x),
+                int(frame_height),
+                int(frame_width),
+                4,
+            ):
+                if (int(ny), int(nx)) not in anchor_cells:
+                    boundary = True
+                    break
+            on_object_boundary = "1" if boundary else "0"
+        else:
+            on_object_boundary = "NA"
+
+    nearest_object_digest_bucket = "NA"
+    nearest_object_direction_bucket = "NA"
+    nearest_object_distance_bucket = "NA"
+    if anchor_component is None:
+        nearest_comp: _ComponentWithCells | None = None
+        nearest_dist = 10**9
+        for comp_dict in (same8_by_id, mixed8_by_id):
+            if not isinstance(comp_dict, dict):
+                continue
+            for comp in comp_dict.values():
+                if not isinstance(comp, _ComponentWithCells):
+                    continue
+                d = math.sqrt(
+                    (float(int(x) - int(comp.node.centroid_x)) ** 2)
+                    + (float(int(y) - int(comp.node.centroid_y)) ** 2)
+                )
+                if d < nearest_dist:
+                    nearest_dist = d
+                    nearest_comp = comp
+        if nearest_comp is not None:
+            comp_id = str(nearest_comp.node.component_id)
+            if comp_id in same8_digest:
+                nearest_object_digest_bucket = str(same8_digest.get(comp_id, "NA"))
+            elif comp_id in mixed8_digest:
+                nearest_object_digest_bucket = str(mixed8_digest.get(comp_id, "NA"))
+            dx = int(nearest_comp.node.centroid_x) - int(x)
+            dy = int(nearest_comp.node.centroid_y) - int(y)
+            nearest_object_direction_bucket = _direction_bucket(dx, dy)
+            nearest_object_distance_bucket = _nearest_distance_bucket(float(nearest_dist))
+
+    hit_object = bool(anchor_component is not None) or bool(hit_object_by_color)
+    hit_type = "none" if anchor_component is None else str(anchor_view)
+
+    feature = {
         "hit_object": int(hit_object),
+        "hit_type": str(hit_type),
+        "anchor_component_id": str(anchor_component_id) if anchor_component_id else "NA",
+        "anchor_view": str(anchor_view),
         "hit_color": int(color_at_point),
-        "on_boundary": int(on_boundary),
+        "on_boundary": int(on_frame_boundary),
+        "on_frame_boundary": int(on_frame_boundary),
+        "on_object_boundary": str(on_object_boundary),
+        "object_digest_bucket": str(object_digest_bucket),
+        "rel_pos_bucket": str(rel_pos_bucket),
+        "dist_to_centroid_bucket": str(dist_to_centroid_bucket),
         "distance_to_nearest_object_bucket": dist_bucket,
         "coarse_region_x": int(max(0, min(7, x // 8))),
         "coarse_region_y": int(max(0, min(7, y // 8))),
+        "nearest_object_digest_bucket": str(nearest_object_digest_bucket),
+        "nearest_object_direction_bucket": str(nearest_object_direction_bucket),
+        "nearest_object_distance_bucket": str(nearest_object_distance_bucket),
     }
+    feature["click_context_bucket"] = (
+        f"hit={int(feature.get('hit_object', -1))}"
+        f"|boundary={int(feature.get('on_boundary', -1))}"
+        f"|dist={str(feature.get('distance_to_nearest_object_bucket', 'na'))}"
+        f"|region={int(feature.get('coarse_region_x', -1))}:{int(feature.get('coarse_region_y', -1))}"
+    )
+    feature["click_context_bucket_v2"] = _encode_click_context_bucket_v2(feature)
+    return feature
 
 
 def _coordinate_context_feature(
@@ -844,6 +1271,7 @@ def _coordinate_context_feature(
         int(representation.background_color),
         int(x),
         int(y),
+        representation.runtime_cache,
     )
 
 
@@ -854,12 +1282,14 @@ def _action6_proposal_diagnostics(
     frame_width: int,
     background_color: int,
     proposals: list[tuple[int, int]],
+    runtime_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     proposal_count = int(len(proposals))
     if proposal_count <= 0:
         return {
             "proposal_count": 0,
             "unique_region_count": 0,
+            "unique_click_bucket_v2_count": 0,
             "region_coverage_ratio": 0.0,
             "redundancy_rate": 0.0,
             "hit_object_rate": 0.0,
@@ -870,6 +1300,7 @@ def _action6_proposal_diagnostics(
 
     coarse_regions: set[tuple[int, int]] = set()
     context_signatures: set[tuple[object, ...]] = set()
+    click_bucket_v2_set: set[str] = set()
     hit_object_count = 0
     on_boundary_count = 0
     distance_hist: dict[str, int] = {}
@@ -883,6 +1314,7 @@ def _action6_proposal_diagnostics(
             background_color,
             int(x),
             int(y),
+            runtime_cache,
         )
         cx = int(feature.get("coarse_region_x", -1))
         cy = int(feature.get("coarse_region_y", -1))
@@ -896,6 +1328,7 @@ def _action6_proposal_diagnostics(
             cy,
         )
         context_signatures.add(context_signature)
+        click_bucket_v2_set.add(str(feature.get("click_context_bucket_v2", "cv2:NA")))
         if int(feature.get("hit_object", 0)) == 1:
             hit_object_count += 1
         if int(feature.get("on_boundary", 0)) == 1:
@@ -908,6 +1341,7 @@ def _action6_proposal_diagnostics(
     return {
         "proposal_count": int(proposal_count),
         "unique_region_count": unique_region_count,
+        "unique_click_bucket_v2_count": int(len(click_bucket_v2_set)),
         "region_coverage_ratio": float(unique_region_count / 64.0),
         "redundancy_rate": float(redundant_region_points / float(max(1, proposal_count))),
         "hit_object_rate": float(hit_object_count / float(max(1, proposal_count))),
@@ -967,11 +1401,24 @@ def build_action_candidates_v1(
                     metadata={
                         "coordinate_context_feature": {
                             "hit_object": -1,
+                            "hit_type": "none",
+                            "anchor_component_id": "NA",
+                            "anchor_view": "none",
                             "hit_color": -1,
                             "on_boundary": -1,
+                            "on_frame_boundary": -1,
+                            "on_object_boundary": "NA",
+                            "object_digest_bucket": "NA",
+                            "rel_pos_bucket": "NA",
+                            "dist_to_centroid_bucket": "NA",
                             "distance_to_nearest_object_bucket": "na",
                             "coarse_region_x": -1,
                             "coarse_region_y": -1,
+                            "nearest_object_digest_bucket": "NA",
+                            "nearest_object_direction_bucket": "NA",
+                            "nearest_object_distance_bucket": "NA",
+                            "click_context_bucket": "hit=-1|boundary=-1|dist=na|region=-1:-1",
+                            "click_context_bucket_v2": "cv2:NA",
                         }
                     },
                 )
