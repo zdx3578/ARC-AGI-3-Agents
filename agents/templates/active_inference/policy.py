@@ -74,6 +74,19 @@ class ActiveInferencePolicyEvaluatorV1:
             return metadata_subcluster
         return self._candidate_cluster_id(candidate)
 
+    def _candidate_transition_stats(
+        self,
+        candidate: ActionCandidateV1,
+    ) -> dict[str, int]:
+        raw = candidate.metadata.get("transition_exploration_stats", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "state_visit_count": int(raw.get("state_visit_count", 0)),
+            "state_action_visit_count": int(raw.get("state_action_visit_count", 0)),
+            "state_outgoing_edge_count": int(raw.get("state_outgoing_edge_count", 0)),
+        }
+
     def _action6_bucket_probe_needed(self, candidate: ActionCandidateV1) -> bool:
         if int(candidate.action_id) != 6:
             return False
@@ -453,6 +466,24 @@ class ActiveInferencePolicyEvaluatorV1:
                                     entry.total_efe,
                                 )
                             ),
+                            int(
+                                self._candidate_transition_stats(entry.candidate).get(
+                                    "state_action_visit_count",
+                                    0,
+                                )
+                            ),
+                            int(
+                                self._candidate_transition_stats(entry.candidate).get(
+                                    "state_visit_count",
+                                    0,
+                                )
+                            ),
+                            int(
+                                self._candidate_transition_stats(entry.candidate).get(
+                                    "state_outgoing_edge_count",
+                                    0,
+                                )
+                            ),
                             int(action_count_map.get(int(entry.candidate.action_id), 0)),
                             int(
                                 cluster_count_map.get(
@@ -500,6 +531,24 @@ class ActiveInferencePolicyEvaluatorV1:
             if phase in ("explore", "explain") or exploit_action6_probe_needed:
                 tie_probe_candidates.sort(
                     key=lambda entry: (
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_action_visit_count",
+                                0,
+                            )
+                        ),
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_visit_count",
+                                0,
+                            )
+                        ),
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_outgoing_edge_count",
+                                0,
+                            )
+                        ),
                         int(action_count_map.get(int(entry.candidate.action_id), 0)),
                         int(
                             cluster_count_map.get(
@@ -564,6 +613,24 @@ class ActiveInferencePolicyEvaluatorV1:
             if len(near_tie_probe_candidates) > 1 and need_probe:
                 near_tie_probe_candidates.sort(
                     key=lambda entry: (
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_action_visit_count",
+                                0,
+                            )
+                        ),
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_visit_count",
+                                0,
+                            )
+                        ),
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_outgoing_edge_count",
+                                0,
+                            )
+                        ),
                         int(action_count_map.get(int(entry.candidate.action_id), 0)),
                         int(
                             cluster_count_map.get(
@@ -627,6 +694,7 @@ class ActiveInferencePolicyEvaluatorV1:
         selected_candidate_usage_count = int(
             candidate_count_map.get(str(entries[0].candidate.candidate_id), 0)
         )
+        selected_transition_stats = self._candidate_transition_stats(entries[0].candidate)
         if early_probe_applied:
             tie_breaker_rule_applied = "early_probe_budget_least_tried"
         elif tie_group_size > 1:
@@ -681,6 +749,15 @@ class ActiveInferencePolicyEvaluatorV1:
                 selected_subcluster_usage_count
             ),
             "selected_candidate_usage_count_before": int(selected_candidate_usage_count),
+            "selected_state_visit_count_before": int(
+                selected_transition_stats.get("state_visit_count", 0)
+            ),
+            "selected_state_action_visit_count_before": int(
+                selected_transition_stats.get("state_action_visit_count", 0)
+            ),
+            "selected_state_outgoing_edge_count_before": int(
+                selected_transition_stats.get("state_outgoing_edge_count", 0)
+            ),
             "tie_probe_candidates": [
                 {
                     "candidate_id": str(entry.candidate.candidate_id),
@@ -725,6 +802,24 @@ class ActiveInferencePolicyEvaluatorV1:
                     "candidate_usage_count_before": int(
                         candidate_count_map.get(
                             str(entry.candidate.candidate_id),
+                            0,
+                        )
+                    ),
+                    "state_visit_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_visit_count",
+                            0,
+                        )
+                    ),
+                    "state_action_visit_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_action_visit_count",
+                            0,
+                        )
+                    ),
+                    "state_outgoing_edge_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_outgoing_edge_count",
                             0,
                         )
                     ),
@@ -781,6 +876,24 @@ class ActiveInferencePolicyEvaluatorV1:
                     "candidate_usage_count_before": int(
                         candidate_count_map.get(str(entry.candidate.candidate_id), 0)
                     ),
+                    "state_visit_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_visit_count",
+                            0,
+                        )
+                    ),
+                    "state_action_visit_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_action_visit_count",
+                            0,
+                        )
+                    ),
+                    "state_outgoing_edge_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_outgoing_edge_count",
+                            0,
+                        )
+                    ),
                 }
                 for entry in near_tie_probe_candidates[:12]
             ],
@@ -828,6 +941,24 @@ class ActiveInferencePolicyEvaluatorV1:
                                     self._candidate_subcluster_id(entry.candidate),
                                 )
                             ),
+                            0,
+                        )
+                    ),
+                    "state_visit_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_visit_count",
+                            0,
+                        )
+                    ),
+                    "state_action_visit_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_action_visit_count",
+                            0,
+                        )
+                    ),
+                    "state_outgoing_edge_count": int(
+                        self._candidate_transition_stats(entry.candidate).get(
+                            "state_outgoing_edge_count",
                             0,
                         )
                     ),

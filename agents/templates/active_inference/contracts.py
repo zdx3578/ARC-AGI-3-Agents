@@ -274,6 +274,44 @@ class CausalEventSignatureV1:
 
 
 @dataclass(slots=True)
+class TransitionRecordV1:
+    schema_name: str
+    schema_version: int
+    action_counter: int
+    state_before_digest: str
+    state_after_digest: str
+    action_token: str
+    action_context_digest: str
+    effect_signature_key_v2: str
+    effect_obs_change_type: str
+    effect_translation_delta_bucket: str
+    state_action_key: str
+    transition_edge_key: str
+    env_delta: dict[str, Any] = field(default_factory=dict)
+    action_context: dict[str, Any] = field(default_factory=dict)
+    effect_summary: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_name": self.schema_name,
+            "schema_version": int(self.schema_version),
+            "action_counter": int(self.action_counter),
+            "state_before_digest": self.state_before_digest,
+            "state_after_digest": self.state_after_digest,
+            "action_token": self.action_token,
+            "action_context_digest": self.action_context_digest,
+            "effect_signature_key_v2": self.effect_signature_key_v2,
+            "effect_obs_change_type": self.effect_obs_change_type,
+            "effect_translation_delta_bucket": self.effect_translation_delta_bucket,
+            "state_action_key": self.state_action_key,
+            "transition_edge_key": self.transition_edge_key,
+            "env_delta": dict(self.env_delta),
+            "action_context": dict(self.action_context),
+            "effect_summary": dict(self.effect_summary),
+        }
+
+
+@dataclass(slots=True)
 class HiddenModeStateV1:
     mode_id: str
     switch_vector: dict[str, int] = field(default_factory=dict)

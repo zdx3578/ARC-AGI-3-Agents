@@ -560,6 +560,12 @@ def _context_features(
     )
     if not isinstance(blocked_edge_observed_stats, dict):
         blocked_edge_observed_stats = {}
+    transition_exploration_stats = candidate.metadata.get(
+        "transition_exploration_stats",
+        {},
+    )
+    if not isinstance(transition_exploration_stats, dict):
+        transition_exploration_stats = {}
     click_context_bucket = _click_context_bucket_from_feature(coord_context)
     click_context_subcluster = str(
         coord_context.get(
@@ -620,6 +626,15 @@ def _context_features(
     region_revisit_count_current = int(
         blocked_edge_observed_stats.get("region_revisit_count_current", 0)
     )
+    transition_state_visit_count = int(
+        transition_exploration_stats.get("state_visit_count", 0)
+    )
+    transition_state_action_visit_count = int(
+        transition_exploration_stats.get("state_action_visit_count", 0)
+    )
+    transition_state_outgoing_edge_count = int(
+        transition_exploration_stats.get("state_outgoing_edge_count", 0)
+    )
 
     return {
         "action_id": int(candidate.action_id),
@@ -642,6 +657,13 @@ def _context_features(
         "navigation_edge_attempts": int(navigation_edge_attempts),
         "navigation_edge_blocked_rate": float(navigation_edge_blocked_rate),
         "region_revisit_count_current": int(region_revisit_count_current),
+        "transition_state_visit_count": int(transition_state_visit_count),
+        "transition_state_action_visit_count": int(
+            transition_state_action_visit_count
+        ),
+        "transition_state_outgoing_edge_count": int(
+            transition_state_outgoing_edge_count
+        ),
         "click_attempts": int(click_attempts),
         "click_non_no_change_rate": float(
             click_non_no_change / float(max(1, click_attempts))

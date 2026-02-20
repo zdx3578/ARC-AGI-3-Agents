@@ -13,6 +13,7 @@ from .contracts import (
     ActionCandidateV1,
     ObservationPacketV1,
     RepresentationStateV1,
+    TransitionRecordV1,
 )
 from .diagnostics import StageDiagnosticsCollectorV1
 from .hypothesis_bank import (
@@ -231,6 +232,11 @@ class ActiveInferenceEFE(Agent):
         self._region_visit_counts: dict[str, int] = {}
         self._click_bucket_stats: dict[str, dict[str, int]] = {}
         self._click_subcluster_stats: dict[str, dict[str, int]] = {}
+        self._state_visit_count: dict[str, int] = {}
+        self._state_action_visit_count: dict[str, int] = {}
+        self._transition_edge_visit_count: dict[str, int] = {}
+        self._state_outgoing_edges: dict[str, set[str]] = {}
+        self._latest_transition_record: dict[str, Any] = {}
 
         self.trace_enabled = _env_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
         self.trace_recorder: ActiveInferenceTraceRecorderV1 | None = None
@@ -297,6 +303,324 @@ class ActiveInferenceEFE(Agent):
                 "action_cost_per_step": int(packet.action_cost_per_step),
                 "action6_coordinate_min": int(packet.action6_coordinate_min),
                 "action6_coordinate_max": int(packet.action6_coordinate_max),
+            },
+        }
+
+    def _stable_digest_payload_v1(self, payload: Any, *, prefix: str = "") -> str:
+        try:
+            canonical = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+        except Exception:
+            canonical = repr(payload)
+        digest = hashlib.sha256(canonical.encode("utf-8", errors="ignore")).hexdigest()[:24]
+        return f"{prefix}{digest}" if prefix else digest
+
+    def _frame_digest_v1(self, packet: ObservationPacketV1) -> str:
+        if packet.frame_chain_digests:
+            return str(packet.frame_chain_digests[-1])
+        return hashlib.sha256(
+            repr(packet.frame).encode("utf-8", errors="ignore")
+        ).hexdigest()[:24]
+
+    def _state_digest_v1(
+        self,
+        packet: ObservationPacketV1,
+        representation: RepresentationStateV1,
+    ) -> str:
+        payload = {
+            "state": str(packet.state),
+            "levels_completed": int(packet.levels_completed),
+            "win_levels": int(packet.win_levels),
+            "available_actions": [int(v) for v in sorted(packet.available_actions)],
+            "frame_digest": self._frame_digest_v1(packet),
+            "object_count": int(representation.summary.get("object_count", 0)),
+            "background_color": int(representation.summary.get("background_color", 0)),
+            "color_histogram": dict(representation.summary.get("color_histogram", {})),
+        }
+        return self._stable_digest_payload_v1(payload, prefix="st:")
+
+    def _action_token_from_candidate_v1(self, candidate: ActionCandidateV1) -> str:
+        action_id = int(candidate.action_id)
+        if action_id != 6:
+            return f"a{action_id}"
+        x = int(candidate.x if candidate.x is not None else -1)
+        y = int(candidate.y if candidate.y is not None else -1)
+        feature = candidate.metadata.get("coordinate_context_feature", {})
+        if isinstance(feature, dict):
+            subcluster = str(feature.get("click_context_subcluster_v1", "cv2:NA|fr=NA_NA|sub=lpNA"))
+            return f"a6|{subcluster}|x={x}|y={y}"
+        return f"a6|na|x={x}|y={y}"
+
+    def _patch_digest_v1(
+        self,
+        frame: list[list[int]],
+        *,
+        x: int,
+        y: int,
+        radius: int = 2,
+    ) -> str:
+        height = len(frame)
+        width = len(frame[0]) if frame else 0
+        values: list[int] = []
+        for dy in range(-int(radius), int(radius) + 1):
+            for dx in range(-int(radius), int(radius) + 1):
+                ny = int(y) + int(dy)
+                nx = int(x) + int(dx)
+                if ny < 0 or nx < 0 or ny >= height or nx >= width:
+                    values.append(-1)
+                else:
+                    values.append(int(frame[ny][nx]))
+        return self._stable_digest_payload_v1(values, prefix="patch:")
+
+    def _find_object_by_digest_v1(
+        self,
+        representation: RepresentationStateV1,
+        digest: str,
+    ) -> dict[str, Any] | None:
+        target = str(digest).strip()
+        if not target:
+            return None
+        for obj in representation.object_nodes:
+            if str(obj.digest) == target:
+                return {
+                    "object_id": str(obj.object_id),
+                    "digest": str(obj.digest),
+                    "color": int(obj.color),
+                    "area": int(obj.area),
+                    "centroid_x": int(obj.centroid_x),
+                    "centroid_y": int(obj.centroid_y),
+                    "bbox": [
+                        int(obj.bbox_min_x),
+                        int(obj.bbox_min_y),
+                        int(obj.bbox_max_x),
+                        int(obj.bbox_max_y),
+                    ],
+                }
+        return None
+
+    def _action_context_payload_v1(
+        self,
+        *,
+        candidate: ActionCandidateV1,
+        packet_before: ObservationPacketV1,
+        representation_before: RepresentationStateV1,
+        tracked_token_before: str | None,
+    ) -> dict[str, Any]:
+        action_id = int(candidate.action_id)
+        payload: dict[str, Any] = {
+            "action_id": int(action_id),
+            "action_token": self._action_token_from_candidate_v1(candidate),
+            "scope": "global",
+        }
+        if action_id == 6:
+            x = int(candidate.x if candidate.x is not None else 31)
+            y = int(candidate.y if candidate.y is not None else 31)
+            feature = candidate.metadata.get("coordinate_context_feature", {})
+            if not isinstance(feature, dict):
+                feature = {}
+            payload.update(
+                {
+                    "scope": "global+click_local",
+                    "x": int(x),
+                    "y": int(y),
+                    "click_patch_digest": self._patch_digest_v1(
+                        packet_before.frame,
+                        x=int(x),
+                        y=int(y),
+                        radius=2,
+                    ),
+                    "click_context_bucket_v2": str(
+                        feature.get("click_context_bucket_v2", "cv2:NA")
+                    ),
+                    "click_context_subcluster_v1": str(
+                        feature.get(
+                            "click_context_subcluster_v1",
+                            "cv2:NA|fr=NA_NA|sub=lpNA",
+                        )
+                    ),
+                    "hit_object": int(feature.get("hit_object", -1)),
+                    "hit_type": str(feature.get("hit_type", "none")),
+                    "object_digest_bucket": str(
+                        feature.get("object_digest_bucket", "NA")
+                    ),
+                    "rel_pos_bucket": str(feature.get("rel_pos_bucket", "NA")),
+                    "on_object_boundary": str(
+                        feature.get("on_object_boundary", "NA")
+                    ),
+                }
+            )
+            return payload
+
+        if action_id in (1, 2, 3, 4, 7):
+            payload["scope"] = "global+navigate_local"
+            payload["tracked_token_before"] = str(tracked_token_before or "NA")
+            payload["action_region_before"] = (
+                f"{self._last_known_agent_pos_region[0]}:{self._last_known_agent_pos_region[1]}"
+                if self._last_known_agent_pos_region is not None
+                else "NA"
+            )
+            if tracked_token_before:
+                matched_object = self._find_object_by_digest_v1(
+                    representation_before,
+                    tracked_token_before,
+                )
+                if matched_object is not None:
+                    payload["tracked_object_before"] = dict(matched_object)
+                    payload["tracked_patch_digest"] = self._patch_digest_v1(
+                        packet_before.frame,
+                        x=int(matched_object.get("centroid_x", 31)),
+                        y=int(matched_object.get("centroid_y", 31)),
+                        radius=2,
+                    )
+            return payload
+
+        payload["scope"] = "global+action"
+        payload["available_actions_before"] = [
+            int(v) for v in sorted(packet_before.available_actions)
+        ]
+        return payload
+
+    def _build_transition_record_v1(
+        self,
+        *,
+        previous_packet: ObservationPacketV1,
+        current_packet: ObservationPacketV1,
+        previous_representation: RepresentationStateV1,
+        current_representation: RepresentationStateV1,
+        executed_candidate: ActionCandidateV1,
+        observed_signature: Any,
+        navigation_state_estimate: dict[str, Any],
+        tracked_token_before: str | None,
+    ) -> TransitionRecordV1:
+        state_before_digest = self._state_digest_v1(
+            previous_packet,
+            previous_representation,
+        )
+        state_after_digest = self._state_digest_v1(
+            current_packet,
+            current_representation,
+        )
+        action_token = self._action_token_from_candidate_v1(executed_candidate)
+        action_context = self._action_context_payload_v1(
+            candidate=executed_candidate,
+            packet_before=previous_packet,
+            representation_before=previous_representation,
+            tracked_token_before=tracked_token_before,
+        )
+        action_context_digest = self._stable_digest_payload_v1(
+            action_context,
+            prefix="ctx:",
+        )
+        effect_signature_key_v2 = str(
+            getattr(observed_signature, "signature_key_v2", "")
+        )
+        effect_obs_change_type = str(
+            getattr(observed_signature, "obs_change_type", "OBSERVED_UNCLASSIFIED")
+        )
+        effect_translation_delta_bucket = str(
+            getattr(observed_signature, "translation_delta_bucket", "na")
+        )
+        state_action_key = f"{state_before_digest}|{action_token}"
+        transition_edge_key = f"{state_before_digest}|{action_token}|{state_after_digest}"
+        env_delta = {
+            "state_transition": str(
+                f"{previous_packet.state}->{current_packet.state}"
+            ),
+            "levels_completed_delta": int(
+                int(current_packet.levels_completed)
+                - int(previous_packet.levels_completed)
+            ),
+            "available_actions_before": [
+                int(v) for v in sorted(previous_packet.available_actions)
+            ],
+            "available_actions_after": [
+                int(v) for v in sorted(current_packet.available_actions)
+            ],
+            "available_actions_changed": bool(
+                sorted(previous_packet.available_actions)
+                != sorted(current_packet.available_actions)
+            ),
+        }
+        effect_summary = {
+            "signature_digest": str(getattr(observed_signature, "signature_digest", "")),
+            "changed_pixel_count": int(
+                getattr(observed_signature, "changed_pixel_count", 0)
+            ),
+            "changed_object_count": int(
+                getattr(observed_signature, "changed_object_count", 0)
+            ),
+            "changed_area_ratio": float(
+                getattr(observed_signature, "changed_area_ratio", 0.0)
+            ),
+            "event_tags": list(getattr(observed_signature, "event_tags", [])),
+            "navigation_state_estimate_v1": dict(navigation_state_estimate),
+        }
+        return TransitionRecordV1(
+            schema_name="active_inference_transition_record_v1",
+            schema_version=1,
+            action_counter=int(previous_packet.action_counter),
+            state_before_digest=state_before_digest,
+            state_after_digest=state_after_digest,
+            action_token=action_token,
+            action_context_digest=action_context_digest,
+            effect_signature_key_v2=effect_signature_key_v2,
+            effect_obs_change_type=effect_obs_change_type,
+            effect_translation_delta_bucket=effect_translation_delta_bucket,
+            state_action_key=state_action_key,
+            transition_edge_key=transition_edge_key,
+            env_delta=env_delta,
+            action_context=action_context,
+            effect_summary=effect_summary,
+        )
+
+    def _update_transition_graph_v1(self, transition: TransitionRecordV1) -> None:
+        before = str(transition.state_before_digest)
+        after = str(transition.state_after_digest)
+        state_action_key = str(transition.state_action_key)
+        edge_key = str(transition.transition_edge_key)
+        self._state_visit_count[before] = int(self._state_visit_count.get(before, 0) + 1)
+        self._state_visit_count[after] = int(self._state_visit_count.get(after, 0) + 1)
+        self._state_action_visit_count[state_action_key] = int(
+            self._state_action_visit_count.get(state_action_key, 0) + 1
+        )
+        self._transition_edge_visit_count[edge_key] = int(
+            self._transition_edge_visit_count.get(edge_key, 0) + 1
+        )
+        outgoing = self._state_outgoing_edges.setdefault(before, set())
+        outgoing.add(edge_key)
+        self._latest_transition_record = transition.to_dict()
+
+    def _transition_graph_summary_v1(self) -> dict[str, Any]:
+        return {
+            "schema_name": "active_inference_transition_graph_summary_v1",
+            "schema_version": 1,
+            "state_count": int(len(self._state_visit_count)),
+            "state_action_count": int(len(self._state_action_visit_count)),
+            "edge_count": int(len(self._transition_edge_visit_count)),
+            "state_visit_histogram": {
+                str(key): int(value)
+                for (key, value) in sorted(
+                    self._state_visit_count.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )
+            },
+            "state_action_visit_histogram": {
+                str(key): int(value)
+                for (key, value) in sorted(
+                    self._state_action_visit_count.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )[:128]
+            },
+            "edge_visit_histogram": {
+                str(key): int(value)
+                for (key, value) in sorted(
+                    self._transition_edge_visit_count.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )[:128]
             },
         }
 
@@ -513,6 +837,28 @@ class ActiveInferenceEFE(Agent):
             "edge_blocked": int(edge_blocked),
             "edge_blocked_rate": float(edge_blocked_rate),
             "region_revisit_count_current": int(revisit_count_current),
+        }
+
+    def _transition_exploration_stats_v1(
+        self,
+        *,
+        state_digest_current: str,
+        candidate: ActionCandidateV1,
+    ) -> dict[str, Any]:
+        action_token = self._action_token_from_candidate_v1(candidate)
+        state_action_key = f"{state_digest_current}|{action_token}"
+        outgoing_edges = self._state_outgoing_edges.get(str(state_digest_current), set())
+        return {
+            "state_digest_current": str(state_digest_current),
+            "action_token": str(action_token),
+            "state_action_key": str(state_action_key),
+            "state_visit_count": int(
+                self._state_visit_count.get(str(state_digest_current), 0)
+            ),
+            "state_action_visit_count": int(
+                self._state_action_visit_count.get(str(state_action_key), 0)
+            ),
+            "state_outgoing_edge_count": int(len(outgoing_edges)),
         }
 
     def _update_operability_stats_v1(
@@ -757,6 +1103,8 @@ class ActiveInferenceEFE(Agent):
             "action_space_constraint_report_v1": dict(
                 self.hypothesis_bank.action_space_constraint_report
             ),
+            "transition_record_previous_step_v1": dict(self._latest_transition_record),
+            "transition_graph_summary_v1": self._transition_graph_summary_v1(),
             "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
             "no_change_streak": int(self._no_change_streak),
@@ -796,6 +1144,8 @@ class ActiveInferenceEFE(Agent):
             "action_space_constraint_report_v1": dict(
                 self.hypothesis_bank.action_space_constraint_report
             ),
+            "transition_record_previous_step_v1": dict(self._latest_transition_record),
+            "transition_graph_summary_v1": self._transition_graph_summary_v1(),
             "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
             "no_change_streak": int(self._no_change_streak),
@@ -818,6 +1168,7 @@ class ActiveInferenceEFE(Agent):
         candidates: list[ActionCandidateV1] = []
         ranked_entries = []
         causal_signature = None
+        transition_record: TransitionRecordV1 | None = None
         selection_diagnostics: dict[str, Any] = {}
         action_space_constraint_report: dict[str, Any] = {}
         navigation_state_estimate: dict[str, Any] = {}
@@ -962,11 +1313,23 @@ class ActiveInferenceEFE(Agent):
                     previous_representation=self._previous_representation,
                     observed_signature=causal_signature,
                 )
+                tracked_token_before = self._tracked_agent_token_digest
                 navigation_state_estimate = self._estimate_navigation_state(
                     self._previous_representation,
                     representation,
                     self._previous_action_candidate,
                 )
+                transition_record = self._build_transition_record_v1(
+                    previous_packet=self._previous_packet,
+                    current_packet=packet,
+                    previous_representation=self._previous_representation,
+                    current_representation=representation,
+                    executed_candidate=self._previous_action_candidate,
+                    observed_signature=causal_signature,
+                    navigation_state_estimate=navigation_state_estimate,
+                    tracked_token_before=tracked_token_before,
+                )
+                self._update_transition_graph_v1(transition_record)
                 self._update_operability_stats_v1(
                     executed_candidate=self._previous_action_candidate,
                     causal_signature=causal_signature,
@@ -999,12 +1362,19 @@ class ActiveInferenceEFE(Agent):
                             posterior_report.get("mode_transition_soft_confidence", 0.0)
                         ),
                         "navigation_state_estimate_v1": dict(navigation_state_estimate),
+                        "transition_record_previous_step_v1": (
+                            transition_record.to_dict()
+                            if transition_record is not None
+                            else None
+                        ),
+                        "transition_graph_summary_v1": self._transition_graph_summary_v1(),
                         "operability_diagnostics_v1": self._operability_diagnostics_v1(),
                     },
                 )
             else:
                 self._no_change_streak = 0
                 self._latest_navigation_state_estimate = {}
+                self._latest_transition_record = {}
                 diagnostics.finish_ok(
                     "causal_update",
                     {"updated": False, "reason": "insufficient_history"},
@@ -1015,6 +1385,7 @@ class ActiveInferenceEFE(Agent):
                 f"causal_update_error::{type(exc).__name__}",
             )
             self._latest_navigation_state_estimate = {}
+            self._latest_transition_record = {}
 
         remaining_budget = max(0, int(self.MAX_ACTIONS - int(self.action_counter)))
         early_probe_budget_remaining = max(
@@ -1125,6 +1496,10 @@ class ActiveInferenceEFE(Agent):
                         self.hypothesis_bank.last_posterior_delta_report
                     ),
                     "action_space_constraint_report_v1": dict(action_space_constraint_report),
+                    "transition_record_previous_step_v1": (
+                        transition_record.to_dict() if transition_record is not None else None
+                    ),
+                    "transition_graph_summary_v1": self._transition_graph_summary_v1(),
                     "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
                     "representation_summary": representation.summary,
                     "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
@@ -1167,6 +1542,12 @@ class ActiveInferenceEFE(Agent):
                                 self.hypothesis_bank.last_posterior_delta_report
                             ),
                             "action_space_constraint_report_v1": dict(action_space_constraint_report),
+                            "transition_record_previous_step_v1": (
+                                transition_record.to_dict()
+                                if transition_record is not None
+                                else None
+                            ),
+                            "transition_graph_summary_v1": self._transition_graph_summary_v1(),
                             "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
                             "available_actions_trajectory_v1": self._available_actions_trajectory_summary(),
                             "remaining_budget": int(remaining_budget),
@@ -1175,6 +1556,7 @@ class ActiveInferenceEFE(Agent):
                             "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
                         }
                     else:
+                        state_digest_current = self._state_digest_v1(packet, representation)
                         control_schema = self._control_schema_posterior()
                         for candidate in candidates:
                             action_key = str(int(candidate.action_id))
@@ -1186,6 +1568,12 @@ class ActiveInferenceEFE(Agent):
                             )
                             candidate.metadata["candidate_subcluster_id"] = (
                                 self._candidate_subcluster_id(candidate)
+                            )
+                            candidate.metadata["transition_exploration_stats"] = (
+                                self._transition_exploration_stats_v1(
+                                    state_digest_current=str(state_digest_current),
+                                    candidate=candidate,
+                                )
                             )
                             if int(candidate.action_id) in (1, 2, 3, 4):
                                 candidate.metadata["blocked_edge_observed_stats"] = (
@@ -1288,6 +1676,12 @@ class ActiveInferenceEFE(Agent):
                                 self.hypothesis_bank.last_posterior_delta_report
                             ),
                             "action_space_constraint_report_v1": dict(action_space_constraint_report),
+                            "transition_record_previous_step_v1": (
+                                transition_record.to_dict()
+                                if transition_record is not None
+                                else None
+                            ),
+                            "transition_graph_summary_v1": self._transition_graph_summary_v1(),
                             "selection_diagnostics_v1": dict(selection_diagnostics),
                             "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
                             "representation_summary": representation.summary,
@@ -1318,6 +1712,14 @@ class ActiveInferenceEFE(Agent):
             action.reasoning.setdefault(
                 "exploration_policy_v1",
                 dict(exploration_policy_payload),
+            )
+            action.reasoning.setdefault(
+                "transition_record_previous_step_v1",
+                transition_record.to_dict() if transition_record is not None else None,
+            )
+            action.reasoning.setdefault(
+                "transition_graph_summary_v1",
+                self._transition_graph_summary_v1(),
             )
             action.reasoning.setdefault(
                 "operability_diagnostics_v1",
@@ -1362,6 +1764,10 @@ class ActiveInferenceEFE(Agent):
                         self.hypothesis_bank.last_posterior_delta_report
                     ),
                     "action_space_constraint_report_v1": dict(action_space_constraint_report),
+                    "transition_record_previous_step_v1": (
+                        transition_record.to_dict() if transition_record is not None else None
+                    ),
+                    "transition_graph_summary_v1": self._transition_graph_summary_v1(),
                     "selection_diagnostics_v1": dict(selection_diagnostics),
                     "memory_policy_v1": self._memory_policy_v1(),
                     "exploration_policy_v1": dict(exploration_policy_payload),
@@ -1440,6 +1846,10 @@ class ActiveInferenceEFE(Agent):
                     "final_navigation_state_estimate_v1": dict(
                         self._latest_navigation_state_estimate
                     ),
+                    "final_transition_record_previous_step_v1": dict(
+                        self._latest_transition_record
+                    ),
+                    "final_transition_graph_summary_v1": self._transition_graph_summary_v1(),
                     "final_operability_diagnostics_v1": self._operability_diagnostics_v1(),
                     "final_control_schema_posterior": self._control_schema_posterior(),
                     "final_action_select_count": {

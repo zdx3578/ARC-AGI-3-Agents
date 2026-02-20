@@ -48,6 +48,7 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 - action-space compatibility pruning + soft mode-transition confidence diagnostics
 - Expected Free Energy ledger per candidate (risk / ambiguity / split information gain / action cost / complexity / VFE term)
 - causal event signatures for action interventions (`obs_change_type` diff semantics)
+- transition record asset (`state_before/action_token/action_context/effect/state_after/env_delta`) for per-action effect auditing
 - Action6 proposal diagnostics (region coverage / redundancy / context diversity / hit-object rate)
 - Action6 proposal diversity selection (greedy coverage across region / bucket / subcluster / object digest)
 - action-selection tie diagnostics (`best_vs_second_best_delta_total_efe`, `tie_group_size`, `tie_breaker_rule_applied`)
@@ -56,6 +57,7 @@ implements an audit-first Active Inference loop for ARC-AGI-3:
 - navigation blocked outcome modeling (`delta=blocked`) wired into predictive signatures/risk preference
 - least-tried probing in explore/explain phases, including early probing budget that forces action-space coverage in the first N steps
 - cluster/subcluster-aware least-tried tie-break (`candidate_cluster_id` + `candidate_subcluster_id`) including exploit-phase Action6 bucket/subcluster probing for tie and near-tie candidate sets
+- state-action frontier-aware probing (`transition_exploration_stats` + state-action visit counts) to prioritize under-sampled transitions
 - hard methodology guard: `cross-episode memory = off` (no persistent cross-run parameter learning; enforced in reasoning + trace)
 - hard objective guard: `action_cost_in_objective = off` (action cost is logged for audit, but excluded from action selection objective)
 - JSONL trace emission for bottleneck analysis
