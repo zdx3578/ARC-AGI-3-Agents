@@ -15,8 +15,7 @@ from functools import partial
 from types import FrameType
 from typing import Optional
 
-import requests
-
+from arc_agi import Arcade
 from agents import AVAILABLE_AGENTS, Swarm
 from agents.tracing import initialize as init_agentops
 
@@ -33,10 +32,64 @@ if (SCHEME == "http" and str(PORT) == "80") or (
     ROOT_URL = f"{SCHEME}://{HOST}"
 else:
     ROOT_URL = f"{SCHEME}://{HOST}:{PORT}"
-HEADERS = {
-    "X-API-Key": os.getenv("ARC_API_KEY", ""),
-    "Accept": "application/json",
-}
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _parse_requested_games(game_arg: Optional[str]) -> list[str]:
+    if not game_arg:
+        return []
+    return [token.strip() for token in game_arg.split(",") if token.strip()]
+
+
+def _collect_available_games() -> list[str]:
+    try:
+        arcade = Arcade()
+        environments = arcade.get_environments()
+        game_ids = _dedupe_preserve_order(
+            [env.game_id for env in environments if env.game_id]
+        )
+        if game_ids:
+            logger.info(
+                "Discovered %d game(s) from Arcade environment catalog", len(game_ids)
+            )
+        else:
+            logger.warning(
+                "Arcade environment catalog is empty (operation_mode=%s, environments_dir=%s)",
+                arcade.operation_mode,
+                arcade.environments_dir,
+            )
+        return game_ids
+    except Exception as e:
+        logger.error("Failed to discover games from Arcade catalog: %s", e)
+        return []
+
+
+def _resolve_games(
+    full_games: list[str], requested_games: list[str]
+) -> tuple[list[str], bool]:
+    if not requested_games:
+        return full_games[:], False
+
+    if full_games:
+        games = [
+            gid
+            for gid in full_games
+            if any(gid.startswith(prefix) for prefix in requested_games)
+        ]
+        return _dedupe_preserve_order(games), False
+
+    # Catalog unavailable: trust user-provided game ids and let Arcade resolve at runtime.
+    return _dedupe_preserve_order(requested_games), True
 
 
 def run_agent(swarm: Swarm) -> None:
@@ -114,28 +167,9 @@ def main() -> None:
         logger.error("An Agent must be specified")
         return
 
-    print(f"{ROOT_URL}/api/games")
-
-    # Get the list of games from the API
-    full_games = []
-    try:
-        with requests.Session() as session:
-            session.headers.update(HEADERS)
-            r = session.get(f"{ROOT_URL}/api/games", timeout=10)
-
-        if r.status_code == 200:
-            try:
-                full_games = [g["game_id"] for g in r.json()]
-            except (ValueError, KeyError) as e:
-                logger.error(f"Failed to parse games response: {e}")
-                logger.error(f"Response content: {r.text[:200]}")
-        else:
-            logger.error(
-                f"API request failed with status {r.status_code}: {r.text[:200]}"
-            )
-
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to connect to API server: {e}")
+    full_games = _collect_available_games()
+    requested_games = _parse_requested_games(args.game)
+    games, using_unvalidated_request = _resolve_games(full_games, requested_games)
 
     # For playback agents, we can derive the game from the recording filename
     if not full_games and args.agent and args.agent.endswith(".recording.jsonl"):
@@ -143,28 +177,27 @@ def main() -> None:
 
         game_prefix = Recorder.get_prefix_one(args.agent)
         full_games = [game_prefix]
+        games = [game_prefix]
         logger.info(
-            f"Using game '{game_prefix}' derived from playback recording filename"
+            "Using game '%s' derived from playback recording filename", game_prefix
         )
-    games = full_games[:]
-    if args.game:
-        filters = args.game.split(",")
-        games = [
-            gid
-            for gid in full_games
-            if any(gid.startswith(prefix) for prefix in filters)
-        ]
+
+    if using_unvalidated_request and games:
+        logger.warning(
+            "Environment catalog unavailable; attempting requested game id(s) directly: %s",
+            games,
+        )
 
     logger.info(f"Game list: {games}")
 
     if not games:
-        if full_games:
+        if requested_games and full_games:
             logger.error(
                 f"The specified game '{args.game}' does not exist or is not available with your API key. Please try a different game."
             )
         else:
             logger.error(
-                "No games available to play. Check API connection or recording file."
+                "No games available to play. Provide --game explicitly, or run in offline mode with local environments."
             )
         return
 
