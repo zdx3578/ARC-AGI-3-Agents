@@ -2712,6 +2712,10 @@ class ActiveInferenceEFE(Agent):
             nav_ry = int(nav_region.get("y", -1))
             if nav_rx >= 0 and nav_ry >= 0:
                 nav_region_key = f"{nav_rx}:{nav_ry}"
+        if self._parse_region_key_v1(nav_region_key) is None:
+            nav_region_key = str(self._current_region_key_v1())
+        if self._parse_region_key_v1(source_region_key) is None:
+            source_region_key = str(nav_region_key)
 
         coupled_info = self._high_info_coupled_regions_v1(
             fallback_source_region_key=str(source_region_key),
@@ -4260,6 +4264,12 @@ class ActiveInferenceEFE(Agent):
                 int(self._last_known_agent_pos_region[1]),
             )
             payload["current_region_source"] = "last_known_region"
+        if current_region is None and self._latest_observed_agent_pos_region is not None:
+            current_region = (
+                int(self._latest_observed_agent_pos_region[0]),
+                int(self._latest_observed_agent_pos_region[1]),
+            )
+            payload["current_region_source"] = "observed_representation"
         if current_region is None:
             payload["reason"] = "unknown_current_region"
             return payload
@@ -5844,12 +5854,22 @@ class ActiveInferenceEFE(Agent):
                                     self._region_action_semantics_v1(
                                         action_id=int(candidate.action_id),
                                         current_region_key=str(
-                                            predicted_region_features.get(
-                                                "current_region_key",
-                                                self._current_region_key_v1(),
+                                            (
+                                                str(predicted_region_features.get("current_region_key", "NA"))
+                                                if (
+                                                    isinstance(predicted_region_features, dict)
+                                                    and self._parse_region_key_v1(
+                                                        str(
+                                                            predicted_region_features.get(
+                                                                "current_region_key",
+                                                                "NA",
+                                                            )
+                                                        )
+                                                    )
+                                                    is not None
+                                                )
+                                                else self._current_region_key_v1()
                                             )
-                                            if isinstance(predicted_region_features, dict)
-                                            else self._current_region_key_v1()
                                         ),
                                     )
                                 )
