@@ -943,6 +943,15 @@ class ActiveInferencePolicyEvaluatorV1:
         region_strong_change_rate = self._clamp01(
             float(region_action_semantics.get("strong_change_rate", 0.0))
         )
+        region_progress_rate = self._clamp01(
+            float(region_action_semantics.get("progress_rate", 0.0))
+        )
+        region_coupling_signal_score = self._clamp01(
+            float(region_action_semantics.get("coupling_signal_score", 0.0))
+        )
+        region_coupling_signal_kind = str(
+            region_action_semantics.get("coupling_signal_kind", "unknown")
+        )
         region_semantics_edge_status = str(
             region_action_semantics.get("edge_status", "unknown")
         )
@@ -953,12 +962,19 @@ class ActiveInferencePolicyEvaluatorV1:
         color_coupling_bonus = 0.0
         color_coupling_penalty = 0.0
         if region_action_semantics_enabled:
-            color_coupling_signal = self._clamp01(
+            region_channel_signal = self._clamp01(
                 (0.35 * region_info_trigger_score)
                 + (0.20 * region_palette_change_rate)
                 + (0.15 * region_palette_delta_mean_norm)
                 + (0.15 * region_cc_count_change_rate)
                 + (0.15 * region_strong_change_rate)
+            )
+            color_coupling_signal = self._clamp01(
+                max(
+                    float(region_coupling_signal_score),
+                    float(region_channel_signal),
+                    float(region_progress_rate),
+                )
             )
             color_coupling_bonus = float(
                 color_coupling_signal
@@ -1238,6 +1254,9 @@ class ActiveInferencePolicyEvaluatorV1:
             "region_palette_delta_mean_norm": float(region_palette_delta_mean_norm),
             "region_cc_count_change_rate": float(region_cc_count_change_rate),
             "region_strong_change_rate": float(region_strong_change_rate),
+            "region_progress_rate": float(region_progress_rate),
+            "region_coupling_signal_score": float(region_coupling_signal_score),
+            "region_coupling_signal_kind": str(region_coupling_signal_kind),
             "region_semantics_edge_status": str(region_semantics_edge_status),
             "color_coupling_signal": float(color_coupling_signal),
             "color_coupling_bonus": float(color_coupling_bonus),
@@ -1499,6 +1518,9 @@ class ActiveInferencePolicyEvaluatorV1:
             "region_palette_delta_mean_norm": float(region_palette_delta_mean_norm),
             "region_cc_count_change_rate": float(region_cc_count_change_rate),
             "region_strong_change_rate": float(region_strong_change_rate),
+            "region_progress_rate": float(region_progress_rate),
+            "region_coupling_signal_score": float(region_coupling_signal_score),
+            "region_coupling_signal_kind": str(region_coupling_signal_kind),
             "region_semantics_edge_status": str(region_semantics_edge_status),
             "color_coupling_signal": float(color_coupling_signal),
             "color_coupling_bonus": float(color_coupling_bonus),
@@ -2021,6 +2043,7 @@ class ActiveInferencePolicyEvaluatorV1:
             "blocked_rate": self._clamp01(float(raw.get("blocked_rate", 0.0))),
             "non_no_change_rate": self._clamp01(float(raw.get("non_no_change_rate", 0.0))),
             "strong_change_rate": self._clamp01(float(raw.get("strong_change_rate", 0.0))),
+            "progress_rate": self._clamp01(float(raw.get("progress_rate", 0.0))),
             "cc_count_change_rate": self._clamp01(float(raw.get("cc_count_change_rate", 0.0))),
             "palette_change_rate": self._clamp01(float(raw.get("palette_change_rate", 0.0))),
             "palette_delta_mean": float(max(0.0, raw.get("palette_delta_mean", 0.0))),
@@ -2029,6 +2052,10 @@ class ActiveInferencePolicyEvaluatorV1:
             ),
             "event_entropy_norm": self._clamp01(float(raw.get("event_entropy_norm", 0.0))),
             "info_trigger_score": self._clamp01(float(raw.get("info_trigger_score", 0.0))),
+            "coupling_signal_score": self._clamp01(
+                float(raw.get("coupling_signal_score", raw.get("info_trigger_score", 0.0)))
+            ),
+            "coupling_signal_kind": str(raw.get("coupling_signal_kind", "unknown")),
             "edge_status": str(raw.get("edge_status", "unknown")),
         }
 

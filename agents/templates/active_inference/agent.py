@@ -1731,6 +1731,79 @@ class ActiveInferenceEFE(Agent):
             "last_status": str(state.get("last_status", "idle")),
         }
 
+    @staticmethod
+    def _coupling_signal_profile_v1(
+        *,
+        cc_rate: float,
+        strong_change_rate: float,
+        non_no_change_rate: float,
+        entropy_norm: float,
+        palette_change_rate: float,
+        palette_delta_mean_norm: float,
+        progress_rate: float,
+    ) -> dict[str, Any]:
+        components = {
+            "structural_cc": float(max(0.0, min(1.0, cc_rate))),
+            "visual_palette": float(
+                max(
+                    0.0,
+                    min(1.0, max(float(palette_change_rate), float(palette_delta_mean_norm))),
+                )
+            ),
+            "dynamic_change": float(max(0.0, min(1.0, strong_change_rate))),
+            "behavioral_response": float(max(0.0, min(1.0, non_no_change_rate))),
+            "surprise_entropy": float(max(0.0, min(1.0, entropy_norm))),
+            "progress_delta": float(max(0.0, min(1.0, progress_rate))),
+        }
+        weights = {
+            "structural_cc": 0.24,
+            "visual_palette": 0.22,
+            "dynamic_change": 0.18,
+            "behavioral_response": 0.14,
+            "surprise_entropy": 0.12,
+            "progress_delta": 0.10,
+        }
+        if components["progress_delta"] > 0.0:
+            weights["progress_delta"] += 0.10
+            weights["behavioral_response"] = max(
+                0.04,
+                float(weights["behavioral_response"] - 0.06),
+            )
+            weights["surprise_entropy"] = max(
+                0.04,
+                float(weights["surprise_entropy"] - 0.04),
+            )
+        weight_sum = float(sum(weights.values()))
+        if weight_sum > 0.0:
+            weights = {
+                str(k): float(v / weight_sum)
+                for (k, v) in weights.items()
+            }
+        score = float(
+            sum(
+                float(weights.get(key, 0.0)) * float(components.get(key, 0.0))
+                for key in components
+            )
+        )
+        dominant_key, dominant_value = max(
+            components.items(),
+            key=lambda item: (float(item[1]), str(item[0])),
+            default=("unknown", 0.0),
+        )
+        return {
+            "score": float(max(0.0, min(1.0, score))),
+            "kind": str(dominant_key),
+            "kind_value": float(max(0.0, min(1.0, dominant_value))),
+            "components": {
+                str(k): float(v)
+                for (k, v) in components.items()
+            },
+            "weights": {
+                str(k): float(v)
+                for (k, v) in weights.items()
+            },
+        }
+
     def _high_info_region_scoreboard_v1(
         self,
         *,
@@ -1757,6 +1830,7 @@ class ActiveInferenceEFE(Agent):
                 continue
             non_no_change = int(self._region_action_non_no_change_counts.get(region_action_key, 0))
             strong_change = int(self._region_action_strong_change_counts.get(region_action_key, 0))
+            progress_count = int(self._region_action_progress_counts.get(region_action_key, 0))
             cc_count_change = int(histogram.get("CC_COUNT_CHANGE", 0))
             palette_change_count = int(
                 self._region_action_palette_change_counts.get(region_action_key, 0)
@@ -1773,11 +1847,21 @@ class ActiveInferenceEFE(Agent):
             entropy_norm = float(entropy / max(1.0, math.log2(float(max(2, len(histogram))))))
             non_no_change_rate = float(non_no_change / float(max(1, attempts)))
             strong_change_rate = float(strong_change / float(max(1, attempts)))
+            progress_rate = float(progress_count / float(max(1, attempts)))
             cc_rate = float(cc_count_change / float(max(1, attempts)))
             palette_change_rate = float(palette_change_count / float(max(1, attempts)))
             palette_delta_mean = float(palette_delta_total_sum / float(max(1, attempts)))
             palette_delta_mean_norm = float(
                 palette_delta_mean / (palette_delta_mean + 16.0)
+            )
+            coupling_profile = self._coupling_signal_profile_v1(
+                cc_rate=cc_rate,
+                strong_change_rate=strong_change_rate,
+                non_no_change_rate=non_no_change_rate,
+                entropy_norm=entropy_norm,
+                palette_change_rate=palette_change_rate,
+                palette_delta_mean_norm=palette_delta_mean_norm,
+                progress_rate=progress_rate,
             )
             visit_count = int(self._region_visit_counts.get(str(region_key), 0))
             visit_novelty = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 10.0)))
@@ -1786,12 +1870,7 @@ class ActiveInferenceEFE(Agent):
                     0.0,
                     min(
                         1.0,
-                        (0.30 * cc_rate)
-                        + (0.24 * strong_change_rate)
-                        + (0.18 * non_no_change_rate)
-                        + (0.10 * entropy_norm)
-                        + (0.12 * palette_change_rate)
-                        + (0.06 * palette_delta_mean_norm)
+                        (0.92 * float(coupling_profile.get("score", 0.0)))
                         + (0.06 * visit_novelty),
                     ),
                 )
@@ -1805,10 +1884,15 @@ class ActiveInferenceEFE(Agent):
                 "event_entropy_norm": float(entropy_norm),
                 "non_no_change_rate": float(non_no_change_rate),
                 "strong_change_rate": float(strong_change_rate),
+                "progress_rate": float(progress_rate),
                 "cc_count_change_rate": float(cc_rate),
                 "palette_change_rate": float(palette_change_rate),
                 "palette_delta_mean": float(palette_delta_mean),
                 "palette_delta_mean_norm": float(palette_delta_mean_norm),
+                "coupling_signal_score": float(coupling_profile.get("score", 0.0)),
+                "coupling_signal_kind": str(coupling_profile.get("kind", "unknown")),
+                "coupling_components": dict(coupling_profile.get("components", {})),
+                "coupling_weights": dict(coupling_profile.get("weights", {})),
                 "visit_count": int(visit_count),
                 "event_histogram": {str(k): int(v) for (k, v) in sorted(histogram.items())},
             }
@@ -1852,12 +1936,17 @@ class ActiveInferenceEFE(Agent):
             "blocked_rate": 0.0,
             "non_no_change_rate": 0.0,
             "strong_change_rate": 0.0,
+            "progress_rate": 0.0,
             "cc_count_change_rate": 0.0,
             "palette_change_rate": 0.0,
             "palette_delta_mean": 0.0,
             "palette_delta_mean_norm": 0.0,
             "event_entropy_norm": 0.0,
             "info_trigger_score": 0.0,
+            "coupling_signal_score": 0.0,
+            "coupling_signal_kind": "unknown",
+            "coupling_components": {},
+            "coupling_weights": {},
             "edge_status": "unknown",
             "event_histogram": {},
         }
@@ -1891,6 +1980,7 @@ class ActiveInferenceEFE(Agent):
             return payload
         non_no_change_count = int(self._region_action_non_no_change_counts.get(region_action_key, 0))
         strong_change_count = int(self._region_action_strong_change_counts.get(region_action_key, 0))
+        progress_count = int(self._region_action_progress_counts.get(region_action_key, 0))
         cc_count_change_count = int(histogram.get("CC_COUNT_CHANGE", 0))
         palette_change_count = int(
             self._region_action_palette_change_counts.get(region_action_key, 0)
@@ -1909,23 +1999,28 @@ class ActiveInferenceEFE(Agent):
         blocked_rate = float(blocked_count / float(max(1, attempts)))
         non_no_change_rate = float(non_no_change_count / float(max(1, attempts)))
         strong_change_rate = float(strong_change_count / float(max(1, attempts)))
+        progress_rate = float(progress_count / float(max(1, attempts)))
         cc_rate = float(cc_count_change_count / float(max(1, attempts)))
         palette_change_rate = float(palette_change_count / float(max(1, attempts)))
         palette_delta_mean = float(palette_delta_total_sum / float(max(1, attempts)))
         palette_delta_mean_norm = float(
             palette_delta_mean / (palette_delta_mean + 16.0)
         )
+        coupling_profile = self._coupling_signal_profile_v1(
+            cc_rate=cc_rate,
+            strong_change_rate=strong_change_rate,
+            non_no_change_rate=non_no_change_rate,
+            entropy_norm=entropy_norm,
+            palette_change_rate=palette_change_rate,
+            palette_delta_mean_norm=palette_delta_mean_norm,
+            progress_rate=progress_rate,
+        )
         info_trigger_score = float(
             max(
                 0.0,
                 min(
                     1.0,
-                    (0.32 * cc_rate)
-                    + (0.25 * strong_change_rate)
-                    + (0.18 * non_no_change_rate)
-                    + (0.11 * entropy_norm)
-                    + (0.09 * palette_change_rate)
-                    + (0.05 * palette_delta_mean_norm),
+                    (0.96 * float(coupling_profile.get("score", 0.0))),
                 ),
             )
         )
@@ -1947,12 +2042,17 @@ class ActiveInferenceEFE(Agent):
                 "blocked_rate": float(blocked_rate),
                 "non_no_change_rate": float(non_no_change_rate),
                 "strong_change_rate": float(strong_change_rate),
+                "progress_rate": float(progress_rate),
                 "cc_count_change_rate": float(cc_rate),
                 "palette_change_rate": float(palette_change_rate),
                 "palette_delta_mean": float(palette_delta_mean),
                 "palette_delta_mean_norm": float(palette_delta_mean_norm),
                 "event_entropy_norm": float(entropy_norm),
                 "info_trigger_score": float(info_trigger_score),
+                "coupling_signal_score": float(coupling_profile.get("score", 0.0)),
+                "coupling_signal_kind": str(coupling_profile.get("kind", "unknown")),
+                "coupling_components": dict(coupling_profile.get("components", {})),
+                "coupling_weights": dict(coupling_profile.get("weights", {})),
                 "edge_status": str(edge_status),
                 "event_histogram": {str(k): int(v) for (k, v) in sorted(histogram.items())},
             }
