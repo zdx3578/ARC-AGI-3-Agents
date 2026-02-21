@@ -3354,6 +3354,29 @@ class ActiveInferencePolicyEvaluatorV1:
                             {},
                         ).get("soft_penalty", 0.0)
                     )
+
+                def _coverage_effective_hard_skip_for_entry(
+                    entry: FreeEnergyLedgerEntryV1,
+                ) -> bool:
+                    if bool(_coverage_hard_skip_for_entry(entry)):
+                        return True
+                    if not bool(coverage_hard_prepass_active):
+                        return False
+                    candidate_id = str(entry.candidate.candidate_id)
+                    stats = predicted_stats_by_candidate_id.get(candidate_id, {})
+                    profile = coverage_block_profile_by_candidate_id.get(candidate_id, {})
+                    edge_attempts = int(max(0, stats.get("edge_attempts", 0)))
+                    edge_blocked_rate = self._clamp01(float(stats.get("edge_blocked_rate", 0.0)))
+                    ui_side_effect_rate = self._clamp01(
+                        float(profile.get("ui_side_effect_rate", 0.0))
+                    )
+                    progress_rate = self._clamp01(float(profile.get("progress_rate", 0.0)))
+                    return bool(
+                        edge_attempts >= 1
+                        and edge_blocked_rate >= 0.95
+                        and ui_side_effect_rate >= 0.85
+                        and progress_rate <= 0.01
+                    )
                 coverage_known_region_count = int(
                     max(
                         (
@@ -3646,7 +3669,7 @@ class ActiveInferencePolicyEvaluatorV1:
                     safe_coverage_pool = [
                         entry
                         for entry in coverage_pool
-                        if not bool(_coverage_hard_skip_for_entry(entry))
+                        if not bool(_coverage_effective_hard_skip_for_entry(entry))
                     ]
                     if safe_coverage_pool:
                         coverage_pool = list(safe_coverage_pool)
@@ -3657,7 +3680,7 @@ class ActiveInferencePolicyEvaluatorV1:
                         coverage_pool = sorted(
                             navigation_entries,
                             key=lambda entry: (
-                                bool(_coverage_hard_skip_for_entry(entry)),
+                                bool(_coverage_effective_hard_skip_for_entry(entry)),
                                 float(_coverage_soft_penalty_for_entry(entry)),
                                 float(
                                     selection_score_by_candidate.get(
@@ -3680,7 +3703,7 @@ class ActiveInferencePolicyEvaluatorV1:
                             entry
                             for entry in navigation_entries
                             if (
-                                not bool(_coverage_hard_skip_for_entry(entry))
+                                not bool(_coverage_effective_hard_skip_for_entry(entry))
                                 and
                                 self._navigation_action_direction(int(entry.candidate.action_id))
                                 == str(coverage_sweep_target_direction)
@@ -3709,7 +3732,7 @@ class ActiveInferencePolicyEvaluatorV1:
                             escaped_pool = sorted(
                                 navigation_entries,
                                 key=lambda entry: (
-                                    bool(_coverage_hard_skip_for_entry(entry)),
+                                    bool(_coverage_effective_hard_skip_for_entry(entry)),
                                     float(_coverage_soft_penalty_for_entry(entry)),
                                     _coverage_frontier_visit(entry),
                                     -float(
@@ -3771,7 +3794,7 @@ class ActiveInferencePolicyEvaluatorV1:
                             entry
                             for entry in coverage_pool
                             if not (
-                                bool(_coverage_hard_skip_for_entry(entry))
+                                bool(_coverage_effective_hard_skip_for_entry(entry))
                                 or
                                 self._navigation_action_direction(
                                     int(entry.candidate.action_id)
@@ -3799,7 +3822,7 @@ class ActiveInferencePolicyEvaluatorV1:
                         if coverage_hard_prepass_active:
                             coverage_pool.sort(
                                 key=lambda entry: (
-                                    bool(_coverage_hard_skip_for_entry(entry)),
+                                    bool(_coverage_effective_hard_skip_for_entry(entry)),
                                     float(_coverage_soft_penalty_for_entry(entry)),
                                     0
                                     if (
@@ -3852,7 +3875,7 @@ class ActiveInferencePolicyEvaluatorV1:
                         else:
                             coverage_pool.sort(
                                 key=lambda entry: (
-                                    bool(_coverage_hard_skip_for_entry(entry)),
+                                    bool(_coverage_effective_hard_skip_for_entry(entry)),
                                     float(_coverage_soft_penalty_for_entry(entry)),
                                     0
                                     if (
@@ -4201,7 +4224,7 @@ class ActiveInferencePolicyEvaluatorV1:
                                     ).get("edge_blocked_rate", 0.0)
                                 ),
                                 "blocked_hard_skip": bool(
-                                    _coverage_hard_skip_for_entry(entry)
+                                    _coverage_effective_hard_skip_for_entry(entry)
                                 ),
                                 "blocked_soft_penalty": float(
                                     coverage_block_profile_by_candidate_id.get(
@@ -4231,6 +4254,17 @@ class ActiveInferencePolicyEvaluatorV1:
                     and bool(focus_features.get("active", False))
                 ):
                     continue
+                predicted_region_stats = self._candidate_predicted_region_stats(
+                    entry.candidate
+                )
+                coverage_profile = self._candidate_coverage_block_profile(
+                    entry.candidate,
+                    predicted_region_stats=predicted_region_stats,
+                )
+                blocked_hard_skip = self._coverage_hard_skip(
+                    profile=coverage_profile,
+                    predicted_region_stats=predicted_region_stats,
+                )
                 high_info_rows.append(
                     {
                         "entry": entry,
@@ -4241,14 +4275,29 @@ class ActiveInferencePolicyEvaluatorV1:
                                 entry.total_efe,
                             )
                         ),
+                        "blocked_hard_skip": bool(blocked_hard_skip),
+                        "blocked_soft_penalty": float(
+                            coverage_profile.get("soft_penalty", 0.0)
+                        ),
+                        "blocked_reasons": list(coverage_profile.get("reasons", [])),
                     }
                 )
             if high_info_rows:
                 high_info_focus_probe_reason = "active_no_override"
-                best_high_info_score = min(float(row["score"]) for row in high_info_rows)
+                safe_high_info_rows = [
+                    row for row in high_info_rows if not bool(row.get("blocked_hard_skip", False))
+                ]
+                candidate_high_info_rows = (
+                    safe_high_info_rows if safe_high_info_rows else high_info_rows
+                )
+                if len(candidate_high_info_rows) < len(high_info_rows):
+                    high_info_focus_probe_reason = "active_blocked_edge_auto_skip"
+                best_high_info_score = min(
+                    float(row["score"]) for row in candidate_high_info_rows
+                )
                 verify_pool = [
                     row
-                    for row in high_info_rows
+                    for row in candidate_high_info_rows
                     if bool(row["features"].get("verify_action_candidate", False))
                 ]
                 if verify_pool:
@@ -4270,7 +4319,7 @@ class ActiveInferencePolicyEvaluatorV1:
                 if not high_info_focus_probe_applied:
                     seek_pool = [
                         row
-                        for row in high_info_rows
+                        for row in candidate_high_info_rows
                         if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
                         and (
                             bool(row["features"].get("moves_toward_target_region", False))
@@ -4302,7 +4351,7 @@ class ActiveInferencePolicyEvaluatorV1:
                 if not high_info_focus_probe_applied:
                     value_pool = [
                         row
-                        for row in high_info_rows
+                        for row in candidate_high_info_rows
                         if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
                         and float(row["features"].get("target_score", 0.0)) >= 0.32
                     ]
@@ -4338,6 +4387,9 @@ class ActiveInferencePolicyEvaluatorV1:
                         "candidate_id": str(row["entry"].candidate.candidate_id),
                         "action_id": int(row["entry"].candidate.action_id),
                         "score": float(row["score"]),
+                        "blocked_hard_skip": bool(row.get("blocked_hard_skip", False)),
+                        "blocked_soft_penalty": float(row.get("blocked_soft_penalty", 0.0)),
+                        "blocked_reasons": list(row.get("blocked_reasons", [])),
                         "stage": str(row["features"].get("stage", "idle")),
                         "current_region_key": str(
                             row["features"].get("current_region_key", "NA")
