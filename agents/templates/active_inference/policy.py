@@ -1760,6 +1760,8 @@ class ActiveInferencePolicyEvaluatorV1:
             "queue_length": int(max(0, raw.get("queue_length", 0))),
             "steps_remaining": int(max(0, raw.get("steps_remaining", 0))),
             "target_score": self._clamp01(float(raw.get("target_score", 0.0))),
+            "target_sample_count": int(max(0, raw.get("target_sample_count", 0))),
+            "remaining_samples": int(max(0, raw.get("remaining_samples", 0))),
             "distance_before": int(raw.get("distance_before", 10**6)),
             "distance_after": int(raw.get("distance_after", 10**6)),
             "distance_delta": int(raw.get("distance_delta", 0)),
@@ -3610,6 +3612,7 @@ class ActiveInferencePolicyEvaluatorV1:
                         seek_pool.sort(
                             key=lambda row: (
                                 0 if bool(row["features"].get("reaches_target_region", False)) else 1,
+                                -int(row["features"].get("remaining_samples", 0)),
                                 int(row["features"].get("distance_after", 10**6)),
                                 -float(row["features"].get("target_score", 0.0)),
                                 -float(row["features"].get("bonus_hint", 0.0)),
@@ -3637,6 +3640,7 @@ class ActiveInferencePolicyEvaluatorV1:
                     if value_pool:
                         value_pool.sort(
                             key=lambda row: (
+                                -int(row["features"].get("remaining_samples", 0)),
                                 -float(row["features"].get("target_score", 0.0)),
                                 -float(row["features"].get("bonus_hint", 0.0)),
                                 int(row["features"].get("distance_after", 10**6)),
@@ -3678,6 +3682,12 @@ class ActiveInferencePolicyEvaluatorV1:
                         "distance_before": int(row["features"].get("distance_before", 10**6)),
                         "distance_after": int(row["features"].get("distance_after", 10**6)),
                         "target_score": float(row["features"].get("target_score", 0.0)),
+                        "target_sample_count": int(
+                            row["features"].get("target_sample_count", 0)
+                        ),
+                        "remaining_samples": int(
+                            row["features"].get("remaining_samples", 0)
+                        ),
                         "moves_toward_target_region": bool(
                             row["features"].get("moves_toward_target_region", False)
                         ),

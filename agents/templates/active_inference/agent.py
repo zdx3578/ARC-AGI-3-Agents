@@ -276,6 +276,10 @@ class ActiveInferenceEFE(Agent):
             64,
             _env_int("ACTIVE_INFERENCE_HIGH_INFO_STRONG_CHANGE_PIXELS", 512),
         )
+        self.high_info_min_samples_per_target = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_MIN_SAMPLES_PER_TARGET", 2),
+        )
         self.enable_empirical_region_override = _env_bool(
             "ACTIVE_INFERENCE_ENABLE_EMPIRICAL_REGION_OVERRIDE",
             True,
@@ -400,6 +404,7 @@ class ActiveInferenceEFE(Agent):
         self._control_schema_counts: dict[str, dict[str, int]] = {}
         self._tracked_agent_token_digest: str | None = None
         self._last_known_agent_pos_region: tuple[int, int] | None = None
+        self._latest_observed_agent_pos_region: tuple[int, int] | None = None
         self._latest_navigation_state_estimate: dict[str, Any] = {}
         self._action_select_count: dict[int, int] = {}
         self._candidate_select_count: dict[str, int] = {}
@@ -470,6 +475,7 @@ class ActiveInferenceEFE(Agent):
             "current_target_region_key": "NA",
             "target_region_queue": [],
             "target_region_scores": {},
+            "target_sample_counts": {},
             "completed_target_regions": [],
             "verify_action_ids": [],
             "last_status": "idle",
@@ -1144,10 +1150,55 @@ class ActiveInferenceEFE(Agent):
             ry = int(region.get("y", -1))
             if rx >= 0 and ry >= 0:
                 return f"{rx}:{ry}"
+        if self._latest_observed_agent_pos_region is not None:
+            rx, ry = self._latest_observed_agent_pos_region
+            return f"{int(rx)}:{int(ry)}"
         if self._last_known_agent_pos_region is not None:
             rx, ry = self._last_known_agent_pos_region
             return f"{int(rx)}:{int(ry)}"
         return "NA"
+
+    def _update_observed_agent_region_from_representation_v1(
+        self,
+        representation: RepresentationStateV1,
+    ) -> None:
+        object_nodes = list(getattr(representation, "object_nodes", []))
+        if not object_nodes:
+            return
+        candidates = [
+            node
+            for node in object_nodes
+            if int(getattr(node, "color", -1)) == 12 and int(getattr(node, "area", 0)) > 0
+        ]
+        if not candidates:
+            return
+        last_region = self._last_known_agent_pos_region
+        last_cx = None
+        last_cy = None
+        if last_region is not None:
+            last_cx = (int(last_region[0]) * 8) + 4
+            last_cy = (int(last_region[1]) * 8) + 4
+        best_node = None
+        best_score = float("inf")
+        for node in candidates:
+            area = int(getattr(node, "area", 0))
+            cx = int(getattr(node, "centroid_x", -1))
+            cy = int(getattr(node, "centroid_y", -1))
+            if cx < 0 or cy < 0:
+                continue
+            score = float(abs(area - 10))
+            if bool(getattr(node, "touches_boundary", False)):
+                score += 15.0
+            if last_cx is not None and last_cy is not None:
+                score += 0.08 * float(abs(cx - int(last_cx)) + abs(cy - int(last_cy)))
+            if score < best_score:
+                best_score = float(score)
+                best_node = node
+        if best_node is None:
+            return
+        rx = int(max(0, min(7, int(best_node.centroid_x) // 8)))
+        ry = int(max(0, min(7, int(best_node.centroid_y) // 8)))
+        self._latest_observed_agent_pos_region = (int(rx), int(ry))
 
     def _navigation_semantic_features_v1(self) -> dict[str, Any]:
         compare_count = int(max(0, self._navigation_semantic_compare_count))
@@ -1238,6 +1289,9 @@ class ActiveInferenceEFE(Agent):
         scores = state.get("target_region_scores", {})
         if not isinstance(scores, dict):
             scores = {}
+        sample_counts = state.get("target_sample_counts", {})
+        if not isinstance(sample_counts, dict):
+            sample_counts = {}
         return {
             "schema_name": "active_inference_high_info_focus_state_v1",
             "schema_version": 1,
@@ -1258,6 +1312,10 @@ class ActiveInferenceEFE(Agent):
             "target_region_scores": {
                 str(k): float(v)
                 for (k, v) in sorted(scores.items(), key=lambda item: str(item[0]))[:16]
+            },
+            "target_sample_counts": {
+                str(k): int(max(0, v))
+                for (k, v) in sorted(sample_counts.items(), key=lambda item: str(item[0]))[:32]
             },
             "completed_target_regions": [str(v) for v in completed[-8:]],
             "verify_action_ids": [int(v) for v in verify_action_ids],
@@ -1499,6 +1557,13 @@ class ActiveInferenceEFE(Agent):
             if isinstance(state.get("target_region_scores", {}), dict)
             else 0.0
         )
+        sample_counts = state.get("target_sample_counts", {})
+        if not isinstance(sample_counts, dict):
+            sample_counts = {}
+        target_sample_count = int(max(0, sample_counts.get(target_region_key, 0)))
+        remaining_samples = int(
+            max(0, int(self.high_info_min_samples_per_target) - int(target_sample_count))
+        )
         bonus_hint = 0.0
         penalty_hint = 0.0
         if bool(state.get("active", False)):
@@ -1513,6 +1578,8 @@ class ActiveInferenceEFE(Agent):
                     penalty_hint += 0.45
             elif str(state.get("stage", "idle")) == "verify":
                 penalty_hint += 0.20
+            if remaining_samples > 0:
+                bonus_hint += float(min(0.45, 0.15 * float(remaining_samples)))
         urgency = float(
             min(
                 1.0,
@@ -1539,6 +1606,8 @@ class ActiveInferenceEFE(Agent):
             "queue_length": int(len(state.get("target_region_queue", []))),
             "steps_remaining": int(max(0, state.get("steps_remaining", 0))),
             "target_score": float(target_score),
+            "target_sample_count": int(target_sample_count),
+            "remaining_samples": int(remaining_samples),
             "distance_before": int(distance_before),
             "distance_after": int(distance_after),
             "distance_delta": int(distance_delta),
@@ -1816,6 +1885,15 @@ class ActiveInferenceEFE(Agent):
         completed_regions = [
             str(v) for v in completed_regions if self._parse_region_key_v1(str(v)) is not None
         ][-16:]
+        target_sample_counts = state.get("target_sample_counts", {})
+        if not isinstance(target_sample_counts, dict):
+            target_sample_counts = {}
+        target_sample_counts = {
+            str(k): int(max(0, v))
+            for (k, v) in target_sample_counts.items()
+            if self._parse_region_key_v1(str(k)) is not None
+        }
+        min_samples_per_target = int(max(1, self.high_info_min_samples_per_target))
 
         source_region_key = "NA"
         if transition_record is not None:
@@ -1873,28 +1951,33 @@ class ActiveInferenceEFE(Agent):
                     float(score),
                 )
 
-            if executed_candidate is not None:
-                nav_target = executed_candidate.metadata.get("navigation_target_features_v1", {})
-                if isinstance(nav_target, dict):
-                    cross_region = nav_target.get("cross_like_target_region", {})
-                    if isinstance(cross_region, dict):
-                        cross_rx = int(cross_region.get("x", -1))
-                        cross_ry = int(cross_region.get("y", -1))
-                        if cross_rx >= 0 and cross_ry >= 0:
-                            key = f"{cross_rx}:{cross_ry}"
+            changed_bbox = getattr(causal_signature, "changed_bbox", None)
+            frame_height = int(len(current_packet.frame))
+            frame_width = int(len(current_packet.frame[0])) if frame_height > 0 else 0
+            frame_area = int(max(1, frame_height * frame_width))
+            if (
+                isinstance(changed_bbox, dict)
+                and frame_height > 0
+                and frame_width > 0
+                and int(changed_pixels) < int(0.65 * float(frame_area))
+            ):
+                min_x = int(changed_bbox.get("min_x", -1))
+                max_x = int(changed_bbox.get("max_x", -1))
+                min_y = int(changed_bbox.get("min_y", -1))
+                max_y = int(changed_bbox.get("max_y", -1))
+                if min_x >= 0 and max_x >= min_x and min_y >= 0 and max_y >= min_y:
+                    min_rx = int(max(0, min(7, min_x // 8)))
+                    max_rx = int(max(0, min(7, max_x // 8)))
+                    min_ry = int(max(0, min(7, min_y // 8)))
+                    max_ry = int(max(0, min(7, max_y // 8)))
+                    bbox_bonus = float(min(0.22, float(changed_pixels) / 1024.0))
+                    for ry in range(min_ry, max_ry + 1):
+                        for rx in range(min_rx, max_rx + 1):
+                            key = f"{int(rx)}:{int(ry)}"
+                            row_bias = 0.06 if int(ry) <= 2 else 0.0
                             target_scores_local[key] = max(
                                 float(target_scores_local.get(key, 0.0)),
-                                0.66,
-                            )
-                    primary_target = nav_target.get("target_region", {})
-                    if isinstance(primary_target, dict):
-                        tx = int(primary_target.get("x", -1))
-                        ty = int(primary_target.get("y", -1))
-                        if tx >= 0 and ty >= 0:
-                            key = f"{tx}:{ty}"
-                            target_scores_local[key] = max(
-                                float(target_scores_local.get(key, 0.0)),
-                                0.56,
+                                float(0.52 + bbox_bonus + row_bias),
                             )
             return target_scores_local
 
@@ -1903,9 +1986,11 @@ class ActiveInferenceEFE(Agent):
             *,
             anchor_region_key: str,
             completed_recent: set[str],
+            sample_counts: dict[str, int],
+            min_samples: int,
         ) -> list[str]:
             current_target = str(state.get("current_target_region_key", "NA"))
-            rows: list[tuple[int, int, float, int, int, str]] = []
+            rows: list[tuple[int, int, int, float, int, int, str]] = []
             for region_key, score in target_scores_raw.items():
                 region_key = str(region_key)
                 if self._parse_region_key_v1(region_key) is None:
@@ -1913,13 +1998,19 @@ class ActiveInferenceEFE(Agent):
                 score_value = float(score)
                 if score_value <= 0.0:
                     continue
+                sample_count = int(max(0, sample_counts.get(region_key, 0)))
+                remaining_samples = int(max(0, int(min_samples) - sample_count))
                 carry_priority = 0 if region_key == current_target else 1
                 completed_priority = 1 if region_key in completed_recent else 0
+                remaining_priority = 0 if remaining_samples > 0 else 1
+                unsampled_bonus = 0.12 if sample_count <= 0 else 0.0
+                adjusted_score = float(score_value + unsampled_bonus)
                 rows.append(
                     (
+                        int(remaining_priority),
                         int(carry_priority),
                         int(completed_priority),
-                        float(-score_value),
+                        float(-adjusted_score),
                         int(self._region_distance_v1(str(anchor_region_key), region_key)),
                         int(self._region_visit_counts.get(region_key, 0)),
                         region_key,
@@ -1968,6 +2059,7 @@ class ActiveInferenceEFE(Agent):
         if not bool(state.get("active", False)):
             state["target_region_scores"] = dict(score_memory)
             state["completed_target_regions"] = list(completed_regions[-16:])
+            state["target_sample_counts"] = dict(target_sample_counts)
             return
 
         if not score_memory:
@@ -1980,6 +2072,8 @@ class ActiveInferenceEFE(Agent):
             score_memory,
             anchor_region_key=str(anchor_key),
             completed_recent=completed_recent,
+            sample_counts=target_sample_counts,
+            min_samples=int(min_samples_per_target),
         )
         if not queue:
             state["active"] = False
@@ -1991,6 +2085,7 @@ class ActiveInferenceEFE(Agent):
             state["completion_count"] = int(state.get("completion_count", 0) + 1)
             state["last_status"] = "completed"
             state["completed_target_regions"] = list(completed_regions[-16:])
+            state["target_sample_counts"] = dict(target_sample_counts)
             return
 
         deadline = int(state.get("deadline_action_counter", current_counter))
@@ -2000,28 +2095,49 @@ class ActiveInferenceEFE(Agent):
         state["target_region_queue"] = list(queue)
         state["target_region_scores"] = dict(score_memory)
         state["completed_target_regions"] = list(completed_regions[-16:])
+        state["target_sample_counts"] = dict(target_sample_counts)
         state["stage"] = "seek"
         in_target_region = bool(str(nav_region_key) == str(target_region_key))
         if in_target_region:
-            if not completed_regions or str(completed_regions[-1]) != str(target_region_key):
-                completed_regions.append(str(target_region_key))
-            completed_regions = completed_regions[-16:]
-            state["completed_target_regions"] = list(completed_regions)
+            sample_delta = 1 if (str(obs_change_type) != "NO_CHANGE" or int(changed_pixels) >= 2) else 0
+            target_sample_counts[str(target_region_key)] = int(
+                max(0, target_sample_counts.get(str(target_region_key), 0)) + int(sample_delta)
+            )
+            sample_count = int(max(0, target_sample_counts.get(str(target_region_key), 0)))
+            remaining_samples = int(max(0, int(min_samples_per_target) - sample_count))
+            if remaining_samples <= 0:
+                if not completed_regions or str(completed_regions[-1]) != str(target_region_key):
+                    completed_regions.append(str(target_region_key))
+                completed_regions = completed_regions[-16:]
+                state["completed_target_regions"] = list(completed_regions)
             if str(target_region_key) in score_memory:
-                score_memory[str(target_region_key)] = float(
-                    max(0.10, 0.72 * float(score_memory.get(str(target_region_key), 0.0)))
-                )
+                if remaining_samples <= 0:
+                    score_memory[str(target_region_key)] = float(
+                        max(0.10, 0.72 * float(score_memory.get(str(target_region_key), 0.0)))
+                    )
+                else:
+                    score_memory[str(target_region_key)] = float(
+                        max(0.56, float(score_memory.get(str(target_region_key), 0.0)))
+                    )
             refreshed_queue = _rank_queue(
                 score_memory,
                 anchor_region_key=str(nav_region_key),
                 completed_recent=set(str(v) for v in completed_regions[-8:]),
+                sample_counts=target_sample_counts,
+                min_samples=int(min_samples_per_target),
             )
-            refreshed_queue = [str(v) for v in refreshed_queue if str(v) != str(target_region_key)]
+            if remaining_samples <= 0:
+                refreshed_queue = [str(v) for v in refreshed_queue if str(v) != str(target_region_key)]
             if refreshed_queue:
                 state["target_region_queue"] = list(refreshed_queue)
                 state["current_target_region_key"] = str(refreshed_queue[0])
                 state["target_region_scores"] = dict(score_memory)
-                state["last_status"] = "target_sampled"
+                state["target_sample_counts"] = dict(target_sample_counts)
+                state["last_status"] = (
+                    "target_sampled"
+                    if remaining_samples <= 0
+                    else "target_resample_pending"
+                )
             else:
                 state["active"] = False
                 state["stage"] = "idle"
@@ -2029,6 +2145,7 @@ class ActiveInferenceEFE(Agent):
                 state["current_target_region_key"] = "NA"
                 state["target_region_queue"] = []
                 state["target_region_scores"] = {}
+                state["target_sample_counts"] = dict(target_sample_counts)
                 state["completion_count"] = int(state.get("completion_count", 0) + 1)
                 state["last_status"] = "completed"
 
@@ -3831,6 +3948,7 @@ class ActiveInferenceEFE(Agent):
                 connectivity=self.component_connectivity,
                 max_action6_points=self.max_action6_points,
             )
+            self._update_observed_agent_region_from_representation_v1(representation)
             diagnostics.finish_ok(
                 "representation_build",
                 {
