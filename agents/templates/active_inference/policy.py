@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from .contracts import (
@@ -39,6 +40,12 @@ class ActiveInferencePolicyEvaluatorV1:
         stagnation_probe_min_action_usage_gap: int = 8,
         rollout_max_candidates: int = 8,
         rollout_only_in_exploit: bool = True,
+        region_revisit_hard_threshold: int = 24,
+        sequence_rollout_frontier_weight: float = 0.35,
+        sequence_rollout_direction_weight: float = 0.25,
+        sequence_probe_score_margin: float = 0.28,
+        sequence_probe_trigger_steps: int = 20,
+        hierarchy_weight_overrides: dict[str, dict[str, float]] | None = None,
     ) -> None:
         self.explore_steps = int(max(1, explore_steps))
         self.exploit_entropy_threshold = float(max(0.0, exploit_entropy_threshold))
@@ -68,6 +75,657 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         self.rollout_max_candidates = int(max(1, rollout_max_candidates))
         self.rollout_only_in_exploit = bool(rollout_only_in_exploit)
+        self.region_revisit_hard_threshold = int(max(4, region_revisit_hard_threshold))
+        self.sequence_rollout_frontier_weight = float(
+            max(0.0, sequence_rollout_frontier_weight)
+        )
+        self.sequence_rollout_direction_weight = float(
+            max(0.0, sequence_rollout_direction_weight)
+        )
+        self.sequence_probe_score_margin = float(max(0.0, sequence_probe_score_margin))
+        self.sequence_probe_trigger_steps = int(max(1, sequence_probe_trigger_steps))
+        self.hierarchy_weight_overrides = hierarchy_weight_overrides or {}
+
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return float(max(0.0, min(1.0, value)))
+
+    @staticmethod
+    def _scaled_weight(base_value: float, factor: float) -> float:
+        return float(max(0.0, float(base_value) * max(0.0, float(factor))))
+
+    @staticmethod
+    def _opposite_direction_bucket(direction_bucket: str) -> str:
+        mapping = {
+            "dir_l": "dir_r",
+            "dir_r": "dir_l",
+            "dir_u": "dir_d",
+            "dir_d": "dir_u",
+        }
+        return str(mapping.get(str(direction_bucket), "dir_unknown"))
+
+    def _hierarchy_weights_for_phase(self, phase: str) -> dict[str, float]:
+        # Layerwise EFE shaping terms:
+        # - progress_risk: L2 task-level pressure (no progress under repeated interactions)
+        # - operability_risk: L1 control-level pressure (blocked / uncontrollable outcomes)
+        # - habit_risk: L2 anti-attractor pressure (over-used action under no progress)
+        # - progress_information_gain: L2 epistemic term (reward mechanisms that reduce
+        #   progress uncertainty)
+        defaults: dict[str, float]
+        if phase == "explore":
+            defaults = {
+                "progress_risk": 0.16,
+                "operability_risk": 0.10,
+                "habit_risk": 0.20,
+                "progress_information_gain": 0.10,
+            }
+        elif phase == "explain":
+            defaults = {
+                "progress_risk": 0.30,
+                "operability_risk": 0.14,
+                "habit_risk": 0.32,
+                "progress_information_gain": 0.12,
+            }
+        else:
+            defaults = {
+                "progress_risk": 0.55,
+                "operability_risk": 0.20,
+                "habit_risk": 0.40,
+                "progress_information_gain": 0.12,
+            }
+        out = dict(defaults)
+        override = self.hierarchy_weight_overrides.get(phase, {})
+        for key in out:
+            if key not in override:
+                continue
+            try:
+                out[key] = float(override[key])
+            except Exception:
+                continue
+        return out
+
+    def _signature_probability_mass(
+        self,
+        predictive_distribution: dict[str, float],
+        *,
+        token_in_signature: str,
+    ) -> float:
+        mass = 0.0
+        for signature_key, probability in predictive_distribution.items():
+            if token_in_signature not in str(signature_key):
+                continue
+            try:
+                mass += float(probability)
+            except Exception:
+                continue
+        return float(max(0.0, min(1.0, mass)))
+
+    def _hierarchical_efe_terms(
+        self,
+        *,
+        packet: ObservationPacketV1,
+        candidate: ActionCandidateV1,
+        predictive_distribution: dict[str, float],
+        risk_value: float,
+        ambiguity: float,
+        ig_action_semantics: float,
+        ig_mechanism_dynamics: float,
+        ig_causal_mapping: float,
+    ) -> dict[str, Any]:
+        # Level 0 (perception/outcome-shape): map to existing risk/ambiguity and
+        # action-semantics information gain.
+        level0 = {
+            "risk": float(max(0.0, risk_value)),
+            "ambiguity": float(max(0.0, ambiguity)),
+            "information_gain": float(max(0.0, ig_action_semantics)),
+        }
+
+        blocked_probability = self._signature_probability_mass(
+            predictive_distribution,
+            token_in_signature="|delta=blocked",
+        )
+        translation_probability = self._signature_probability_mass(
+            predictive_distribution,
+            token_in_signature="type=CC_TRANSLATION|progress=0",
+        )
+        no_change_probability = self._signature_probability_mass(
+            predictive_distribution,
+            token_in_signature="type=NO_CHANGE|progress=0",
+        )
+        progress_probability = self._signature_probability_mass(
+            predictive_distribution,
+            token_in_signature="progress=1",
+        )
+        progress_gap = int(max(0, int(packet.win_levels) - int(packet.levels_completed)))
+        progress_gap_ratio = float(progress_gap / float(max(1, int(packet.win_levels))))
+
+        blocked_edge_stats = candidate.metadata.get("blocked_edge_observed_stats", {})
+        if not isinstance(blocked_edge_stats, dict):
+            blocked_edge_stats = {}
+        transition_stats = candidate.metadata.get("transition_exploration_stats", {})
+        if not isinstance(transition_stats, dict):
+            transition_stats = {}
+
+        action_attempts = int(max(0, blocked_edge_stats.get("action_attempts", 0)))
+        edge_attempts = int(max(0, blocked_edge_stats.get("edge_attempts", 0)))
+        action_blocked_rate = float(
+            max(0.0, min(1.0, blocked_edge_stats.get("action_blocked_rate", 0.0)))
+        )
+        action_moved_rate = float(
+            max(0.0, min(1.0, blocked_edge_stats.get("action_moved_rate", 0.0)))
+        )
+        edge_blocked_rate = float(
+            max(0.0, min(1.0, blocked_edge_stats.get("edge_blocked_rate", 0.0)))
+        )
+        region_revisit_count = int(max(0, blocked_edge_stats.get("region_revisit_count_current", 0)))
+        state_visit_count = int(max(0, transition_stats.get("state_visit_count", 0)))
+        state_action_visit_count = int(max(0, transition_stats.get("state_action_visit_count", 0)))
+        state_outgoing_edge_count = int(
+            max(0, transition_stats.get("state_outgoing_edge_count", 0))
+        )
+        region_revisit_ratio = float(
+            min(
+                1.0,
+                float(region_revisit_count)
+                / float(max(1, self.region_revisit_hard_threshold)),
+            )
+        )
+        region_novelty = float(max(0.0, 1.0 - region_revisit_ratio))
+        action_frontier_novelty = float(
+            max(0.0, 1.0 - min(1.0, float(action_attempts) / 10.0))
+        )
+        edge_frontier_novelty = float(
+            max(0.0, 1.0 - min(1.0, float(edge_attempts) / 8.0))
+        )
+        state_action_frontier_novelty = float(
+            max(0.0, 1.0 - min(1.0, float(state_action_visit_count) / 4.0))
+        )
+        state_outgoing_frontier_novelty = float(
+            max(0.0, 1.0 - min(1.0, float(state_outgoing_edge_count) / 6.0))
+        )
+        frontier_novelty = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (0.35 * action_frontier_novelty)
+                    + (0.20 * edge_frontier_novelty)
+                    + (0.30 * state_action_frontier_novelty)
+                    + (0.15 * state_outgoing_frontier_novelty),
+                ),
+            )
+        )
+        region_revisit_hard_penalty_raw = float(
+            max(
+                0.0,
+                (
+                    float(region_revisit_count - int(self.region_revisit_hard_threshold) + 1)
+                    / float(max(1, int(self.region_revisit_hard_threshold)))
+                ),
+            )
+        )
+        # Saturating penalty keeps anti-loop pressure without exploding magnitudes.
+        region_revisit_hard_penalty = float(
+            region_revisit_hard_penalty_raw / (1.0 + region_revisit_hard_penalty_raw)
+        )
+        evidence_count_effective = int(max(action_attempts, state_action_visit_count))
+        evidence_confidence = float(
+            1.0 - math.exp(-float(evidence_count_effective) / 10.0)
+        )
+        evidence_confidence = self._clamp01(evidence_confidence)
+        evidence_novelty = float(max(0.0, 1.0 - evidence_confidence))
+        if evidence_count_effective < 4:
+            evidence_regime = "few_shot"
+        elif evidence_count_effective < 12:
+            evidence_regime = "forming"
+        elif evidence_count_effective < 24:
+            evidence_regime = "stable"
+        else:
+            evidence_regime = "saturated"
+
+        navigation_target = candidate.metadata.get("navigation_target_features_v1", {})
+        if not isinstance(navigation_target, dict):
+            navigation_target = {}
+        key_target_enabled = bool(navigation_target.get("enabled", False))
+        key_target_direction_bucket = str(
+            navigation_target.get("target_direction_bucket", "dir_unknown")
+        )
+        key_target_salience = self._clamp01(
+            float(navigation_target.get("target_salience", 0.0))
+        )
+        key_target_kind = str(navigation_target.get("target_kind", "unknown"))
+        key_target_distance_before_raw = float(
+            navigation_target.get("distance_before", -1.0)
+        )
+        key_target_distance_before = float(
+            key_target_distance_before_raw if key_target_distance_before_raw >= 0.0 else -1.0
+        )
+        key_target_valid_direction = bool(
+            key_target_direction_bucket in ("dir_l", "dir_r", "dir_u", "dir_d")
+        )
+        key_target_toward_probability = 0.0
+        key_target_away_probability = 0.0
+        key_target_expected_distance_delta = 0.0
+        key_target_expected_distance_after = float(
+            key_target_distance_before if key_target_distance_before >= 0.0 else -1.0
+        )
+        key_target_direction_alignment = 0.0
+        key_target_escape_bonus = 0.0
+        key_target_away_penalty = 0.0
+        if key_target_enabled and key_target_valid_direction and key_target_salience > 0.0:
+            key_target_toward_probability = self._signature_probability_mass(
+                predictive_distribution,
+                token_in_signature=f"|delta={key_target_direction_bucket}",
+            )
+            opposite_bucket = self._opposite_direction_bucket(key_target_direction_bucket)
+            key_target_away_probability = self._signature_probability_mass(
+                predictive_distribution,
+                token_in_signature=f"|delta={opposite_bucket}",
+            )
+            key_target_expected_distance_delta = float(
+                key_target_away_probability - key_target_toward_probability
+            )
+            if key_target_distance_before >= 0.0:
+                key_target_expected_distance_after = float(
+                    max(0.0, key_target_distance_before + key_target_expected_distance_delta)
+                )
+            key_target_direction_alignment = float(
+                max(-1.0, min(1.0, key_target_toward_probability - key_target_away_probability))
+            )
+            key_target_escape_bonus = float(
+                max(0.0, -key_target_expected_distance_delta) * key_target_salience
+            )
+            key_target_away_penalty = float(
+                max(0.0, key_target_expected_distance_delta) * key_target_salience
+            )
+
+        # Level 1 (operability/control): risk captures blocked tendencies and
+        # control uncertainty in movement outcomes.
+        same_region_translation_penalty = float(
+            max(
+                0.0,
+                translation_probability
+                * region_revisit_ratio
+                * (0.45 + (0.55 * action_moved_rate)),
+            )
+        )
+        operability_risk = float(
+            max(
+                0.0,
+                (0.60 * blocked_probability)
+                + (0.25 * action_blocked_rate)
+                + (0.15 * edge_blocked_rate),
+            )
+        )
+        operability_risk = float(
+            max(
+                0.0,
+                operability_risk + (0.70 * same_region_translation_penalty),
+            )
+        )
+        operability_risk = float(
+            max(
+                0.0,
+                operability_risk
+                + (0.25 * key_target_away_penalty)
+                - (
+                    0.30
+                    * key_target_escape_bonus
+                    * max(0.25, float(translation_probability))
+                ),
+            )
+        )
+        level1 = {
+            "risk": float(operability_risk),
+            "ambiguity": float(max(0.0, ambiguity)),
+            "information_gain": float(max(0.0, ig_mechanism_dynamics)),
+            "blocked_probability": float(blocked_probability),
+            "action_blocked_rate": float(action_blocked_rate),
+            "action_moved_rate": float(action_moved_rate),
+            "edge_blocked_rate": float(edge_blocked_rate),
+            "same_region_translation_penalty": float(same_region_translation_penalty),
+            "key_target_enabled": bool(key_target_enabled),
+            "key_target_kind": str(key_target_kind),
+            "key_target_salience": float(key_target_salience),
+            "key_target_direction_bucket": str(key_target_direction_bucket),
+            "key_target_toward_probability": float(key_target_toward_probability),
+            "key_target_away_probability": float(key_target_away_probability),
+            "key_target_direction_alignment": float(key_target_direction_alignment),
+            "key_target_expected_distance_delta": float(key_target_expected_distance_delta),
+            "key_target_expected_distance_after": float(key_target_expected_distance_after),
+        }
+
+        # Level 2 (task/progress): penalize repetitive no-progress attractors.
+        no_progress_probability = float(max(0.0, min(1.0, 1.0 - progress_probability)))
+        translation_no_progress_probability_amplified = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    translation_probability * (1.0 + (0.90 * region_revisit_ratio)),
+                ),
+            )
+        )
+        stagnation_context = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (
+                        0.30 * min(1.0, float(region_revisit_count) / 24.0)
+                        + 0.50 * min(1.0, float(state_action_visit_count) / 8.0)
+                        + 0.20 * (1.0 - frontier_novelty)
+                    ),
+                ),
+            )
+        )
+        action_repeat_ratio = float(
+            min(1.0, float(action_attempts) / 40.0)
+        )
+        repeated_no_progress_penalty = float(
+            max(
+                0.0,
+                action_repeat_ratio
+                * max(
+                    no_change_probability,
+                    translation_no_progress_probability_amplified,
+                )
+                * (0.35 + (0.65 * region_revisit_ratio)),
+            )
+        )
+        habit_pressure = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (
+                        0.60
+                        * (
+                            math.log1p(float(action_attempts))
+                            / max(1.0, math.log1p(80.0))
+                        )
+                        + 0.25 * stagnation_context
+                        + 0.15 * region_revisit_ratio
+                    ),
+                ),
+            )
+        )
+        leave_high_revisit_potential = float(
+            max(
+                0.0,
+                translation_probability
+                * frontier_novelty
+                * (0.35 + (0.65 * region_revisit_ratio)),
+            )
+        )
+        progress_risk = float(
+            max(
+                0.0,
+                progress_gap_ratio
+                * (
+                    (0.35 * no_progress_probability * (0.5 + (0.5 * region_revisit_ratio)))
+                    + (0.35 * translation_no_progress_probability_amplified)
+                    + (0.18 * (1.0 - frontier_novelty))
+                    + (0.12 * region_revisit_hard_penalty)
+                    + (0.20 * repeated_no_progress_penalty)
+                    + (0.18 * key_target_away_penalty)
+                    - (0.25 * leave_high_revisit_potential)
+                    - (0.30 * key_target_escape_bonus)
+                ),
+            )
+        )
+        habit_risk = float(
+            max(
+                0.0,
+                progress_gap_ratio
+                * no_progress_probability
+                * ((0.65 * habit_pressure) + (0.35 * region_revisit_ratio)),
+            )
+        )
+        habit_risk += float(
+            max(
+                0.0,
+                progress_gap_ratio * no_progress_probability * region_revisit_hard_penalty,
+            )
+        )
+        habit_risk += float(
+            max(0.0, 0.70 * repeated_no_progress_penalty)
+        )
+        habit_risk += float(max(0.0, 0.25 * key_target_away_penalty))
+        habit_risk = float(max(0.0, habit_risk - (0.22 * key_target_escape_bonus)))
+        progress_information_gain = float(
+            max(
+                0.0,
+                ig_causal_mapping
+                * (0.5 + (0.5 * progress_gap_ratio))
+                * (
+                    0.30
+                    + (0.45 * frontier_novelty)
+                    + (0.25 * evidence_novelty)
+                    + (0.20 * key_target_escape_bonus)
+                ),
+            )
+        )
+        level2 = {
+            "risk": float(progress_risk),
+            "habit_risk": float(habit_risk),
+            "ambiguity": float(no_progress_probability),
+            "information_gain": float(progress_information_gain),
+            "progress_probability": float(progress_probability),
+            "translation_no_progress_probability": float(translation_probability),
+            "translation_no_progress_probability_amplified": float(
+                translation_no_progress_probability_amplified
+            ),
+            "no_change_probability": float(no_change_probability),
+            "progress_gap_ratio": float(progress_gap_ratio),
+            "action_attempts": int(action_attempts),
+            "edge_attempts": int(edge_attempts),
+            "state_visit_count": int(state_visit_count),
+            "state_action_visit_count": int(state_action_visit_count),
+            "state_outgoing_edge_count": int(state_outgoing_edge_count),
+            "region_revisit_count_current": int(region_revisit_count),
+            "region_revisit_ratio": float(region_revisit_ratio),
+            "region_novelty": float(region_novelty),
+            "frontier_novelty": float(frontier_novelty),
+            "region_revisit_hard_penalty": float(region_revisit_hard_penalty),
+            "region_revisit_hard_penalty_raw": float(region_revisit_hard_penalty_raw),
+            "leave_high_revisit_potential": float(leave_high_revisit_potential),
+            "stagnation_context": float(stagnation_context),
+            "habit_pressure": float(habit_pressure),
+            "action_repeat_ratio": float(action_repeat_ratio),
+            "repeated_no_progress_penalty": float(repeated_no_progress_penalty),
+            "evidence_count_effective": int(evidence_count_effective),
+            "evidence_confidence": float(evidence_confidence),
+            "evidence_novelty": float(evidence_novelty),
+            "evidence_regime": str(evidence_regime),
+            "key_target_enabled": bool(key_target_enabled),
+            "key_target_kind": str(key_target_kind),
+            "key_target_salience": float(key_target_salience),
+            "key_target_direction_bucket": str(key_target_direction_bucket),
+            "key_target_distance_before": float(key_target_distance_before),
+            "key_target_toward_probability": float(key_target_toward_probability),
+            "key_target_away_probability": float(key_target_away_probability),
+            "key_target_direction_alignment": float(key_target_direction_alignment),
+            "key_target_expected_distance_delta": float(key_target_expected_distance_delta),
+            "key_target_expected_distance_after": float(key_target_expected_distance_after),
+            "key_target_escape_bonus": float(key_target_escape_bonus),
+            "key_target_away_penalty": float(key_target_away_penalty),
+        }
+
+        return {
+            "schema_name": "active_inference_hierarchical_efe_terms_v1",
+            "schema_version": 1,
+            "levels": {
+                "level0_perception": level0,
+                "level1_operability": level1,
+                "level2_progress": level2,
+            },
+        }
+
+    def _adaptive_objective_profile(
+        self,
+        *,
+        phase: str,
+        base_weights: dict[str, float],
+        base_hierarchy_weights: dict[str, float],
+        level1_terms: dict[str, Any],
+        level2_terms: dict[str, Any],
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, Any]]:
+        weights = {str(k): float(v) for (k, v) in base_weights.items()}
+        hierarchy_weights = {
+            str(k): float(v) for (k, v) in base_hierarchy_weights.items()
+        }
+        progress_probability = self._clamp01(float(level2_terms.get("progress_probability", 0.0)))
+        no_progress_signal = float(max(0.0, 1.0 - progress_probability))
+        blocked_probability = self._clamp01(float(level1_terms.get("blocked_probability", 0.0)))
+        region_revisit_ratio = self._clamp01(float(level2_terms.get("region_revisit_ratio", 0.0)))
+        stagnation_context = self._clamp01(float(level2_terms.get("stagnation_context", 0.0)))
+        habit_pressure = self._clamp01(float(level2_terms.get("habit_pressure", 0.0)))
+        translation_no_progress_amplified = self._clamp01(
+            float(level2_terms.get("translation_no_progress_probability_amplified", 0.0))
+        )
+        evidence_novelty = self._clamp01(float(level2_terms.get("evidence_novelty", 0.0)))
+        evidence_confidence = self._clamp01(float(level2_terms.get("evidence_confidence", 0.0)))
+        stuck_score = self._clamp01(
+            (0.30 * stagnation_context)
+            + (0.30 * region_revisit_ratio)
+            + (0.25 * translation_no_progress_amplified)
+            + (0.15 * habit_pressure)
+        )
+
+        phase_focus = "balanced"
+        explain_escape_pressure = 0.0
+        if phase == "explore":
+            phase_focus = "epistemic_first"
+            weights["risk"] = self._scaled_weight(
+                weights["risk"],
+                max(0.70, 1.0 - (0.25 * evidence_novelty)),
+            )
+            weights["information_gain_mechanism_dynamics"] = self._scaled_weight(
+                weights["information_gain_mechanism_dynamics"],
+                1.0 + (0.85 * evidence_novelty) + (0.35 * stuck_score),
+            )
+            weights["information_gain_causal_mapping"] = self._scaled_weight(
+                weights["information_gain_causal_mapping"],
+                1.0 + (0.55 * evidence_novelty) + (0.35 * stuck_score),
+            )
+            hierarchy_weights["progress_information_gain"] = self._scaled_weight(
+                hierarchy_weights["progress_information_gain"],
+                1.0 + (0.60 * evidence_novelty) + (0.25 * stuck_score),
+            )
+            hierarchy_weights["progress_risk"] = self._scaled_weight(
+                hierarchy_weights["progress_risk"],
+                1.0 + (0.25 * stuck_score),
+            )
+        elif phase == "explain":
+            phase_focus = "mechanism_disambiguation"
+            explain_escape_pressure = self._clamp01(
+                (0.55 * stagnation_context) + (0.45 * region_revisit_ratio)
+            )
+            weights["ambiguity"] = self._scaled_weight(
+                weights["ambiguity"],
+                1.0 + (0.20 * evidence_novelty),
+            )
+            weights["information_gain_mechanism_dynamics"] = self._scaled_weight(
+                weights["information_gain_mechanism_dynamics"],
+                max(
+                    0.60,
+                    1.0
+                    + (0.20 * evidence_novelty)
+                    - (0.55 * evidence_confidence)
+                    - (0.45 * explain_escape_pressure),
+                ),
+            )
+            weights["information_gain_causal_mapping"] = self._scaled_weight(
+                weights["information_gain_causal_mapping"],
+                max(
+                    0.65,
+                    1.0
+                    + (0.15 * evidence_novelty)
+                    - (0.35 * evidence_confidence)
+                    - (0.25 * explain_escape_pressure),
+                ),
+            )
+            hierarchy_weights["operability_risk"] = self._scaled_weight(
+                hierarchy_weights["operability_risk"],
+                1.0 + (0.50 * blocked_probability),
+            )
+            hierarchy_weights["progress_risk"] = self._scaled_weight(
+                hierarchy_weights["progress_risk"],
+                1.0 + (0.45 * explain_escape_pressure),
+            )
+            hierarchy_weights["habit_risk"] = self._scaled_weight(
+                hierarchy_weights["habit_risk"],
+                1.0 + (0.55 * explain_escape_pressure),
+            )
+            hierarchy_weights["progress_information_gain"] = self._scaled_weight(
+                hierarchy_weights["progress_information_gain"],
+                max(
+                    0.70,
+                    1.0
+                    + (0.20 * evidence_novelty)
+                    - (0.30 * evidence_confidence),
+                ),
+            )
+        else:
+            phase_focus = "progress_with_escape"
+            # When stuck, reduce rigid risk pressure to allow escape rollouts.
+            if stuck_score > 0.55:
+                weights["risk"] = self._scaled_weight(weights["risk"], 0.88)
+            else:
+                weights["risk"] = self._scaled_weight(
+                    weights["risk"],
+                    1.0 + (0.20 * (1.0 - stuck_score)),
+                )
+            weights["information_gain_mechanism_dynamics"] = self._scaled_weight(
+                weights["information_gain_mechanism_dynamics"],
+                1.0 + (0.55 * stuck_score * no_progress_signal),
+            )
+            weights["information_gain_causal_mapping"] = self._scaled_weight(
+                weights["information_gain_causal_mapping"],
+                1.0 + (0.45 * stuck_score * no_progress_signal),
+            )
+            hierarchy_weights["progress_risk"] = self._scaled_weight(
+                hierarchy_weights["progress_risk"],
+                1.0 + (0.95 * stuck_score),
+            )
+            hierarchy_weights["habit_risk"] = self._scaled_weight(
+                hierarchy_weights["habit_risk"],
+                1.0 + (1.35 * stuck_score),
+            )
+            hierarchy_weights["operability_risk"] = self._scaled_weight(
+                hierarchy_weights["operability_risk"],
+                1.0 + (0.30 * blocked_probability),
+            )
+            hierarchy_weights["progress_information_gain"] = self._scaled_weight(
+                hierarchy_weights["progress_information_gain"],
+                1.0 + (0.80 * stuck_score * no_progress_signal),
+            )
+
+        diagnostics = {
+            "phase_focus": str(phase_focus),
+            "stuck_score": float(stuck_score),
+            "progress_probability": float(progress_probability),
+            "no_progress_signal": float(no_progress_signal),
+            "blocked_probability": float(blocked_probability),
+            "region_revisit_ratio": float(region_revisit_ratio),
+            "stagnation_context": float(stagnation_context),
+            "habit_pressure": float(habit_pressure),
+            "translation_no_progress_probability_amplified": float(
+                translation_no_progress_amplified
+            ),
+            "explain_escape_pressure": float(explain_escape_pressure),
+            "evidence_confidence": float(evidence_confidence),
+            "evidence_novelty": float(evidence_novelty),
+            "evidence_count_effective": int(level2_terms.get("evidence_count_effective", 0)),
+            "evidence_regime": str(level2_terms.get("evidence_regime", "unknown")),
+            "effect_thresholds": {
+                "few_shot_min": 4,
+                "forming_min": 12,
+                "stable_min": 24,
+            },
+        }
+        return weights, hierarchy_weights, diagnostics
 
     def _candidate_cluster_id(self, candidate: ActionCandidateV1) -> str:
         metadata_cluster = str(candidate.metadata.get("candidate_cluster_id", "")).strip()
@@ -106,6 +764,100 @@ class ActiveInferencePolicyEvaluatorV1:
             "state_action_visit_count": int(raw.get("state_action_visit_count", 0)),
             "state_outgoing_edge_count": int(raw.get("state_outgoing_edge_count", 0)),
         }
+
+    def _candidate_blocked_edge_stats(
+        self,
+        candidate: ActionCandidateV1,
+    ) -> dict[str, float]:
+        raw = candidate.metadata.get("blocked_edge_observed_stats", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "action_attempts": int(raw.get("action_attempts", 0)),
+            "action_blocked_rate": float(raw.get("action_blocked_rate", 0.0)),
+            "action_moved_rate": float(raw.get("action_moved_rate", 0.0)),
+            "edge_attempts": int(raw.get("edge_attempts", 0)),
+            "edge_blocked_rate": float(raw.get("edge_blocked_rate", 0.0)),
+            "region_revisit_count_current": int(raw.get("region_revisit_count_current", 0)),
+        }
+
+    def _candidate_frontier_graph_cost(self, candidate: ActionCandidateV1) -> float:
+        transition_stats = self._candidate_transition_stats(candidate)
+        blocked_stats = self._candidate_blocked_edge_stats(candidate)
+        state_visit_count = int(max(0, transition_stats.get("state_visit_count", 0)))
+        state_action_visit_count = int(
+            max(0, transition_stats.get("state_action_visit_count", 0))
+        )
+        state_outgoing_edge_count = int(
+            max(0, transition_stats.get("state_outgoing_edge_count", 0))
+        )
+        edge_attempts = int(max(0, blocked_stats.get("edge_attempts", 0)))
+        region_revisit_count = int(
+            max(0, blocked_stats.get("region_revisit_count_current", 0))
+        )
+        state_repeat = min(1.0, float(state_visit_count) / 6.0)
+        state_action_repeat = min(1.0, float(state_action_visit_count) / 3.0)
+        edge_repeat = min(1.0, float(edge_attempts) / 8.0)
+        region_repeat = min(
+            1.0,
+            float(region_revisit_count) / float(max(1, self.region_revisit_hard_threshold)),
+        )
+        outgoing_repeat = min(1.0, float(state_outgoing_edge_count) / 6.0)
+        frontier_cost = (
+            0.30 * state_repeat
+            + 0.32 * state_action_repeat
+            + 0.14 * edge_repeat
+            + 0.14 * region_repeat
+            + 0.10 * outgoing_repeat
+        )
+        return float(max(0.0, min(1.0, frontier_cost)))
+
+    def _predicted_direction_distribution(
+        self,
+        entry: FreeEnergyLedgerEntryV1,
+    ) -> dict[str, float]:
+        predictive = entry.predictive_signature_distribution
+        if not isinstance(predictive, dict):
+            return {}
+        out: dict[str, float] = {
+            "dir_l": 0.0,
+            "dir_r": 0.0,
+            "dir_u": 0.0,
+            "dir_d": 0.0,
+        }
+        for signature_key, probability in predictive.items():
+            signature = str(signature_key)
+            if "type=CC_TRANSLATION" not in signature:
+                continue
+            p = float(probability)
+            if p <= 0.0:
+                continue
+            for direction in ("dir_l", "dir_r", "dir_u", "dir_d"):
+                if f"|delta={direction}" in signature:
+                    out[direction] = float(out.get(direction, 0.0) + p)
+                    break
+        return out
+
+    def _dominant_predicted_direction(self, entry: FreeEnergyLedgerEntryV1) -> str:
+        distribution = self._predicted_direction_distribution(entry)
+        if not distribution:
+            return "na"
+        direction, mass = max(distribution.items(), key=lambda item: float(item[1]))
+        if float(mass) <= 0.0:
+            return "na"
+        return str(direction)
+
+    def _last_valid_direction(self, recent_navigation_directions: list[str] | None) -> str:
+        if not recent_navigation_directions:
+            return "na"
+        for value in reversed(recent_navigation_directions):
+            direction = str(value)
+            if direction in ("dir_l", "dir_r", "dir_u", "dir_d"):
+                return direction
+        return "na"
+
+    def _direction_sequence_key(self, previous_direction: str, next_direction: str) -> str:
+        return f"{str(previous_direction)}->{str(next_direction)}"
 
     def _action6_bucket_probe_needed(self, candidate: ActionCandidateV1) -> bool:
         if int(candidate.action_id) != 6:
@@ -231,8 +983,8 @@ class ActiveInferencePolicyEvaluatorV1:
         hypothesis_bank: ActiveInferenceHypothesisBankV1,
         phase: str,
     ) -> list[FreeEnergyLedgerEntryV1]:
-        weights = self._weights_for_phase(phase)
-        preference_distribution = preference_distribution_v1(packet, phase)
+        base_weights = self._weights_for_phase(phase)
+        base_hierarchy_weights = self._hierarchy_weights_for_phase(phase)
         entries: list[FreeEnergyLedgerEntryV1] = []
 
         for candidate in candidates:
@@ -240,6 +992,14 @@ class ActiveInferencePolicyEvaluatorV1:
             predictive_distribution = stats["predictive_distribution"]
             supports_by_signature = stats["supports_by_signature"]
             expected_mdl_bits = float(stats["expected_mdl_bits"])
+            navigation_target = candidate.metadata.get("navigation_target_features_v1", {})
+            if not isinstance(navigation_target, dict):
+                navigation_target = {}
+            preference_distribution = preference_distribution_v1(
+                packet,
+                phase,
+                navigation_target=navigation_target,
+            )
 
             risk_value, risk_terms = compute_risk_kl_v1(
                 predictive_distribution,
@@ -266,6 +1026,27 @@ class ActiveInferencePolicyEvaluatorV1:
             complexity_penalty = float(expected_mdl_bits / 64.0)
             vfe_current = float(hypothesis_bank.current_vfe_bits())
 
+            hierarchical_terms = self._hierarchical_efe_terms(
+                packet=packet,
+                candidate=candidate,
+                predictive_distribution=predictive_distribution,
+                risk_value=risk_value,
+                ambiguity=ambiguity,
+                ig_action_semantics=ig_action_semantics,
+                ig_mechanism_dynamics=ig_mechanism_dynamics,
+                ig_causal_mapping=ig_causal_mapping,
+            )
+            level1_terms = (
+                hierarchical_terms.get("levels", {}).get("level1_operability", {})
+            )
+            level2_terms = hierarchical_terms.get("levels", {}).get("level2_progress", {})
+            weights, hierarchy_weights, adaptive_objective = self._adaptive_objective_profile(
+                phase=phase,
+                base_weights=base_weights,
+                base_hierarchy_weights=base_hierarchy_weights,
+                level1_terms=level1_terms,
+                level2_terms=level2_terms,
+            )
             total_efe = (
                 weights["risk"] * risk_value
                 + weights["ambiguity"] * ambiguity
@@ -276,13 +1057,31 @@ class ActiveInferencePolicyEvaluatorV1:
                 + weights["complexity"] * complexity_penalty
                 + weights["vfe"] * vfe_current
             )
+            hierarchy_adjustment = (
+                hierarchy_weights["progress_risk"] * float(level2_terms.get("risk", 0.0))
+                + hierarchy_weights["operability_risk"] * float(level1_terms.get("risk", 0.0))
+                + hierarchy_weights["habit_risk"] * float(level2_terms.get("habit_risk", 0.0))
+                - hierarchy_weights["progress_information_gain"]
+                * float(level2_terms.get("information_gain", 0.0))
+            )
+            total_efe += float(hierarchy_adjustment)
 
             witness = {
                 "weights": {str(k): float(v) for (k, v) in weights.items()},
+                "weights_base_v1": {
+                    str(k): float(v) for (k, v) in base_weights.items()
+                },
+                "hierarchy_weights_v1": {
+                    str(k): float(v) for (k, v) in hierarchy_weights.items()
+                },
+                "hierarchy_weights_base_v1": {
+                    str(k): float(v) for (k, v) in base_hierarchy_weights.items()
+                },
                 "objective_policy_v1": {
                     "ignore_action_cost": bool(self.ignore_action_cost),
                     "applied_action_cost_weight": float(weights["action_cost"]),
                 },
+                "adaptive_objective_v1": adaptive_objective,
                 "risk_terms": {str(k): float(v) for (k, v) in risk_terms.items()},
                 "preference_distribution": {
                     str(k): float(v) for (k, v) in preference_distribution.items()
@@ -294,6 +1093,26 @@ class ActiveInferencePolicyEvaluatorV1:
                 "expected_mdl_bits": float(expected_mdl_bits),
                 "posterior_entropy_bits": float(hypothesis_bank.posterior_entropy()),
                 "vfe_current_bits": float(vfe_current),
+                "hierarchical_efe_v1": hierarchical_terms,
+                "hierarchy_adjustment_v1": {
+                    "applied_adjustment_to_total_efe": float(hierarchy_adjustment),
+                    "progress_risk_component": float(
+                        hierarchy_weights["progress_risk"]
+                        * float(level2_terms.get("risk", 0.0))
+                    ),
+                    "operability_risk_component": float(
+                        hierarchy_weights["operability_risk"]
+                        * float(level1_terms.get("risk", 0.0))
+                    ),
+                    "habit_risk_component": float(
+                        hierarchy_weights["habit_risk"]
+                        * float(level2_terms.get("habit_risk", 0.0))
+                    ),
+                    "progress_information_gain_component": float(
+                        hierarchy_weights["progress_information_gain"]
+                        * float(level2_terms.get("information_gain", 0.0))
+                    ),
+                },
             }
 
             entries.append(
@@ -340,15 +1159,70 @@ class ActiveInferencePolicyEvaluatorV1:
         hypothesis_bank: ActiveInferenceHypothesisBankV1,
         phase: str,
         entries: list[FreeEnergyLedgerEntryV1],
+        direction_sequence_visit_count: dict[str, int] | None = None,
+        recent_navigation_directions: list[str] | None = None,
     ) -> dict[str, float]:
         rollout_scores: dict[str, float] = {}
+        sequence_visit_map = {
+            str(key): int(value)
+            for (key, value) in (direction_sequence_visit_count or {}).items()
+        }
+        previous_direction = self._last_valid_direction(recent_navigation_directions)
         if self.rollout_horizon < 2:
             for entry in entries:
-                rollout_scores[entry.candidate.candidate_id] = float(entry.total_efe)
+                frontier_cost = self._candidate_frontier_graph_cost(entry.candidate)
+                current_direction = self._dominant_predicted_direction(entry)
+                current_sequence_key = ""
+                current_sequence_count = 0
+                if (
+                    previous_direction in ("dir_l", "dir_r", "dir_u", "dir_d")
+                    and current_direction in ("dir_l", "dir_r", "dir_u", "dir_d")
+                ):
+                    current_sequence_key = self._direction_sequence_key(
+                        previous_direction,
+                        current_direction,
+                    )
+                    current_sequence_count = int(
+                        sequence_visit_map.get(current_sequence_key, 0)
+                    )
+                current_sequence_cost = float(
+                    min(1.0, float(current_sequence_count) / 12.0)
+                )
+                rollout_total = float(entry.total_efe) + (
+                    self.sequence_rollout_frontier_weight * float(frontier_cost)
+                ) + (self.sequence_rollout_direction_weight * float(current_sequence_cost))
+                entry.witness["rollout_horizon"] = int(self.rollout_horizon)
+                entry.witness["rollout_expected_future_efe"] = 0.0
+                entry.witness["rollout_expected_future_frontier_cost"] = 0.0
+                entry.witness["rollout_expected_future_sequence_cost"] = 0.0
+                entry.witness["rollout_current_frontier_cost"] = float(frontier_cost)
+                entry.witness["rollout_current_sequence_key"] = str(current_sequence_key)
+                entry.witness["rollout_current_sequence_count"] = int(current_sequence_count)
+                entry.witness["rollout_current_sequence_cost"] = float(
+                    current_sequence_cost
+                )
+                entry.witness["rollout_total_efe"] = float(rollout_total)
+                rollout_scores[entry.candidate.candidate_id] = float(rollout_total)
             return rollout_scores
 
         for entry in entries:
-            expected_future_efe = 0.0
+            current_frontier_cost = self._candidate_frontier_graph_cost(entry.candidate)
+            current_direction = self._dominant_predicted_direction(entry)
+            current_sequence_key = ""
+            current_sequence_count = 0
+            if (
+                previous_direction in ("dir_l", "dir_r", "dir_u", "dir_d")
+                and current_direction in ("dir_l", "dir_r", "dir_u", "dir_d")
+            ):
+                current_sequence_key = self._direction_sequence_key(
+                    previous_direction,
+                    current_direction,
+                )
+                current_sequence_count = int(sequence_visit_map.get(current_sequence_key, 0))
+            current_sequence_cost = float(min(1.0, float(current_sequence_count) / 12.0))
+            expected_future_composite = 0.0
+            expected_future_frontier_cost = 0.0
+            expected_future_sequence_cost = 0.0
             predictive = entry.predictive_signature_distribution
             if predictive:
                 for signature_key, probability in predictive.items():
@@ -369,14 +1243,75 @@ class ActiveInferencePolicyEvaluatorV1:
                         hypothesis_bank=simulated_bank,
                         phase=phase,
                     )
-                    best_future = float(future_entries[0].total_efe) if future_entries else 0.0
-                    expected_future_efe += p * best_future
+                    best_future_composite = 0.0
+                    best_future_frontier_cost = 0.0
+                    best_future_sequence_cost = 0.0
+                    if future_entries:
+                        best_future_composite = float("inf")
+                        for future_entry in future_entries:
+                            future_frontier_cost = self._candidate_frontier_graph_cost(
+                                future_entry.candidate
+                            )
+                            future_direction = self._dominant_predicted_direction(future_entry)
+                            sequence_pair_cost = 0.0
+                            if (
+                                current_direction in ("dir_l", "dir_r", "dir_u", "dir_d")
+                                and future_direction
+                                in ("dir_l", "dir_r", "dir_u", "dir_d")
+                            ):
+                                sequence_pair_key = self._direction_sequence_key(
+                                    current_direction,
+                                    future_direction,
+                                )
+                                sequence_pair_count = int(
+                                    sequence_visit_map.get(sequence_pair_key, 0)
+                                )
+                                sequence_pair_cost = float(
+                                    min(1.0, float(sequence_pair_count) / 12.0)
+                                )
+                            future_composite = (
+                                float(future_entry.total_efe)
+                                + (
+                                    self.sequence_rollout_frontier_weight
+                                    * float(future_frontier_cost)
+                                )
+                                + (
+                                    self.sequence_rollout_direction_weight
+                                    * float(sequence_pair_cost)
+                                )
+                            )
+                            if future_composite < best_future_composite:
+                                best_future_composite = float(future_composite)
+                                best_future_frontier_cost = float(future_frontier_cost)
+                                best_future_sequence_cost = float(sequence_pair_cost)
+                        if best_future_composite == float("inf"):
+                            best_future_composite = 0.0
+                    expected_future_composite += p * float(best_future_composite)
+                    expected_future_frontier_cost += p * float(best_future_frontier_cost)
+                    expected_future_sequence_cost += p * float(best_future_sequence_cost)
 
-            rollout_total = float(entry.total_efe) + (
-                self.rollout_discount * float(expected_future_efe)
+            rollout_total = (
+                float(entry.total_efe)
+                + (self.sequence_rollout_frontier_weight * float(current_frontier_cost))
+                + (self.sequence_rollout_direction_weight * float(current_sequence_cost))
+                + (self.rollout_discount * float(expected_future_composite))
             )
             entry.witness["rollout_horizon"] = int(self.rollout_horizon)
-            entry.witness["rollout_expected_future_efe"] = float(expected_future_efe)
+            entry.witness["rollout_expected_future_efe"] = float(
+                expected_future_composite
+            )
+            entry.witness["rollout_expected_future_frontier_cost"] = float(
+                expected_future_frontier_cost
+            )
+            entry.witness["rollout_expected_future_sequence_cost"] = float(
+                expected_future_sequence_cost
+            )
+            entry.witness["rollout_current_frontier_cost"] = float(current_frontier_cost)
+            entry.witness["rollout_current_sequence_key"] = str(current_sequence_key)
+            entry.witness["rollout_current_sequence_count"] = int(current_sequence_count)
+            entry.witness["rollout_current_sequence_cost"] = float(
+                current_sequence_cost
+            )
             entry.witness["rollout_total_efe"] = float(rollout_total)
             rollout_scores[entry.candidate.candidate_id] = float(rollout_total)
 
@@ -398,6 +1333,9 @@ class ActiveInferencePolicyEvaluatorV1:
         early_probe_budget_remaining: int = 0,
         no_change_streak: int = 0,
         stagnation_streak: int = 0,
+        direction_sequence_visit_count: dict[str, int] | None = None,
+        direction_visit_count: dict[str, int] | None = None,
+        recent_navigation_directions: list[str] | None = None,
     ) -> tuple[ActionCandidateV1, list[FreeEnergyLedgerEntryV1]]:
         entries = self.evaluate_candidates(
             packet=packet,
@@ -441,6 +1379,8 @@ class ActiveInferencePolicyEvaluatorV1:
                 hypothesis_bank=hypothesis_bank,
                 phase=phase,
                 entries=entries,
+                direction_sequence_visit_count=direction_sequence_visit_count,
+                recent_navigation_directions=recent_navigation_directions,
             )
             selection_metric = "rollout_total_efe"
             rollout_applied = True
@@ -464,6 +1404,11 @@ class ActiveInferencePolicyEvaluatorV1:
         candidate_count_map = candidate_select_count or {}
         cluster_count_map = cluster_select_count or {}
         subcluster_count_map = subcluster_select_count or {}
+        direction_sequence_count_map = direction_sequence_visit_count or {}
+        direction_count_map = direction_visit_count or {}
+        previous_navigation_direction = self._last_valid_direction(
+            recent_navigation_directions
+        )
         cluster_id_by_candidate_id: dict[str, str] = {
             str(entry.candidate.candidate_id): self._candidate_cluster_id(entry.candidate)
             for entry in entries
@@ -516,6 +1461,8 @@ class ActiveInferencePolicyEvaluatorV1:
         early_probe_target_action_ids: list[int] = []
         early_probe_candidate_pool: list[FreeEnergyLedgerEntryV1] = []
         early_probe_min_action_usage = 0
+        direction_sequence_probe_applied = False
+        direction_sequence_probe_candidates: list[dict[str, Any]] = []
 
         early_probe_active = bool(
             int(early_probe_budget_remaining) > 0 and phase in ("explore", "explain")
@@ -879,6 +1826,165 @@ class ActiveInferencePolicyEvaluatorV1:
                     entries.remove(selected_entry)
                     entries.insert(0, selected_entry)
 
+        if (
+            not early_probe_applied
+            and not least_tried_probe_applied
+            and str(phase) == "exploit"
+            and int(packet.levels_completed) <= 0
+            and int(stagnation_streak) >= int(self.sequence_probe_trigger_steps)
+            and len(entries) >= 2
+        ):
+            navigation_sequence_pool = [
+                entry
+                for entry in entries
+                if int(entry.candidate.action_id) in (1, 2, 3, 4)
+            ]
+            if len(navigation_sequence_pool) >= 2:
+                best_navigation_score = min(
+                    float(
+                        selection_score_by_candidate.get(
+                            entry.candidate.candidate_id,
+                            entry.total_efe,
+                        )
+                    )
+                    for entry in navigation_sequence_pool
+                )
+                sequence_pool = [
+                    entry
+                    for entry in navigation_sequence_pool
+                    if (
+                        float(
+                            selection_score_by_candidate.get(
+                                entry.candidate.candidate_id,
+                                entry.total_efe,
+                            )
+                        )
+                        - best_navigation_score
+                    )
+                    <= float(
+                        max(
+                            self.stagnation_probe_score_margin,
+                            self.sequence_probe_score_margin,
+                        )
+                    )
+                ]
+                if len(sequence_pool) < 2:
+                    sequence_pool = sorted(
+                        navigation_sequence_pool,
+                        key=lambda entry: (
+                            float(
+                                selection_score_by_candidate.get(
+                                    entry.candidate.candidate_id,
+                                    entry.total_efe,
+                                )
+                            ),
+                            int(entry.candidate.action_id),
+                            str(entry.candidate.candidate_id),
+                        ),
+                    )[: min(4, len(navigation_sequence_pool))]
+                scored_sequence_pool: list[dict[str, Any]] = []
+                for entry in sequence_pool:
+                    predicted_direction = self._dominant_predicted_direction(entry)
+                    if predicted_direction not in ("dir_l", "dir_r", "dir_u", "dir_d"):
+                        continue
+                    transition_stats = self._candidate_transition_stats(entry.candidate)
+                    predicted_sequence_key = ""
+                    predicted_sequence_count = 0
+                    if previous_navigation_direction in (
+                        "dir_l",
+                        "dir_r",
+                        "dir_u",
+                        "dir_d",
+                    ):
+                        predicted_sequence_key = self._direction_sequence_key(
+                            previous_navigation_direction,
+                            predicted_direction,
+                        )
+                        predicted_sequence_count = int(
+                            direction_sequence_count_map.get(predicted_sequence_key, 0)
+                        )
+                    predicted_direction_count = int(
+                        direction_count_map.get(predicted_direction, 0)
+                    )
+                    frontier_cost = float(
+                        self._candidate_frontier_graph_cost(entry.candidate)
+                    )
+                    scored_sequence_pool.append(
+                        {
+                            "entry": entry,
+                            "predicted_direction": str(predicted_direction),
+                            "predicted_sequence_key": str(predicted_sequence_key),
+                            "predicted_sequence_count": int(predicted_sequence_count),
+                            "predicted_direction_count": int(predicted_direction_count),
+                            "frontier_graph_cost": float(frontier_cost),
+                            "state_action_visit_count": int(
+                                transition_stats.get("state_action_visit_count", 0)
+                            ),
+                            "score": float(
+                                selection_score_by_candidate.get(
+                                    entry.candidate.candidate_id,
+                                    entry.total_efe,
+                                )
+                            ),
+                            "action_usage_count_before": int(
+                                action_count_map.get(int(entry.candidate.action_id), 0)
+                            ),
+                        }
+                    )
+                if scored_sequence_pool:
+                    scored_sequence_pool.sort(
+                        key=lambda row: (
+                            int(row.get("predicted_sequence_count", 0)),
+                            int(row.get("predicted_direction_count", 0)),
+                            int(row.get("state_action_visit_count", 0)),
+                            int(row.get("action_usage_count_before", 0)),
+                            float(row.get("frontier_graph_cost", 1.0)),
+                            float(row.get("score", 0.0)),
+                            int(
+                                (row.get("entry") or entries[0]).candidate.action_id
+                            ),
+                            str((row.get("entry") or entries[0]).candidate.candidate_id),
+                        )
+                    )
+                    best_row = scored_sequence_pool[0]
+                    selected_entry = best_row["entry"]
+                    direction_sequence_probe_applied = True
+                    least_tried_probe_applied = True
+                    if selected_entry is not entries[0]:
+                        entries.remove(selected_entry)
+                        entries.insert(0, selected_entry)
+                    direction_sequence_probe_candidates = [
+                        {
+                            "candidate_id": str(
+                                row["entry"].candidate.candidate_id
+                            ),
+                            "action_id": int(row["entry"].candidate.action_id),
+                            "predicted_direction": str(
+                                row.get("predicted_direction", "na")
+                            ),
+                            "predicted_sequence_key": str(
+                                row.get("predicted_sequence_key", "")
+                            ),
+                            "predicted_sequence_count": int(
+                                row.get("predicted_sequence_count", 0)
+                            ),
+                            "predicted_direction_count": int(
+                                row.get("predicted_direction_count", 0)
+                            ),
+                            "frontier_graph_cost": float(
+                                row.get("frontier_graph_cost", 0.0)
+                            ),
+                            "state_action_visit_count": int(
+                                row.get("state_action_visit_count", 0)
+                            ),
+                            "action_usage_count_before": int(
+                                row.get("action_usage_count_before", 0)
+                            ),
+                            "score": float(row.get("score", 0.0)),
+                        }
+                        for row in scored_sequence_pool[:12]
+                    ]
+
         navigation_stagnation_probe_applied = False
         navigation_probe_candidates: list[FreeEnergyLedgerEntryV1] = []
         navigation_stagnated = bool(
@@ -1027,6 +2133,10 @@ class ActiveInferencePolicyEvaluatorV1:
         selected_transition_stats = self._candidate_transition_stats(entries[0].candidate)
         if early_probe_applied:
             tie_breaker_rule_applied = "early_probe_budget_least_tried"
+        elif direction_sequence_probe_applied:
+            tie_breaker_rule_applied = (
+                "exploit_direction_sequence_probe_least_visited(sequence_count,direction_count,state_action,action_usage,frontier,score)"
+            )
         elif navigation_stagnation_probe_applied:
             tie_breaker_rule_applied = (
                 "navigation_stagnation_probe_least_tried(action_usage,state_action,state,edge,blocked,nochange,score)"
@@ -1085,6 +2195,16 @@ class ActiveInferencePolicyEvaluatorV1:
             "stagnation_probe_score_margin": float(self.stagnation_probe_score_margin),
             "stagnation_probe_min_action_usage_gap": int(
                 self.stagnation_probe_min_action_usage_gap
+            ),
+            "sequence_probe_score_margin": float(self.sequence_probe_score_margin),
+            "sequence_probe_trigger_steps": int(self.sequence_probe_trigger_steps),
+            "previous_navigation_direction": str(previous_navigation_direction),
+            "direction_sequence_probe_applied": bool(direction_sequence_probe_applied),
+            "sequence_rollout_frontier_weight": float(
+                self.sequence_rollout_frontier_weight
+            ),
+            "sequence_rollout_direction_weight": float(
+                self.sequence_rollout_direction_weight
             ),
             "rollout_applied": bool(rollout_applied),
             "rollout_skip_reason": str(rollout_skip_reason),
@@ -1378,6 +2498,33 @@ class ActiveInferencePolicyEvaluatorV1:
                     ),
                 }
                 for entry in navigation_probe_candidates[:12]
+            ],
+            "direction_sequence_probe_candidates": [
+                {
+                    "candidate_id": str(row.get("candidate_id", "")),
+                    "action_id": int(row.get("action_id", -1)),
+                    "predicted_direction": str(row.get("predicted_direction", "na")),
+                    "predicted_sequence_key": str(
+                        row.get("predicted_sequence_key", "")
+                    ),
+                    "predicted_sequence_count": int(
+                        row.get("predicted_sequence_count", 0)
+                    ),
+                    "predicted_direction_count": int(
+                        row.get("predicted_direction_count", 0)
+                    ),
+                    "frontier_graph_cost": float(
+                        row.get("frontier_graph_cost", 0.0)
+                    ),
+                    "state_action_visit_count": int(
+                        row.get("state_action_visit_count", 0)
+                    ),
+                    "action_usage_count_before": int(
+                        row.get("action_usage_count_before", 0)
+                    ),
+                    "score": float(row.get("score", 0.0)),
+                }
+                for row in direction_sequence_probe_candidates[:12]
             ],
             "early_probe_candidates": [
                 {

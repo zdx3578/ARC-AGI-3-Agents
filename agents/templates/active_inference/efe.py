@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 from .contracts import ObservationPacketV1
 
@@ -120,7 +121,22 @@ def weights_for_phase_v1(phase: str) -> EFEWeightsV1:
     )
 
 
-def preference_distribution_v1(packet: ObservationPacketV1, phase: str) -> dict[str, float]:
+def _opposite_direction_bucket(direction_bucket: str) -> str:
+    mapping = {
+        "dir_l": "dir_r",
+        "dir_r": "dir_l",
+        "dir_u": "dir_d",
+        "dir_d": "dir_u",
+    }
+    return str(mapping.get(str(direction_bucket), "dir_unknown"))
+
+
+def preference_distribution_v1(
+    packet: ObservationPacketV1,
+    phase: str,
+    *,
+    navigation_target: dict[str, Any] | None = None,
+) -> dict[str, float]:
     progress_gap = int(max(0, packet.win_levels - packet.levels_completed))
     progress_weight = 0.45 if progress_gap > 0 else 0.20
     if phase == "exploit":
@@ -140,6 +156,24 @@ def preference_distribution_v1(packet: ObservationPacketV1, phase: str) -> dict[
         "type=OBSERVED_UNCLASSIFIED|progress=0": 0.10,
         "type=METADATA_PROGRESS_CHANGE|progress=0": 0.05,
     }
+
+    target = navigation_target if isinstance(navigation_target, dict) else {}
+    target_enabled = bool(target.get("enabled", False))
+    target_direction = str(target.get("target_direction_bucket", "dir_unknown"))
+    target_salience = max(0.0, min(1.0, float(target.get("target_salience", 0.0))))
+    if (
+        target_enabled
+        and target_direction in ("dir_l", "dir_r", "dir_u", "dir_d")
+        and target_salience > 0.0
+    ):
+        toward_key = f"type=CC_TRANSLATION|progress=0|delta={target_direction}"
+        away_direction = _opposite_direction_bucket(target_direction)
+        away_key = f"type=CC_TRANSLATION|progress=0|delta={away_direction}"
+        toward_bonus = 0.22 * target_salience
+        away_scale = max(0.10, 1.0 - (0.60 * target_salience))
+        pref[toward_key] = float(pref.get(toward_key, 0.0) + toward_bonus)
+        pref[away_key] = float(max(0.005, pref.get(away_key, 0.02) * away_scale))
+
     return normalize_distribution(pref)
 
 

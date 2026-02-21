@@ -165,9 +165,32 @@ class ActiveInferenceEFE(Agent):
             "ACTIVE_INFERENCE_ROLLOUT_ONLY_IN_EXPLOIT",
             True,
         )
+        self.region_revisit_hard_threshold = max(
+            4,
+            _env_int("ACTIVE_INFERENCE_REGION_REVISIT_HARD_THRESHOLD", 24),
+        )
+        self.sequence_rollout_frontier_weight = max(
+            0.0,
+            _env_float("ACTIVE_INFERENCE_SEQUENCE_ROLLOUT_FRONTIER_WEIGHT", 0.35),
+        )
+        self.sequence_rollout_direction_weight = max(
+            0.0,
+            _env_float("ACTIVE_INFERENCE_SEQUENCE_ROLLOUT_DIRECTION_WEIGHT", 0.25),
+        )
+        self.sequence_probe_score_margin = max(
+            0.0,
+            _env_float("ACTIVE_INFERENCE_SEQUENCE_PROBE_SCORE_MARGIN", 0.28),
+        )
+        self.sequence_probe_trigger_steps = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_SEQUENCE_PROBE_TRIGGER_STEPS", 20),
+        )
         self.early_probe_budget = max(
             0,
-            _env_int("ACTIVE_INFERENCE_EARLY_PROBE_BUDGET", 8),
+            _env_int(
+                "ACTIVE_INFERENCE_EARLY_PROBE_BUDGET",
+                max(8, min(512, int(round(float(self.MAX_ACTIONS) * 0.08)))),
+            ),
         )
         self.action6_bucket_probe_min_attempts = max(
             1,
@@ -203,7 +226,10 @@ class ActiveInferenceEFE(Agent):
         )
         self.stagnation_stop_loss_steps = max(
             1,
-            _env_int("ACTIVE_INFERENCE_STAGNATION_STOP_LOSS_STEPS", 80),
+            _env_int(
+                "ACTIVE_INFERENCE_STAGNATION_STOP_LOSS_STEPS",
+                max(80, int(round(float(self.MAX_ACTIONS) * 0.45))),
+            ),
         )
         self.no_change_stop_loss_steps = max(
             1,
@@ -218,7 +244,10 @@ class ActiveInferenceEFE(Agent):
         )
         self.exploration_max_steps = max(
             self.exploration_min_steps,
-            _env_int("ACTIVE_INFERENCE_EXPLORATION_MAX_STEPS", 120),
+            _env_int(
+                "ACTIVE_INFERENCE_EXPLORATION_MAX_STEPS",
+                max(120, int(round(float(self.MAX_ACTIONS) * 0.70))),
+            ),
         )
         self.exploration_fraction = max(
             0.0,
@@ -246,6 +275,11 @@ class ActiveInferenceEFE(Agent):
             stagnation_probe_trigger_steps=self.stagnation_probe_trigger_steps,
             stagnation_probe_score_margin=self.stagnation_probe_score_margin,
             stagnation_probe_min_action_usage_gap=self.stagnation_probe_min_action_usage_gap,
+            region_revisit_hard_threshold=self.region_revisit_hard_threshold,
+            sequence_rollout_frontier_weight=self.sequence_rollout_frontier_weight,
+            sequence_rollout_direction_weight=self.sequence_rollout_direction_weight,
+            sequence_probe_score_margin=self.sequence_probe_score_margin,
+            sequence_probe_trigger_steps=self.sequence_probe_trigger_steps,
         )
         self.hypothesis_bank = ActiveInferenceHypothesisBankV1()
 
@@ -263,6 +297,13 @@ class ActiveInferenceEFE(Agent):
         self._candidate_select_count: dict[str, int] = {}
         self._cluster_select_count: dict[str, int] = {}
         self._subcluster_select_count: dict[str, int] = {}
+        self._navigation_direction_history_window = max(
+            8,
+            _env_int("ACTIVE_INFERENCE_DIRECTION_HISTORY_WINDOW", 256),
+        )
+        self._recent_navigation_directions: list[str] = []
+        self._navigation_direction_visit_count: dict[str, int] = {}
+        self._navigation_direction_sequence_visit_count: dict[str, int] = {}
         self._navigation_attempt_count = 0
         self._navigation_blocked_count = 0
         self._navigation_moved_count = 0
@@ -442,6 +483,261 @@ class ActiveInferenceEFE(Agent):
                 }
         return None
 
+    @staticmethod
+    def _direction_bucket_from_delta_v1(dx: int, dy: int) -> str:
+        if int(dx) == 0 and int(dy) == 0:
+            return "dir_none"
+        if abs(int(dx)) >= abs(int(dy)):
+            if int(dx) > 0:
+                return "dir_r"
+            if int(dx) < 0:
+                return "dir_l"
+        if int(dy) > 0:
+            return "dir_d"
+        if int(dy) < 0:
+            return "dir_u"
+        return "dir_unknown"
+
+    def _navigation_direction_bucket_from_estimate_v1(
+        self,
+        navigation_state_estimate: dict[str, Any],
+    ) -> str:
+        if not isinstance(navigation_state_estimate, dict):
+            return "na"
+        if not bool(navigation_state_estimate.get("matched", False)):
+            return "na"
+        delta = navigation_state_estimate.get("delta_pos_xy", {})
+        if not isinstance(delta, dict):
+            return "na"
+        dx = int(delta.get("dx", 0))
+        dy = int(delta.get("dy", 0))
+        bucket = self._direction_bucket_from_delta_v1(dx, dy)
+        if bucket in ("dir_l", "dir_r", "dir_u", "dir_d"):
+            return str(bucket)
+        return "na"
+
+    def _current_agent_position_xy_v1(
+        self,
+        representation: RepresentationStateV1,
+    ) -> tuple[int, int] | None:
+        latest = self._latest_navigation_state_estimate
+        if isinstance(latest, dict):
+            pos = latest.get("agent_pos_xy", {})
+            if isinstance(pos, dict):
+                x = int(pos.get("x", -1))
+                y = int(pos.get("y", -1))
+                if x >= 0 and y >= 0:
+                    return (int(x), int(y))
+        if self._tracked_agent_token_digest:
+            matched = self._find_object_by_digest_v1(
+                representation,
+                self._tracked_agent_token_digest,
+            )
+            if matched is not None:
+                return (
+                    int(matched.get("centroid_x", -1)),
+                    int(matched.get("centroid_y", -1)),
+                )
+        return None
+
+    def _navigation_key_targets_v1(
+        self,
+        representation: RepresentationStateV1,
+        *,
+        agent_pos_xy: tuple[int, int] | None,
+    ) -> list[dict[str, Any]]:
+        frame_height = int(max(1, representation.frame_height))
+        frame_width = int(max(1, representation.frame_width))
+        frame_area = float(max(1, frame_height * frame_width))
+        if agent_pos_xy is None:
+            ref_x = int(frame_width // 2)
+            ref_y = int(frame_height // 2)
+        else:
+            ref_x = int(agent_pos_xy[0])
+            ref_y = int(agent_pos_xy[1])
+
+        color_counts: dict[int, int] = {}
+        for obj in representation.object_nodes:
+            color = int(obj.color)
+            color_counts[color] = int(color_counts.get(color, 0) + 1)
+
+        targets: list[dict[str, Any]] = []
+        for obj in representation.object_nodes:
+            if self._tracked_agent_token_digest and str(obj.digest) == str(
+                self._tracked_agent_token_digest
+            ):
+                continue
+            area = int(max(1, obj.area))
+            if bool(obj.touches_boundary) and area >= int(0.45 * frame_area):
+                continue
+            bbox_w = int(max(1, int(obj.bbox_max_x) - int(obj.bbox_min_x) + 1))
+            bbox_h = int(max(1, int(obj.bbox_max_y) - int(obj.bbox_min_y) + 1))
+            bbox_area = int(max(1, bbox_w * bbox_h))
+            fill_ratio = float(max(0.0, min(1.0, float(area) / float(bbox_area))))
+
+            color_rarity = float(1.0 / float(max(1, color_counts.get(int(obj.color), 1))))
+            smallness = float(max(0.0, 1.0 - min(1.0, float(area) / 120.0)))
+            topness = float(
+                max(
+                    0.0,
+                    1.0
+                    - min(
+                        1.0,
+                        float(int(obj.centroid_y)) / float(max(1, frame_height - 1)),
+                    ),
+                )
+            )
+            interior_bonus = 0.0 if bool(obj.touches_boundary) else 1.0
+            cross_like = (
+                1.0
+                if (
+                    area <= 48
+                    and bbox_w >= 3
+                    and bbox_h >= 3
+                    and 0.35 <= fill_ratio <= 0.75
+                )
+                else 0.0
+            )
+            gate_like = (
+                1.0
+                if (
+                    int(obj.centroid_y) <= int(round(0.38 * float(frame_height)))
+                    and area >= 12
+                    and area <= 320
+                    and bbox_w >= 3
+                    and bbox_h >= 3
+                    and fill_ratio <= 0.78
+                )
+                else 0.0
+            )
+            salience = float(
+                (0.95 * cross_like)
+                + (0.82 * gate_like)
+                + (0.36 * color_rarity)
+                + (0.22 * smallness)
+                + (0.18 * topness)
+                + (0.16 * interior_bonus)
+            )
+            if salience < 0.35:
+                continue
+
+            distance_from_agent = int(
+                abs(int(obj.centroid_x) - int(ref_x)) + abs(int(obj.centroid_y) - int(ref_y))
+            )
+            kind = "salient"
+            if cross_like >= gate_like and cross_like > 0.0:
+                kind = "cross_like"
+            elif gate_like > 0.0:
+                kind = "gate_like"
+
+            targets.append(
+                {
+                    "digest": str(obj.digest),
+                    "object_id": str(obj.object_id),
+                    "kind": str(kind),
+                    "color": int(obj.color),
+                    "area": int(area),
+                    "centroid_x": int(obj.centroid_x),
+                    "centroid_y": int(obj.centroid_y),
+                    "bbox_w": int(bbox_w),
+                    "bbox_h": int(bbox_h),
+                    "fill_ratio": float(fill_ratio),
+                    "touches_boundary": bool(obj.touches_boundary),
+                    "salience": float(salience),
+                    "distance_from_agent": int(distance_from_agent),
+                }
+            )
+
+        targets.sort(
+            key=lambda row: (
+                -float(row.get("salience", 0.0)),
+                int(row.get("distance_from_agent", 10**9)),
+                int(row.get("area", 10**9)),
+                str(row.get("digest", "")),
+            )
+        )
+        return targets[:4]
+
+    def _navigation_target_features_v1(
+        self,
+        representation: RepresentationStateV1,
+    ) -> dict[str, Any]:
+        agent_pos_xy = self._current_agent_position_xy_v1(representation)
+        targets = self._navigation_key_targets_v1(
+            representation,
+            agent_pos_xy=agent_pos_xy,
+        )
+        if not targets:
+            return {
+                "schema_name": "active_inference_navigation_target_features_v1",
+                "schema_version": 1,
+                "enabled": False,
+                "agent_pos_xy": {"x": -1, "y": -1},
+                "target_count": 0,
+                "target_direction_bucket": "dir_unknown",
+                "distance_before": -1.0,
+                "target_salience": 0.0,
+                "targets": [],
+            }
+
+        primary = dict(targets[0])
+        if agent_pos_xy is None:
+            agent_x = -1
+            agent_y = -1
+            dx = 0
+            dy = 0
+            distance_before = -1.0
+            direction_bucket = "dir_unknown"
+            enabled = False
+        else:
+            agent_x = int(agent_pos_xy[0])
+            agent_y = int(agent_pos_xy[1])
+            dx = int(primary.get("centroid_x", 0)) - int(agent_x)
+            dy = int(primary.get("centroid_y", 0)) - int(agent_y)
+            distance_before = float(abs(int(dx)) + abs(int(dy)))
+            direction_bucket = self._direction_bucket_from_delta_v1(dx, dy)
+            enabled = bool(
+                direction_bucket in ("dir_l", "dir_r", "dir_u", "dir_d")
+                and float(distance_before) > 0.0
+            )
+
+        return {
+            "schema_name": "active_inference_navigation_target_features_v1",
+            "schema_version": 1,
+            "enabled": bool(enabled),
+            "agent_pos_xy": {"x": int(agent_x), "y": int(agent_y)},
+            "target_count": int(len(targets)),
+            "target_digest": str(primary.get("digest", "NA")),
+            "target_object_id": str(primary.get("object_id", "NA")),
+            "target_kind": str(primary.get("kind", "salient")),
+            "target_color": int(primary.get("color", -1)),
+            "target_area": int(primary.get("area", 0)),
+            "target_salience": float(primary.get("salience", 0.0)),
+            "target_pos_xy": {
+                "x": int(primary.get("centroid_x", -1)),
+                "y": int(primary.get("centroid_y", -1)),
+            },
+            "target_region": {
+                "x": int(max(0, min(7, int(primary.get("centroid_x", -1)) // 8))),
+                "y": int(max(0, min(7, int(primary.get("centroid_y", -1)) // 8))),
+            },
+            "distance_before": float(distance_before),
+            "target_direction_bucket": str(direction_bucket),
+            "targets": [
+                {
+                    "digest": str(row.get("digest", "NA")),
+                    "kind": str(row.get("kind", "salient")),
+                    "salience": float(row.get("salience", 0.0)),
+                    "distance_from_agent": int(row.get("distance_from_agent", -1)),
+                    "x": int(row.get("centroid_x", -1)),
+                    "y": int(row.get("centroid_y", -1)),
+                    "area": int(row.get("area", 0)),
+                    "color": int(row.get("color", -1)),
+                }
+                for row in targets[:3]
+            ],
+        }
+
     def _action_context_payload_v1(
         self,
         *,
@@ -564,6 +860,12 @@ class ActiveInferenceEFE(Agent):
         effect_translation_delta_bucket = str(
             getattr(observed_signature, "translation_delta_bucket", "na")
         )
+        if int(executed_candidate.action_id) in (1, 2, 3, 4):
+            navigation_direction_bucket = self._navigation_direction_bucket_from_estimate_v1(
+                navigation_state_estimate
+            )
+            if navigation_direction_bucket in ("dir_l", "dir_r", "dir_u", "dir_d"):
+                effect_translation_delta_bucket = str(navigation_direction_bucket)
         state_action_key = f"{state_before_digest}|{action_token}"
         transition_edge_key = f"{state_before_digest}|{action_token}|{state_after_digest}"
         env_delta = {
@@ -781,6 +1083,18 @@ class ActiveInferenceEFE(Agent):
                 self.stagnation_probe_min_action_usage_gap
             ),
             "stagnation_stop_loss_steps": int(self.stagnation_stop_loss_steps),
+            "region_revisit_hard_threshold": int(self.region_revisit_hard_threshold),
+            "sequence_probe_score_margin": float(self.sequence_probe_score_margin),
+            "sequence_probe_trigger_steps": int(self.sequence_probe_trigger_steps),
+            "sequence_rollout_frontier_weight": float(
+                self.sequence_rollout_frontier_weight
+            ),
+            "sequence_rollout_direction_weight": float(
+                self.sequence_rollout_direction_weight
+            ),
+            "navigation_direction_history_window": int(
+                self._navigation_direction_history_window
+            ),
             "action_cost_in_objective": "off_hard",
             "action_cost_enable_requested": bool(self.action_cost_objective_enable_requested),
             "action_cost_override_blocked": bool(
@@ -917,6 +1231,9 @@ class ActiveInferenceEFE(Agent):
         action_id = int(executed_candidate.action_id)
         obs_change_type = str(getattr(causal_signature, "obs_change_type", "OBSERVED_UNCLASSIFIED"))
         level_delta = int(getattr(causal_signature, "level_delta", 0))
+        translation_delta_bucket = str(
+            getattr(causal_signature, "translation_delta_bucket", "na")
+        )
         if action_id in (1, 2, 3, 4):
             self._navigation_attempt_count += 1
             action_key = str(action_id)
@@ -939,6 +1256,40 @@ class ActiveInferenceEFE(Agent):
             if moved:
                 self._navigation_moved_count += 1
                 action_stats["moved"] = int(action_stats.get("moved", 0) + 1)
+                movement_direction_bucket = str(translation_delta_bucket)
+                navigation_direction_bucket = self._navigation_direction_bucket_from_estimate_v1(
+                    navigation_state_estimate
+                )
+                if navigation_direction_bucket in ("dir_l", "dir_r", "dir_u", "dir_d"):
+                    movement_direction_bucket = str(navigation_direction_bucket)
+                if movement_direction_bucket in ("dir_l", "dir_r", "dir_u", "dir_d"):
+                    self._navigation_direction_visit_count[movement_direction_bucket] = int(
+                        self._navigation_direction_visit_count.get(
+                            movement_direction_bucket,
+                            0,
+                        )
+                        + 1
+                    )
+                    if self._recent_navigation_directions:
+                        previous_direction = str(self._recent_navigation_directions[-1])
+                        if previous_direction in ("dir_l", "dir_r", "dir_u", "dir_d"):
+                            sequence_key = (
+                                f"{previous_direction}->{movement_direction_bucket}"
+                            )
+                            self._navigation_direction_sequence_visit_count[sequence_key] = int(
+                                self._navigation_direction_sequence_visit_count.get(
+                                    sequence_key,
+                                    0,
+                                )
+                                + 1
+                            )
+                    self._recent_navigation_directions.append(movement_direction_bucket)
+                    if len(self._recent_navigation_directions) > int(
+                        self._navigation_direction_history_window
+                    ):
+                        self._recent_navigation_directions = self._recent_navigation_directions[
+                            -int(self._navigation_direction_history_window) :
+                        ]
                 region = navigation_state_estimate.get("agent_pos_region", {})
                 if isinstance(region, dict):
                     rx = int(region.get("x", -1))
@@ -1044,6 +1395,31 @@ class ActiveInferenceEFE(Agent):
             },
             "click_bucket_effectiveness": click_summary,
             "click_subcluster_effectiveness": click_subcluster_summary,
+        }
+
+    def _navigation_sequence_diagnostics_v1(self) -> dict[str, Any]:
+        return {
+            "schema_name": "active_inference_navigation_sequence_diagnostics_v1",
+            "schema_version": 1,
+            "history_window": int(self._navigation_direction_history_window),
+            "history_length": int(len(self._recent_navigation_directions)),
+            "recent_navigation_directions": [
+                str(v) for v in self._recent_navigation_directions[-32:]
+            ],
+            "direction_visit_histogram": {
+                str(key): int(value)
+                for (key, value) in sorted(
+                    self._navigation_direction_visit_count.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )
+            },
+            "direction_sequence_visit_histogram": {
+                str(key): int(value)
+                for (key, value) in sorted(
+                    self._navigation_direction_sequence_visit_count.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )[:128]
+            },
         }
 
     def _estimate_navigation_state(
@@ -1666,6 +2042,9 @@ class ActiveInferenceEFE(Agent):
                     else:
                         state_digest_current = self._state_digest_v1(packet, representation)
                         control_schema = self._control_schema_posterior()
+                        navigation_target_features = self._navigation_target_features_v1(
+                            representation
+                        )
                         for candidate in candidates:
                             action_key = str(int(candidate.action_id))
                             candidate.metadata["control_schema_observed_posterior"] = dict(
@@ -1687,6 +2066,9 @@ class ActiveInferenceEFE(Agent):
                                 candidate.metadata["blocked_edge_observed_stats"] = (
                                     self._navigation_candidate_stats(int(candidate.action_id))
                                 )
+                                target_payload = dict(navigation_target_features)
+                                target_payload["candidate_action_id"] = int(candidate.action_id)
+                                candidate.metadata["navigation_target_features_v1"] = target_payload
                             if int(candidate.action_id) == 6:
                                 click_bucket = self._click_context_bucket_from_candidate(candidate)
                                 click_subcluster = self._click_context_subcluster_from_candidate(
@@ -1729,6 +2111,9 @@ class ActiveInferenceEFE(Agent):
                             early_probe_budget_remaining=early_probe_budget_remaining,
                             no_change_streak=self._no_change_streak,
                             stagnation_streak=self._stagnation_streak,
+                            direction_sequence_visit_count=self._navigation_direction_sequence_visit_count,
+                            direction_visit_count=self._navigation_direction_visit_count,
+                            recent_navigation_directions=self._recent_navigation_directions,
                         )
                         if ranked_entries:
                             selection_diagnostics = dict(
@@ -1794,6 +2179,7 @@ class ActiveInferenceEFE(Agent):
                             "transition_graph_summary_v1": self._transition_graph_summary_v1(),
                             "selection_diagnostics_v1": dict(selection_diagnostics),
                             "navigation_state_estimate_v1": dict(self._latest_navigation_state_estimate),
+                            "navigation_sequence_diagnostics_v1": self._navigation_sequence_diagnostics_v1(),
                             "representation_summary": representation.summary,
                             "causal_event_signature_previous_step": (
                                 causal_signature.to_dict() if causal_signature else None
@@ -1834,6 +2220,10 @@ class ActiveInferenceEFE(Agent):
             action.reasoning.setdefault(
                 "operability_diagnostics_v1",
                 self._operability_diagnostics_v1(),
+            )
+            action.reasoning.setdefault(
+                "navigation_sequence_diagnostics_v1",
+                self._navigation_sequence_diagnostics_v1(),
             )
             action.reasoning.setdefault("no_change_streak", int(self._no_change_streak))
             action.reasoning.setdefault("stagnation_streak", int(self._stagnation_streak))
@@ -1885,6 +2275,7 @@ class ActiveInferenceEFE(Agent):
                     "memory_policy_v1": self._memory_policy_v1(),
                     "exploration_policy_v1": dict(exploration_policy_payload),
                     "operability_diagnostics_v1": self._operability_diagnostics_v1(),
+                    "navigation_sequence_diagnostics_v1": self._navigation_sequence_diagnostics_v1(),
                     "causal_event_signature_previous_step": (
                         causal_signature.to_dict() if causal_signature else None
                     ),
@@ -1964,6 +2355,7 @@ class ActiveInferenceEFE(Agent):
                     ),
                     "final_transition_graph_summary_v1": self._transition_graph_summary_v1(),
                     "final_operability_diagnostics_v1": self._operability_diagnostics_v1(),
+                    "final_navigation_sequence_diagnostics_v1": self._navigation_sequence_diagnostics_v1(),
                     "final_control_schema_posterior": self._control_schema_posterior(),
                     "final_action_select_count": {
                         str(key): int(value)
