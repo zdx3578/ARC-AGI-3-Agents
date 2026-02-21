@@ -837,6 +837,38 @@ class ActiveInferencePolicyEvaluatorV1:
                 sequence_causal_penalty = float(
                     sequence_causal_penalty + (0.20 * self.sequence_causal_penalty_weight)
                 )
+        navigation_projection = candidate.metadata.get(
+            "navigation_step_projection_features_v1",
+            {},
+        )
+        if not isinstance(navigation_projection, dict):
+            navigation_projection = {}
+        projection_enabled = bool(navigation_projection.get("enabled", False))
+        projection_source = str(navigation_projection.get("projection_source", "none"))
+        projection_distance_before = float(navigation_projection.get("distance_before", -1.0))
+        projection_distance_after = float(navigation_projection.get("distance_after", -1.0))
+        projection_distance_delta = float(navigation_projection.get("distance_delta", 0.0))
+        projection_distance_delta_normalized = float(
+            navigation_projection.get("distance_delta_normalized", 0.0)
+        )
+        projection_alignment = float(
+            max(-1.0, min(1.0, navigation_projection.get("alignment", 0.0)))
+        )
+        projection_confidence = self._clamp01(
+            float(navigation_projection.get("confidence", 0.0))
+        )
+        projection_bonus_hint = float(max(0.0, navigation_projection.get("bonus_hint", 0.0)))
+        projection_penalty_hint = float(
+            max(0.0, navigation_projection.get("penalty_hint", 0.0))
+        )
+        projection_toward_bonus = float(
+            max(0.0, projection_bonus_hint)
+            * (0.70 + (0.30 * max(0.0, projection_alignment)))
+        )
+        projection_away_penalty = float(
+            max(0.0, projection_penalty_hint)
+            * (0.70 + (0.30 * max(0.0, -projection_alignment)))
+        )
         key_target_enabled = bool(navigation_target.get("enabled", False))
         key_target_direction_bucket = str(
             navigation_target.get("target_direction_bucket", "dir_unknown")
@@ -900,6 +932,12 @@ class ActiveInferencePolicyEvaluatorV1:
         key_target_away_penalty_effective = float(
             key_target_away_penalty * geometry_term_gate
         )
+        projection_toward_bonus_effective = float(
+            projection_toward_bonus * projection_confidence * geometry_term_gate
+        )
+        projection_away_penalty_effective = float(
+            projection_away_penalty * projection_confidence * geometry_term_gate
+        )
 
         # Level 1 (operability/control): risk captures blocked tendencies and
         # control uncertainty in movement outcomes.
@@ -930,10 +968,22 @@ class ActiveInferencePolicyEvaluatorV1:
                 0.0,
                 operability_risk
                 + (0.25 * key_target_away_penalty_effective)
+                + (0.35 * projection_away_penalty_effective)
                 + (0.10 * coverage_repeat_penalty)
                 - (
                     0.30
                     * key_target_escape_bonus_effective
+                    * max(0.25, float(translation_probability))
+                ),
+            )
+        )
+        operability_risk = float(
+            max(
+                0.0,
+                operability_risk
+                - (
+                    0.45
+                    * projection_toward_bonus_effective
                     * max(0.25, float(translation_probability))
                 ),
             )
@@ -972,6 +1022,24 @@ class ActiveInferencePolicyEvaluatorV1:
             "key_target_direction_alignment": float(key_target_direction_alignment),
             "key_target_expected_distance_delta": float(key_target_expected_distance_delta),
             "key_target_expected_distance_after": float(key_target_expected_distance_after),
+            "projection_enabled": bool(projection_enabled),
+            "projection_source": str(projection_source),
+            "projection_confidence": float(projection_confidence),
+            "projection_distance_before": float(projection_distance_before),
+            "projection_distance_after": float(projection_distance_after),
+            "projection_distance_delta": float(projection_distance_delta),
+            "projection_distance_delta_normalized": float(
+                projection_distance_delta_normalized
+            ),
+            "projection_alignment": float(projection_alignment),
+            "projection_toward_bonus": float(projection_toward_bonus),
+            "projection_away_penalty": float(projection_away_penalty),
+            "projection_toward_bonus_effective": float(
+                projection_toward_bonus_effective
+            ),
+            "projection_away_penalty_effective": float(
+                projection_away_penalty_effective
+            ),
             "navigation_confidence_gating_enabled": bool(
                 self.navigation_confidence_gating_enabled
             ),
@@ -1061,10 +1129,12 @@ class ActiveInferencePolicyEvaluatorV1:
                     + (0.12 * region_revisit_hard_penalty)
                     + (0.20 * repeated_no_progress_penalty)
                     + (0.18 * key_target_away_penalty_effective)
+                    + (0.24 * projection_away_penalty_effective)
                     + (0.20 * coverage_repeat_penalty)
                     + (0.28 * sequence_causal_penalty)
                     - (0.25 * leave_high_revisit_potential)
                     - (0.30 * key_target_escape_bonus_effective)
+                    - (0.34 * projection_toward_bonus_effective)
                     - (0.35 * coverage_frontier_bonus)
                     - (0.45 * sequence_causal_bonus)
                 ),
@@ -1088,9 +1158,11 @@ class ActiveInferencePolicyEvaluatorV1:
             max(0.0, 0.70 * repeated_no_progress_penalty)
         )
         habit_risk += float(max(0.0, 0.25 * key_target_away_penalty_effective))
+        habit_risk += float(max(0.0, 0.30 * projection_away_penalty_effective))
         habit_risk += float(max(0.0, 0.30 * coverage_repeat_penalty))
         habit_risk += float(max(0.0, 0.24 * sequence_causal_penalty))
         habit_risk = float(max(0.0, habit_risk - (0.22 * key_target_escape_bonus_effective)))
+        habit_risk = float(max(0.0, habit_risk - (0.28 * projection_toward_bonus_effective)))
         habit_risk = float(max(0.0, habit_risk - (0.26 * coverage_frontier_bonus)))
         habit_risk = float(max(0.0, habit_risk - (0.30 * sequence_causal_bonus)))
         progress_information_gain = float(
@@ -1103,6 +1175,7 @@ class ActiveInferencePolicyEvaluatorV1:
                     + (0.45 * frontier_novelty)
                     + (0.25 * evidence_novelty)
                     + (0.20 * key_target_escape_bonus_effective)
+                    + (0.30 * projection_toward_bonus_effective)
                     + (0.28 * coverage_frontier_bonus)
                     + (0.35 * sequence_causal_bonus)
                     + (0.20 * navigation_relocalization_bonus)
@@ -1155,6 +1228,24 @@ class ActiveInferencePolicyEvaluatorV1:
             "key_target_away_penalty": float(key_target_away_penalty),
             "key_target_escape_bonus_effective": float(key_target_escape_bonus_effective),
             "key_target_away_penalty_effective": float(key_target_away_penalty_effective),
+            "projection_enabled": bool(projection_enabled),
+            "projection_source": str(projection_source),
+            "projection_confidence": float(projection_confidence),
+            "projection_distance_before": float(projection_distance_before),
+            "projection_distance_after": float(projection_distance_after),
+            "projection_distance_delta": float(projection_distance_delta),
+            "projection_distance_delta_normalized": float(
+                projection_distance_delta_normalized
+            ),
+            "projection_alignment": float(projection_alignment),
+            "projection_toward_bonus": float(projection_toward_bonus),
+            "projection_away_penalty": float(projection_away_penalty),
+            "projection_toward_bonus_effective": float(
+                projection_toward_bonus_effective
+            ),
+            "projection_away_penalty_effective": float(
+                projection_away_penalty_effective
+            ),
             "geometry_term_gate": float(geometry_term_gate),
             "coverage_enabled": bool(coverage_enabled),
             "coverage_confidence": float(coverage_confidence),

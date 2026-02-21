@@ -549,6 +549,17 @@ class ActiveInferenceEFE(Agent):
         y: int,
         radius: int = 2,
     ) -> str:
+        values = self._patch_values_v1(frame, x=x, y=y, radius=radius)
+        return self._stable_digest_payload_v1(values, prefix="patch:")
+
+    def _patch_values_v1(
+        self,
+        frame: list[list[int]],
+        *,
+        x: int,
+        y: int,
+        radius: int = 2,
+    ) -> list[int]:
         height = len(frame)
         width = len(frame[0]) if frame else 0
         values: list[int] = []
@@ -560,7 +571,226 @@ class ActiveInferenceEFE(Agent):
                     values.append(-1)
                 else:
                     values.append(int(frame[ny][nx]))
-        return self._stable_digest_payload_v1(values, prefix="patch:")
+        return values
+
+    def _patch_context_v1(
+        self,
+        frame: list[list[int]],
+        *,
+        x: int,
+        y: int,
+        radius: int = 2,
+    ) -> dict[str, Any]:
+        values = self._patch_values_v1(frame, x=int(x), y=int(y), radius=int(radius))
+        histogram: dict[int, int] = {}
+        for value in values:
+            key = int(value)
+            histogram[key] = int(histogram.get(key, 0) + 1)
+        width = int((2 * int(radius)) + 1)
+        return {
+            "schema_name": "active_inference_patch_context_v1",
+            "schema_version": 1,
+            "center": {"x": int(x), "y": int(y)},
+            "radius": int(radius),
+            "width": int(width),
+            "height": int(width),
+            "digest": self._stable_digest_payload_v1(values, prefix="patch:"),
+            "color_histogram": {str(k): int(v) for (k, v) in sorted(histogram.items())},
+            "values": [int(v) for v in values],
+        }
+
+    @staticmethod
+    def _action_direction_vector_v1(action_id: int) -> tuple[int, int] | None:
+        mapping: dict[int, tuple[int, int]] = {
+            1: (0, -1),  # up
+            2: (0, 1),   # down
+            3: (-1, 0),  # left
+            4: (1, 0),   # right
+        }
+        return mapping.get(int(action_id))
+
+    def _trace_object_snapshot_v1(
+        self,
+        representation: RepresentationStateV1,
+        *,
+        max_objects: int = 12,
+    ) -> dict[str, Any]:
+        agent_pos_xy = self._current_agent_position_xy_v1(representation)
+        targets = self._navigation_key_targets_v1(
+            representation,
+            agent_pos_xy=agent_pos_xy,
+        )
+        target_by_digest = {
+            str(row.get("digest", "NA")): {
+                "kind": str(row.get("kind", "salient")),
+                "salience": float(row.get("salience", 0.0)),
+                "target_priority": float(row.get("target_priority", 0.0)),
+            }
+            for row in targets
+            if isinstance(row, dict)
+        }
+        tracked_digest = str(self._tracked_agent_token_digest or "NA")
+        tracked_obj = (
+            self._find_object_by_digest_v1(representation, tracked_digest)
+            if tracked_digest != "NA"
+            else None
+        )
+        rows: list[dict[str, Any]] = []
+        for obj in representation.object_nodes:
+            key_target = target_by_digest.get(str(obj.digest), {})
+            distance_from_agent = -1
+            if agent_pos_xy is not None:
+                ax, ay = agent_pos_xy
+                distance_from_agent = int(
+                    abs(int(obj.centroid_x) - int(ax))
+                    + abs(int(obj.centroid_y) - int(ay))
+                )
+            rows.append(
+                {
+                    "object_id": str(obj.object_id),
+                    "digest": str(obj.digest),
+                    "color": int(obj.color),
+                    "area": int(obj.area),
+                    "centroid_x": int(obj.centroid_x),
+                    "centroid_y": int(obj.centroid_y),
+                    "bbox": [
+                        int(obj.bbox_min_x),
+                        int(obj.bbox_min_y),
+                        int(obj.bbox_max_x),
+                        int(obj.bbox_max_y),
+                    ],
+                    "touches_boundary": bool(obj.touches_boundary),
+                    "distance_from_agent": int(distance_from_agent),
+                    "is_key_target": bool(str(obj.digest) in target_by_digest),
+                    "key_target_kind": str(key_target.get("kind", "na")),
+                    "key_target_salience": float(key_target.get("salience", 0.0)),
+                    "key_target_priority": float(key_target.get("target_priority", 0.0)),
+                    "is_tracked_agent_candidate": bool(str(obj.digest) == tracked_digest),
+                }
+            )
+
+        rows.sort(
+            key=lambda row: (
+                not bool(row.get("is_tracked_agent_candidate", False)),
+                not bool(row.get("is_key_target", False)),
+                -int(row.get("area", 0)),
+                int(row.get("distance_from_agent", 10**9)),
+                str(row.get("digest", "")),
+            )
+        )
+        trimmed = rows[: int(max(1, max_objects))]
+        return {
+            "schema_name": "active_inference_trace_object_snapshot_v1",
+            "schema_version": 1,
+            "object_count": int(len(representation.object_nodes)),
+            "agent_pos_xy": (
+                {"x": int(agent_pos_xy[0]), "y": int(agent_pos_xy[1])}
+                if agent_pos_xy is not None
+                else {"x": -1, "y": -1}
+            ),
+            "tracked_agent_digest": str(tracked_digest),
+            "tracked_agent_present": bool(tracked_obj is not None),
+            "tracked_agent_object": dict(tracked_obj) if tracked_obj is not None else None,
+            "key_targets": [
+                {
+                    "digest": str(row.get("digest", "NA")),
+                    "kind": str(row.get("kind", "salient")),
+                    "salience": float(row.get("salience", 0.0)),
+                    "target_priority": float(row.get("target_priority", 0.0)),
+                    "x": int(row.get("centroid_x", -1)),
+                    "y": int(row.get("centroid_y", -1)),
+                    "distance_from_agent": int(row.get("distance_from_agent", -1)),
+                }
+                for row in targets[:4]
+            ],
+            "top_objects": trimmed,
+        }
+
+    def _trace_neighborhood_context_v1(
+        self,
+        *,
+        packet: ObservationPacketV1,
+        representation: RepresentationStateV1,
+        patch_radius: int = 2,
+    ) -> dict[str, Any]:
+        anchors: list[dict[str, Any]] = []
+        added_keys: set[str] = set()
+        agent_pos_xy = self._current_agent_position_xy_v1(representation)
+        targets = self._navigation_key_targets_v1(
+            representation,
+            agent_pos_xy=agent_pos_xy,
+        )
+
+        def add_anchor(
+            *,
+            label: str,
+            x: int,
+            y: int,
+            kind: str,
+            digest: str = "NA",
+        ) -> None:
+            if int(x) < 0 or int(y) < 0:
+                return
+            key = f"{int(x)}:{int(y)}:{str(label)}"
+            if key in added_keys:
+                return
+            added_keys.add(key)
+            anchors.append(
+                {
+                    "label": str(label),
+                    "kind": str(kind),
+                    "digest": str(digest),
+                    "region_key": f"{int(max(0, min(7, int(x) // 8)))}:{int(max(0, min(7, int(y) // 8)))}",
+                    "patch_context_v1": self._patch_context_v1(
+                        packet.frame,
+                        x=int(x),
+                        y=int(y),
+                        radius=int(patch_radius),
+                    ),
+                }
+            )
+
+        if agent_pos_xy is not None:
+            add_anchor(
+                label="agent",
+                x=int(agent_pos_xy[0]),
+                y=int(agent_pos_xy[1]),
+                kind="agent",
+                digest=str(self._tracked_agent_token_digest or "NA"),
+            )
+        if targets:
+            primary = targets[0]
+            if isinstance(primary, dict):
+                add_anchor(
+                    label="primary_target",
+                    x=int(primary.get("centroid_x", -1)),
+                    y=int(primary.get("centroid_y", -1)),
+                    kind=str(primary.get("kind", "salient")),
+                    digest=str(primary.get("digest", "NA")),
+                )
+            cross_like = next(
+                (
+                    row
+                    for row in targets
+                    if isinstance(row, dict)
+                    and str(row.get("kind", "")) == "cross_like"
+                ),
+                None,
+            )
+            if isinstance(cross_like, dict):
+                add_anchor(
+                    label="cross_like_target",
+                    x=int(cross_like.get("centroid_x", -1)),
+                    y=int(cross_like.get("centroid_y", -1)),
+                    kind="cross_like",
+                    digest=str(cross_like.get("digest", "NA")),
+                )
+        return {
+            "schema_name": "active_inference_trace_neighborhood_context_v1",
+            "schema_version": 1,
+            "anchor_count": int(len(anchors)),
+            "anchors": anchors,
+        }
 
     def _find_object_by_digest_v1(
         self,
@@ -602,6 +832,210 @@ class ActiveInferenceEFE(Agent):
         if int(dy) < 0:
             return "dir_u"
         return "dir_unknown"
+
+    def _navigation_step_projection_features_v1(
+        self,
+        *,
+        action_id: int,
+        action_posterior: dict[str, Any] | None,
+        navigation_target_features: dict[str, Any] | None,
+        predicted_region_features: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_name": "active_inference_navigation_step_projection_features_v1",
+            "schema_version": 1,
+            "enabled": False,
+            "action_id": int(action_id),
+            "target_kind": "unknown",
+            "target_salience": 0.0,
+            "target_digest": "NA",
+            "projection_source": "none",
+            "agent_pos_xy": {"x": -1, "y": -1},
+            "target_pos_xy": {"x": -1, "y": -1},
+            "expected_step_pos_xy": {"dx": 0.0, "dy": 0.0},
+            "distance_before": -1.0,
+            "distance_after": -1.0,
+            "distance_delta": 0.0,
+            "distance_delta_normalized": 0.0,
+            "step_manhattan": 0.0,
+            "alignment": 0.0,
+            "confidence": 0.0,
+            "bonus_hint": 0.0,
+            "penalty_hint": 0.0,
+            "moves_toward_target": False,
+            "moves_away_from_target": False,
+            "command_direction_bucket": "dir_unknown",
+        }
+        if int(action_id) not in (1, 2, 3, 4):
+            payload["reason"] = "non_navigation_action"
+            return payload
+
+        command_vec = self._action_direction_vector_v1(int(action_id))
+        if command_vec is not None:
+            payload["command_direction_bucket"] = self._direction_bucket_from_delta_v1(
+                int(command_vec[0]),
+                int(command_vec[1]),
+            )
+
+        target = (
+            navigation_target_features
+            if isinstance(navigation_target_features, dict)
+            else {}
+        )
+        if not bool(target.get("enabled", False)):
+            payload["reason"] = "navigation_target_disabled"
+            return payload
+
+        agent_pos = target.get("agent_pos_xy", {})
+        target_pos = target.get("target_pos_xy", {})
+        if not isinstance(agent_pos, dict) or not isinstance(target_pos, dict):
+            payload["reason"] = "invalid_target_payload"
+            return payload
+        agent_x = int(agent_pos.get("x", -1))
+        agent_y = int(agent_pos.get("y", -1))
+        target_x = int(target_pos.get("x", -1))
+        target_y = int(target_pos.get("y", -1))
+        if min(agent_x, agent_y, target_x, target_y) < 0:
+            payload["reason"] = "missing_agent_or_target_position"
+            return payload
+        payload["agent_pos_xy"] = {"x": int(agent_x), "y": int(agent_y)}
+        payload["target_pos_xy"] = {"x": int(target_x), "y": int(target_y)}
+        payload["target_kind"] = str(target.get("target_kind", "unknown"))
+        payload["target_salience"] = float(
+            max(0.0, min(1.0, float(target.get("target_salience", 0.0))))
+        )
+        payload["target_digest"] = str(target.get("target_digest", "NA"))
+
+        expected_dx = 0.0
+        expected_dy = 0.0
+        projection_source = "command_default"
+        projection_confidence = 0.25
+
+        predicted = (
+            predicted_region_features
+            if isinstance(predicted_region_features, dict)
+            else {}
+        )
+        predicted_enabled = bool(predicted.get("enabled", False))
+        if predicted_enabled:
+            current_region = predicted.get("current_region", {})
+            next_region = predicted.get("predicted_region", {})
+            if isinstance(current_region, dict) and isinstance(next_region, dict):
+                crx = int(current_region.get("x", -1))
+                cry = int(current_region.get("y", -1))
+                nrx = int(next_region.get("x", -1))
+                nry = int(next_region.get("y", -1))
+                if min(crx, cry, nrx, nry) >= 0:
+                    expected_dx = float((int(nrx) - int(crx)) * 8)
+                    expected_dy = float((int(nry) - int(cry)) * 8)
+                    projection_source = "predicted_region"
+                    projection_confidence = float(
+                        max(
+                            0.35,
+                            min(1.0, float(predicted.get("confidence", 0.0))),
+                        )
+                    )
+
+        if projection_source != "predicted_region":
+            posterior = action_posterior if isinstance(action_posterior, dict) else {}
+            mass = 0.0
+            weighted_dx = 0.0
+            weighted_dy = 0.0
+            dominant_prob = 0.0
+            for delta_key, value in posterior.items():
+                try:
+                    p_raw = float(value)
+                except Exception:
+                    p_raw = 0.0
+                if p_raw <= 0.0:
+                    continue
+                dx, dy = self._parse_delta_key_v1(str(delta_key))
+                weighted_dx += float(p_raw) * float(dx)
+                weighted_dy += float(p_raw) * float(dy)
+                mass += float(p_raw)
+            if mass > 1.0e-9:
+                for _, value in posterior.items():
+                    try:
+                        p_raw = float(value)
+                    except Exception:
+                        p_raw = 0.0
+                    if p_raw <= 0.0:
+                        continue
+                    dominant_prob = max(dominant_prob, float(p_raw / mass))
+                expected_dx = float(weighted_dx / mass)
+                expected_dy = float(weighted_dy / mass)
+                projection_source = "posterior_expected_delta"
+                projection_confidence = float(max(0.30, min(1.0, dominant_prob)))
+
+        if (
+            projection_source == "command_default"
+            and command_vec is not None
+        ):
+            command_dx, command_dy = command_vec
+            expected_dx = float(int(command_dx) * 5)
+            expected_dy = float(int(command_dy) * 5)
+
+        target_dx = float(target_x - agent_x)
+        target_dy = float(target_y - agent_y)
+        distance_before = float(abs(target_dx) + abs(target_dy))
+        projected_agent_x = float(agent_x) + float(expected_dx)
+        projected_agent_y = float(agent_y) + float(expected_dy)
+        distance_after = float(
+            abs(float(target_x) - projected_agent_x)
+            + abs(float(target_y) - projected_agent_y)
+        )
+        distance_delta = float(distance_after - distance_before)
+        distance_delta_normalized = float(
+            distance_delta / float(max(1.0, distance_before))
+        )
+        step_manhattan = float(abs(float(expected_dx)) + abs(float(expected_dy)))
+        toward_gain = float(
+            max(0.0, distance_before - distance_after)
+            / float(max(1.0, step_manhattan))
+        )
+        away_gain = float(
+            max(0.0, distance_after - distance_before)
+            / float(max(1.0, step_manhattan))
+        )
+
+        alignment = 0.0
+        step_norm = float(math.sqrt((expected_dx * expected_dx) + (expected_dy * expected_dy)))
+        target_norm = float(math.sqrt((target_dx * target_dx) + (target_dy * target_dy)))
+        if step_norm > 1.0e-9 and target_norm > 1.0e-9:
+            alignment = float(
+                max(
+                    -1.0,
+                    min(
+                        1.0,
+                        ((expected_dx * target_dx) + (expected_dy * target_dy))
+                        / float(step_norm * target_norm),
+                    ),
+                )
+            )
+
+        target_salience = float(payload.get("target_salience", 0.0))
+        confidence = float(max(0.0, min(1.0, projection_confidence)))
+        bonus_hint = float(max(0.0, toward_gain) * target_salience * confidence)
+        penalty_hint = float(max(0.0, away_gain) * target_salience * confidence)
+        payload.update(
+            {
+                "enabled": True,
+                "projection_source": str(projection_source),
+                "expected_step_pos_xy": {"dx": float(expected_dx), "dy": float(expected_dy)},
+                "distance_before": float(distance_before),
+                "distance_after": float(distance_after),
+                "distance_delta": float(distance_delta),
+                "distance_delta_normalized": float(distance_delta_normalized),
+                "step_manhattan": float(step_manhattan),
+                "alignment": float(alignment),
+                "confidence": float(confidence),
+                "bonus_hint": float(bonus_hint),
+                "penalty_hint": float(penalty_hint),
+                "moves_toward_target": bool(distance_after + 1.0e-6 < distance_before),
+                "moves_away_from_target": bool(distance_after > distance_before + 1.0e-6),
+            }
+        )
+        return payload
 
     def _navigation_direction_bucket_from_estimate_v1(
         self,
@@ -2309,56 +2743,137 @@ class ActiveInferenceEFE(Agent):
                 "control_schema_posterior": self._control_schema_posterior(),
             }
 
-        best_pair: tuple[Any, Any] | None = None
-        best_score = 10**9
         action_id = int(executed_candidate.action_id)
-        expected_dir = {
-            1: (0, -1),  # up
-            2: (0, 1),   # down
-            3: (-1, 0),  # left
-            4: (1, 0),   # right
-        }.get(action_id)
-        for previous in previous_nodes:
-            for current in current_nodes:
-                if int(previous.color) != int(current.color):
-                    continue
-                area_gap = abs(int(previous.area) - int(current.area))
-                if area_gap > max(2, int(previous.area * 0.3)):
-                    continue
-                delta_x = int(current.centroid_x) - int(previous.centroid_x)
-                delta_y = int(current.centroid_y) - int(previous.centroid_y)
-                shift = abs(delta_x) + abs(delta_y)
-                if shift <= 0:
-                    continue
+        expected_dir = self._action_direction_vector_v1(action_id)
+        tracked_digest = str(self._tracked_agent_token_digest or "")
+        expected_step = 5
 
-                # Navigation moves are one-tile translations; prefer displacements
-                # that are close to one-step and aligned with the commanded direction.
-                shift_error = abs(int(shift) - 5)
-                if shift < 2:
-                    shift_error += 6
-                direction_penalty = 0
-                if expected_dir is not None:
-                    expected_dx_sign, expected_dy_sign = expected_dir
-                    if expected_dx_sign < 0 and delta_x >= 0:
-                        direction_penalty += 30
-                    elif expected_dx_sign > 0 and delta_x <= 0:
-                        direction_penalty += 30
-                    if expected_dy_sign < 0 and delta_y >= 0:
-                        direction_penalty += 30
-                    elif expected_dy_sign > 0 and delta_y <= 0:
-                        direction_penalty += 30
-                    if expected_dx_sign != 0 and abs(delta_y) > abs(delta_x):
-                        direction_penalty += 12
-                    if expected_dy_sign != 0 and abs(delta_x) > abs(delta_y):
-                        direction_penalty += 12
+        def pair_metrics(previous: Any, current: Any) -> dict[str, float] | None:
+            if int(previous.color) != int(current.color):
+                return None
+            area_gap = abs(int(previous.area) - int(current.area))
+            if area_gap > max(2, int(previous.area * 0.3)):
+                return None
 
-                score = (area_gap * 10) + (shift_error * 6) + direction_penalty
-                if self._tracked_agent_token_digest is not None:
-                    if str(previous.digest) != self._tracked_agent_token_digest:
-                        score += 8
-                if score < best_score:
-                    best_score = score
-                    best_pair = (previous, current)
+            delta_x = int(current.centroid_x) - int(previous.centroid_x)
+            delta_y = int(current.centroid_y) - int(previous.centroid_y)
+            shift = abs(int(delta_x)) + abs(int(delta_y))
+            if shift <= 0:
+                return None
+
+            shift_error = abs(int(shift) - int(expected_step))
+            if shift < 2:
+                shift_error += 8
+            elif shift > 14:
+                shift_error += int(shift - 14) * 3
+
+            direction_penalty = 0
+            projection_error = 0
+            direction_alignment = 0.0
+            if expected_dir is not None:
+                expected_dx_sign, expected_dy_sign = expected_dir
+                if expected_dx_sign < 0 and delta_x >= 0:
+                    direction_penalty += 30
+                elif expected_dx_sign > 0 and delta_x <= 0:
+                    direction_penalty += 30
+                if expected_dy_sign < 0 and delta_y >= 0:
+                    direction_penalty += 30
+                elif expected_dy_sign > 0 and delta_y <= 0:
+                    direction_penalty += 30
+                if expected_dx_sign != 0 and abs(delta_y) > abs(delta_x):
+                    direction_penalty += 12
+                if expected_dy_sign != 0 and abs(delta_x) > abs(delta_y):
+                    direction_penalty += 12
+
+                projected_x = int(previous.centroid_x) + (int(expected_dx_sign) * int(expected_step))
+                projected_y = int(previous.centroid_y) + (int(expected_dy_sign) * int(expected_step))
+                projection_error = int(
+                    abs(int(current.centroid_x) - int(projected_x))
+                    + abs(int(current.centroid_y) - int(projected_y))
+                )
+                if shift > 0:
+                    direction_alignment = float(
+                        (
+                            (int(delta_x) * int(expected_dx_sign))
+                            + (int(delta_y) * int(expected_dy_sign))
+                        )
+                        / float(max(1, int(shift)))
+                    )
+
+            track_penalty = 0
+            if tracked_digest:
+                if str(previous.digest) != tracked_digest:
+                    track_penalty += 10
+                else:
+                    track_penalty -= 4
+                if str(current.digest) == tracked_digest:
+                    track_penalty -= 2
+
+            continuity_bonus = 0
+            if str(previous.object_id) == str(current.object_id):
+                continuity_bonus = 6
+
+            score = (
+                (int(area_gap) * 10)
+                + (int(shift_error) * 6)
+                + int(direction_penalty)
+                + (int(projection_error) * 2)
+                + int(track_penalty)
+                - int(continuity_bonus)
+            )
+            return {
+                "score": float(score),
+                "delta_x": float(delta_x),
+                "delta_y": float(delta_y),
+                "shift": float(shift),
+                "direction_alignment": float(max(-1.0, min(1.0, direction_alignment))),
+                "projection_error": float(projection_error),
+                "area_gap": float(area_gap),
+            }
+
+        def search(previous_pool: list[Any]) -> tuple[tuple[Any, Any] | None, dict[str, float]]:
+            best_pair_local: tuple[Any, Any] | None = None
+            best_metrics_local: dict[str, float] = {}
+            best_score_local = 10**9
+            for previous in previous_pool:
+                for current in current_nodes:
+                    metrics = pair_metrics(previous, current)
+                    if metrics is None:
+                        continue
+                    score = float(metrics.get("score", 10**9))
+                    if score < float(best_score_local):
+                        best_score_local = score
+                        best_pair_local = (previous, current)
+                        best_metrics_local = dict(metrics)
+            return best_pair_local, best_metrics_local
+
+        tracked_previous_nodes = (
+            [node for node in previous_nodes if str(node.digest) == tracked_digest]
+            if tracked_digest
+            else []
+        )
+        best_pair: tuple[Any, Any] | None = None
+        best_metrics: dict[str, float] = {}
+        if tracked_previous_nodes:
+            best_pair, best_metrics = search(tracked_previous_nodes)
+            fallback_pair, fallback_metrics = search(previous_nodes)
+            if fallback_pair is not None:
+                fallback_score = float(fallback_metrics.get("score", 10**9))
+                tracked_score = float(best_metrics.get("score", 10**9))
+                tracked_alignment = float(best_metrics.get("direction_alignment", 0.0))
+                tracked_projection_error = float(best_metrics.get("projection_error", 10**9))
+                tracked_low_quality = bool(
+                    expected_dir is not None
+                    and (
+                        tracked_alignment < 0.0
+                        or tracked_projection_error > 14.0
+                    )
+                )
+                if tracked_low_quality or (fallback_score + 6.0 < tracked_score):
+                    best_pair = fallback_pair
+                    best_metrics = fallback_metrics
+        else:
+            best_pair, best_metrics = search(previous_nodes)
 
         if best_pair is None:
             return {
@@ -2372,6 +2887,7 @@ class ActiveInferenceEFE(Agent):
         previous, current = best_pair
         delta_x = int(current.centroid_x) - int(previous.centroid_x)
         delta_y = int(current.centroid_y) - int(previous.centroid_y)
+        shift = int(abs(delta_x) + abs(delta_y))
         delta_key = f"dx={delta_x}|dy={delta_y}"
         action_key = str(int(executed_candidate.action_id))
         per_action = self._control_schema_counts.setdefault(action_key, {})
@@ -2396,6 +2912,15 @@ class ActiveInferenceEFE(Agent):
                 "y": int(max(0, min(7, int(current.centroid_y) // 8))),
             },
             "delta_pos_xy": {"dx": int(delta_x), "dy": int(delta_y)},
+            "displacement_manhattan": int(shift),
+            "match_score": float(best_metrics.get("score", 0.0)),
+            "direction_alignment": float(best_metrics.get("direction_alignment", 0.0)),
+            "projection_error": float(best_metrics.get("projection_error", 0.0)),
+            "tracked_pair_source": (
+                "tracked_first_pass"
+                if tracked_previous_nodes and str(previous.digest) == tracked_digest
+                else "global_pair_search"
+            ),
             "action_id": int(executed_candidate.action_id),
             "control_schema_posterior": self._control_schema_posterior(),
         }
@@ -2993,6 +3518,14 @@ class ActiveInferenceEFE(Agent):
                                 target_payload = dict(navigation_target_features)
                                 target_payload["candidate_action_id"] = int(candidate.action_id)
                                 candidate.metadata["navigation_target_features_v1"] = target_payload
+                                candidate.metadata["navigation_step_projection_features_v1"] = (
+                                    self._navigation_step_projection_features_v1(
+                                        action_id=int(candidate.action_id),
+                                        action_posterior=action_posterior,
+                                        navigation_target_features=target_payload,
+                                        predicted_region_features=predicted_region_features,
+                                    )
+                                )
                                 candidate.metadata["region_graph_snapshot_v1"] = dict(
                                     region_graph_snapshot
                                 )
@@ -3175,6 +3708,11 @@ class ActiveInferenceEFE(Agent):
                     "summary": representation.summary,
                 }
             )
+            trace_object_snapshot = self._trace_object_snapshot_v1(representation)
+            trace_neighborhood_context = self._trace_neighborhood_context_v1(
+                packet=packet,
+                representation=representation,
+            )
             self.trace_recorder.write(
                 {
                     "schema_name": "active_inference_step_trace_v1",
@@ -3189,6 +3727,8 @@ class ActiveInferenceEFE(Agent):
                     "phase": phase,
                     "observation_packet_summary": self._observation_summary_for_trace(packet),
                     "representation_state": representation_payload,
+                    "trace_object_snapshot_v1": trace_object_snapshot,
+                    "trace_neighborhood_context_v1": trace_neighborhood_context,
                     "candidate_count": int(len(candidates)),
                     "selected_candidate": selected_candidate.to_dict(),
                     "ranked_candidates_by_efe": [
