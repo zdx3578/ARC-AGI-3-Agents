@@ -2257,11 +2257,14 @@ class ActiveInferenceEFE(Agent):
         verify_action_ids = {
             int(v) for v in verify_action_ids_raw if isinstance(v, int) or str(v).isdigit()
         }
-        if not verify_action_ids:
-            verify_action_ids = {6}
+        verify_actions_available = bool(verify_action_ids)
         verify_action_candidate = bool(
             str(state.get("stage", "idle")) == "verify"
-            and action_id in verify_action_ids
+            and (
+                action_id in verify_action_ids
+                if verify_actions_available
+                else action_id in (1, 2, 3, 4)
+            )
         )
         bonus_hint = 0.0
         penalty_hint = 0.0
@@ -2342,7 +2345,13 @@ class ActiveInferenceEFE(Agent):
             }
         )
         if not verify_action_ids:
-            verify_action_ids = [6]
+            verify_action_ids = sorted(
+                {
+                    int(v)
+                    for v in current_packet.available_actions
+                    if int(v) in (1, 2, 3, 4)
+                }
+            )
         state["verify_action_ids"] = [int(v) for v in verify_action_ids]
         current_counter = int(getattr(current_packet, "action_counter", 0))
         if bool(state.get("active", False)):
@@ -2491,6 +2500,9 @@ class ActiveInferenceEFE(Agent):
             if self._parse_region_key_v1(str(k)) is not None
         }
         min_samples_per_target = int(max(1, self.high_info_min_samples_per_target))
+        high_value_threshold = float(
+            max(0.0, min(1.0, float(self.high_info_focus_min_trigger_score)))
+        )
 
         source_region_key = "NA"
         if transition_record is not None:
@@ -2524,7 +2536,7 @@ class ActiveInferenceEFE(Agent):
 
         def _collect_hot_targets(anchor_region_key: str) -> dict[str, float]:
             target_scores_local: dict[str, float] = {}
-            scoreboard = self._high_info_region_scoreboard_v1(max_regions=16)
+            scoreboard = self._high_info_region_scoreboard_v1(max_regions=64)
             rows = scoreboard.get("rows", [])
             if not isinstance(rows, list):
                 rows = []
@@ -2587,7 +2599,7 @@ class ActiveInferenceEFE(Agent):
             min_samples: int,
         ) -> list[str]:
             current_target = str(state.get("current_target_region_key", "NA"))
-            rows: list[tuple[int, int, int, float, int, int, str]] = []
+            rows: list[tuple[int, int, int, int, float, int, int, str]] = []
             for region_key, score in target_scores_raw.items():
                 region_key = str(region_key)
                 if self._parse_region_key_v1(region_key) is None:
@@ -2600,11 +2612,15 @@ class ActiveInferenceEFE(Agent):
                 carry_priority = 0 if region_key == current_target else 1
                 completed_priority = 1 if region_key in completed_recent else 0
                 remaining_priority = 0 if remaining_samples > 0 else 1
+                high_value_priority = (
+                    0 if score_value >= float(high_value_threshold) else 1
+                )
                 unsampled_bonus = 0.12 if sample_count <= 0 else 0.0
                 adjusted_score = float(score_value + unsampled_bonus)
                 rows.append(
                     (
                         int(remaining_priority),
+                        int(high_value_priority),
                         int(carry_priority),
                         int(completed_priority),
                         float(-adjusted_score),
@@ -2614,26 +2630,45 @@ class ActiveInferenceEFE(Agent):
                     )
                 )
             rows.sort()
-            limit = int(max(1, self.high_info_focus_max_targets))
-            return [str(row[-1]) for row in rows[:limit]]
+            return [str(row[-1]) for row in rows]
 
         if should_trigger:
             was_active_before_trigger = bool(state.get("active", False))
             new_targets = _collect_hot_targets(str(source_region_key))
             merged_scores: dict[str, float] = {}
             for region_key, old_score in score_memory.items():
+                sample_count = int(max(0, target_sample_counts.get(str(region_key), 0)))
+                retention_floor = (
+                    0.22 if sample_count < int(min_samples_per_target) else 0.0
+                )
                 merged_scores[str(region_key)] = float(max(0.0, 0.86 * float(old_score)))
+                if retention_floor > 0.0:
+                    merged_scores[str(region_key)] = float(
+                        max(float(merged_scores[str(region_key)]), float(retention_floor))
+                    )
             for region_key, new_score in new_targets.items():
                 merged_scores[str(region_key)] = max(
                     float(merged_scores.get(str(region_key), 0.0)),
                     float(new_score),
                 )
-            min_keep = float(max(0.12, 0.35 * float(self.high_info_focus_min_trigger_score)))
+            min_keep = float(max(0.08, 0.35 * float(self.high_info_focus_min_trigger_score)))
+            mandatory_keep = {
+                str(region_key)
+                for (region_key, sample_count) in target_sample_counts.items()
+                if self._parse_region_key_v1(str(region_key)) is not None
+                and int(sample_count) < int(min_samples_per_target)
+            }
             merged_scores = {
                 str(region_key): float(score)
                 for (region_key, score) in merged_scores.items()
-                if self._parse_region_key_v1(str(region_key)) is not None and float(score) >= min_keep
+                if self._parse_region_key_v1(str(region_key)) is not None
+                and (
+                    float(score) >= min_keep
+                    or str(region_key) in mandatory_keep
+                )
             }
+            for region_key in merged_scores.keys():
+                target_sample_counts.setdefault(str(region_key), 0)
             score_memory = dict(merged_scores)
             state["active"] = bool(score_memory)
             state["stage"] = "seek"

@@ -386,9 +386,8 @@ class ActiveInferencePolicyEvaluatorV1:
             return ordered_entries[0], diagnostics
 
         diagnostics["enabled"] = True
-        diagnostics["mode"] = "serpentine_complete"
-        diagnostics["prepass_complete"] = True
-        return None, diagnostics
+        diagnostics["mode"] = "serpentine_complete_bfs_fallback"
+        diagnostics["prepass_complete"] = False
 
         sample_entry = navigation_entries[0]
         sample_candidate_id = str(sample_entry.candidate.candidate_id)
