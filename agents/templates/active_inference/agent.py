@@ -1776,17 +1776,25 @@ class ActiveInferenceEFE(Agent):
                 distance_term = float(
                     max(0.0, 1.0 - min(1.0, float(max(0, distance - 1)) / 6.0))
                 )
+                local_loop_penalty = 0.0
+                if distance <= 1 and pair_affinity >= 0.65:
+                    local_loop_penalty = float(min(0.25, 0.18 * pair_affinity))
                 base = float(_region_base_score(key))
                 nav_hint = float(max(0.0, min(1.0, nav_region_hints.get(key, 0.0))))
                 nav_kind = float(max(0.0, min(1.0, nav_region_kind_bonus.get(key, 0.0))))
                 nav_prior = float(max(0.0, min(1.0, (0.70 * nav_hint) + (0.30 * nav_kind))))
-                score = float(
-                    (0.48 * base)
-                    + (0.24 * pair_affinity)
-                    + (0.10 * distance_term)
-                    + (0.18 * nav_prior)
-                )
                 visit_count = int(max(0, self._region_visit_counts.get(key, 0)))
+                underexplored = float(
+                    max(0.0, 1.0 - min(1.0, float(max(0, visit_count)) / 6.0))
+                )
+                score = float(
+                    (0.36 * base)
+                    + (0.16 * pair_affinity)
+                    + (0.10 * distance_term)
+                    + (0.28 * nav_prior)
+                    + (0.10 * underexplored)
+                    - local_loop_penalty
+                )
                 attempts = int(max(0, row_by_region.get(key, {}).get("attempts", 0)))
                 secondary_candidates.append(
                     (
@@ -1861,6 +1869,18 @@ class ActiveInferenceEFE(Agent):
             "primary_region_score": float(primary_region_score),
             "secondary_region_score": float(secondary_region_score),
             "pair_affinity_score": float(pair_affinity_score),
+            "primary_nav_hint": float(
+                max(0.0, min(1.0, nav_region_hints.get(str(primary_region_key), 0.0)))
+            ),
+            "secondary_nav_hint": float(
+                max(0.0, min(1.0, nav_region_hints.get(str(secondary_region_key), 0.0)))
+            ),
+            "primary_nav_kind_bonus": float(
+                max(0.0, min(1.0, nav_region_kind_bonus.get(str(primary_region_key), 0.0)))
+            ),
+            "secondary_nav_kind_bonus": float(
+                max(0.0, min(1.0, nav_region_kind_bonus.get(str(secondary_region_key), 0.0)))
+            ),
             "coupled_region_keys": list(coupled_region_keys),
             "fallback_source_region_key": str(fallback_key),
             "cross_region_key": str(primary_region_key),

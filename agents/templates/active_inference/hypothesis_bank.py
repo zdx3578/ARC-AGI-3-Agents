@@ -384,6 +384,15 @@ def _classify_observed_change_type(
         return "METADATA_PROGRESS_CHANGE"
 
     if object_count_delta != 0:
+        # Objectization can jitter under motion (split/merge artifacts). Avoid
+        # over-tagging these as structural count-change when translation evidence
+        # is clear and the disturbed area remains local.
+        if (
+            translation_match_count > 0
+            and abs(int(object_count_delta)) <= 2
+            and float(changed_area_ratio) < 0.20
+        ):
+            return "CC_TRANSLATION"
         return "CC_COUNT_CHANGE"
 
     if translation_match_count > 0 and changed_area_ratio < 0.35:
