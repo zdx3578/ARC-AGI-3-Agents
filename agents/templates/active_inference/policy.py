@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import math
 from typing import Any
 
@@ -133,6 +134,426 @@ class ActiveInferencePolicyEvaluatorV1:
             4: "dir_r",
         }
         return str(mapping.get(int(action_id), "na"))
+
+    @staticmethod
+    def _parse_region_key(region_key: str) -> tuple[int, int] | None:
+        try:
+            sx, sy = str(region_key).split(":", 1)
+            rx = int(sx)
+            ry = int(sy)
+        except Exception:
+            return None
+        if rx < 0 or ry < 0:
+            return None
+        return (int(rx), int(ry))
+
+    @classmethod
+    def _region_distance_from_keys(
+        cls,
+        source_region_key: str,
+        target_region_key: str,
+    ) -> int:
+        source = cls._parse_region_key(source_region_key)
+        target = cls._parse_region_key(target_region_key)
+        if source is None or target is None:
+            return 10**6
+        sx, sy = source
+        tx, ty = target
+        return int(abs(int(sx) - int(tx)) + abs(int(sy) - int(ty)))
+
+    def _region_graph_adjacency(
+        self,
+        snapshot: dict[str, Any] | None,
+    ) -> dict[str, dict[str, int]]:
+        adjacency: dict[str, dict[str, int]] = {}
+        if not isinstance(snapshot, dict):
+            return adjacency
+        edges = snapshot.get("edges", [])
+        if not isinstance(edges, list):
+            return adjacency
+        for row in edges:
+            if not isinstance(row, dict):
+                continue
+            source = str(row.get("source_region_key", "NA"))
+            target = str(row.get("target_region_key", "NA"))
+            if self._parse_region_key(source) is None:
+                continue
+            if self._parse_region_key(target) is None:
+                continue
+            count = int(max(0, row.get("count", 0)))
+            if count <= 0:
+                continue
+            source_hist = adjacency.setdefault(source, {})
+            source_hist[target] = max(int(source_hist.get(target, 0)), int(count))
+        return adjacency
+
+    def _bfs_next_region_key(
+        self,
+        adjacency: dict[str, dict[str, int]],
+        *,
+        start_region_key: str,
+        goal_region_key: str,
+    ) -> str:
+        start = str(start_region_key)
+        goal = str(goal_region_key)
+        if start == goal:
+            return str(start)
+        if start not in adjacency:
+            return "NA"
+        queue: deque[str] = deque([start])
+        parent: dict[str, str | None] = {start: None}
+        while queue:
+            node = str(queue.popleft())
+            neighbors = adjacency.get(node, {})
+            for neighbor, _ in sorted(
+                neighbors.items(),
+                key=lambda item: (-int(item[1]), str(item[0])),
+            ):
+                next_node = str(neighbor)
+                if next_node in parent:
+                    continue
+                parent[next_node] = node
+                if next_node == goal:
+                    cursor = str(next_node)
+                    while parent.get(cursor) not in (None, start):
+                        cursor = str(parent.get(cursor))
+                    return str(cursor)
+                queue.append(next_node)
+        return "NA"
+
+    @classmethod
+    def _serpentine_region_rank(cls, region_key: str) -> int:
+        parsed = cls._parse_region_key(region_key)
+        if parsed is None:
+            return 10**6
+        rx, ry = parsed
+        if int(ry) % 2 == 0:
+            col = int(rx)
+        else:
+            col = int(7 - int(rx))
+        return int((int(ry) * 8) + col)
+
+    @classmethod
+    def _direction_toward_region(
+        cls,
+        *,
+        source_region_key: str,
+        target_region_key: str,
+    ) -> str:
+        source = cls._parse_region_key(source_region_key)
+        target = cls._parse_region_key(target_region_key)
+        if source is None or target is None:
+            return "na"
+        sx, sy = source
+        tx, ty = target
+        dx = int(tx) - int(sx)
+        dy = int(ty) - int(sy)
+        if abs(dx) >= abs(dy):
+            if dx < 0:
+                return "dir_l"
+            if dx > 0:
+                return "dir_r"
+        if dy < 0:
+            return "dir_u"
+        if dy > 0:
+            return "dir_d"
+        return "na"
+
+    def _two_pass_serpentine_action_id(self, action_counter: int) -> int | None:
+        row_count = 8
+        horizontal_span = 12
+        vertical_span = 1
+        pass_length = int((row_count * horizontal_span) + ((row_count - 1) * vertical_span))
+        total_length = int(2 * pass_length)
+        step = int(max(0, action_counter))
+        if step >= int(total_length):
+            return None
+        pass_index = int(step // pass_length)
+        offset = int(step % pass_length)
+        for row in range(row_count):
+            horizontal_direction = 3 if ((row + pass_index) % 2 == 0) else 4
+            if offset < horizontal_span:
+                return int(horizontal_direction)
+            offset -= int(horizontal_span)
+            if row >= (row_count - 1):
+                break
+            if offset < vertical_span:
+                return int(1 if pass_index == 0 else 2)
+            offset -= int(vertical_span)
+        return None
+
+    def _select_fixed_two_pass_traversal_entry(
+        self,
+        *,
+        packet: ObservationPacketV1,
+        entries: list[FreeEnergyLedgerEntryV1],
+        action_count_map: dict[int, int],
+    ) -> tuple[FreeEnergyLedgerEntryV1 | None, dict[str, Any]]:
+        diagnostics: dict[str, Any] = {
+            "enabled": False,
+            "mode": "inactive",
+            "visit_target": int(max(1, self.coverage_sweep_min_region_visits)),
+            "known_region_count": 0,
+            "min_region_visit_count": 0,
+            "regions_visited_at_least_target": 0,
+            "current_region_key": "NA",
+            "goal_region_key": "NA",
+            "next_region_key": "NA",
+            "desired_direction": "na",
+            "cross_region_key": "NA",
+            "cross_region_visit_count": 0,
+            "cross_visit_target": int(max(1, self.coverage_sweep_min_region_visits)),
+            "prepass_complete": False,
+            "candidate_pool_size": 0,
+        }
+        if int(packet.levels_completed) > 0:
+            diagnostics["mode"] = "levels_progressed"
+            return None, diagnostics
+        if int(packet.action_counter) >= int(self.coverage_prepass_steps):
+            diagnostics["mode"] = "prepass_window_exhausted"
+            return None, diagnostics
+
+        navigation_entries = [
+            entry
+            for entry in entries
+            if int(entry.candidate.action_id) in (1, 2, 3, 4)
+        ]
+        diagnostics["candidate_pool_size"] = int(len(navigation_entries))
+        if not navigation_entries:
+            diagnostics["mode"] = "no_navigation_candidates"
+            return None, diagnostics
+
+        predicted_stats_by_candidate_id: dict[str, dict[str, Any]] = {
+            str(entry.candidate.candidate_id): self._candidate_predicted_region_stats(
+                entry.candidate
+            )
+            for entry in navigation_entries
+        }
+        scripted_action_id = self._two_pass_serpentine_action_id(
+            int(packet.action_counter)
+        )
+        if scripted_action_id is not None:
+            scripted_direction = self._navigation_action_direction(int(scripted_action_id))
+
+            def _script_sort_key(entry: FreeEnergyLedgerEntryV1) -> tuple[Any, ...]:
+                stats = predicted_stats_by_candidate_id.get(
+                    str(entry.candidate.candidate_id),
+                    {},
+                )
+                edge_attempts = int(stats.get("edge_attempts", 0))
+                edge_blocked_rate = float(stats.get("edge_blocked_rate", 0.0))
+                retry_saturated = bool(
+                    edge_attempts >= int(self.coverage_sweep_direction_retry_limit)
+                    and edge_blocked_rate >= 0.5
+                )
+                return (
+                    0 if int(entry.candidate.action_id) == int(scripted_action_id) else 1,
+                    1 if retry_saturated else 0,
+                    int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                    int(entry.candidate.action_id),
+                    str(entry.candidate.candidate_id),
+                )
+
+            ordered_entries = sorted(navigation_entries, key=_script_sort_key)
+            diagnostics["enabled"] = True
+            diagnostics["mode"] = "deterministic_serpentine"
+            diagnostics["desired_direction"] = str(scripted_direction)
+            return ordered_entries[0], diagnostics
+
+        diagnostics["enabled"] = True
+        diagnostics["mode"] = "serpentine_complete"
+        diagnostics["prepass_complete"] = True
+        return None, diagnostics
+
+        sample_entry = navigation_entries[0]
+        sample_candidate_id = str(sample_entry.candidate.candidate_id)
+        sample_stats = predicted_stats_by_candidate_id.get(sample_candidate_id, {})
+        current_region_key = str(sample_stats.get("current_region_key", "NA"))
+        diagnostics["current_region_key"] = str(current_region_key)
+
+        navigation_target = sample_entry.candidate.metadata.get(
+            "navigation_target_features_v1",
+            {},
+        )
+        if not isinstance(navigation_target, dict):
+            navigation_target = {}
+        region_graph_snapshot = sample_entry.candidate.metadata.get(
+            "region_graph_snapshot_v1",
+            {},
+        )
+        if not isinstance(region_graph_snapshot, dict):
+            region_graph_snapshot = {}
+        region_visit_histogram = region_graph_snapshot.get("region_visit_histogram", {})
+        if not isinstance(region_visit_histogram, dict):
+            region_visit_histogram = {}
+
+        visit_target = int(max(1, self.coverage_sweep_min_region_visits))
+        diagnostics["visit_target"] = int(visit_target)
+
+        cross_region = navigation_target.get("cross_like_target_region", {})
+        if not isinstance(cross_region, dict):
+            cross_region = {}
+        cross_rx = int(cross_region.get("x", -1))
+        cross_ry = int(cross_region.get("y", -1))
+        cross_region_key = (
+            f"{cross_rx}:{cross_ry}"
+            if cross_rx >= 0 and cross_ry >= 0
+            else "NA"
+        )
+        diagnostics["cross_region_key"] = str(cross_region_key)
+        cross_region_visit_count = int(
+            max(
+                0,
+                navigation_target.get(
+                    "cross_like_target_region_visit_count",
+                    region_visit_histogram.get(cross_region_key, 0),
+                ),
+            )
+        )
+        diagnostics["cross_region_visit_count"] = int(cross_region_visit_count)
+
+        normalized_region_visits: dict[str, int] = {}
+        for region_key_raw, count_raw in region_visit_histogram.items():
+            region_key = str(region_key_raw)
+            if self._parse_region_key(region_key) is None:
+                continue
+            normalized_region_visits[region_key] = int(max(0, count_raw))
+        if current_region_key != "NA" and self._parse_region_key(current_region_key) is not None:
+            normalized_region_visits.setdefault(str(current_region_key), 0)
+        if cross_region_key != "NA" and self._parse_region_key(cross_region_key) is not None:
+            normalized_region_visits.setdefault(str(cross_region_key), int(cross_region_visit_count))
+
+        known_region_count = int(len(normalized_region_visits))
+        min_region_visit_count = int(min(normalized_region_visits.values(), default=0))
+        regions_visited_at_least_target = int(
+            sum(1 for count in normalized_region_visits.values() if int(count) >= int(visit_target))
+        )
+        diagnostics["known_region_count"] = int(known_region_count)
+        diagnostics["min_region_visit_count"] = int(min_region_visit_count)
+        diagnostics["regions_visited_at_least_target"] = int(regions_visited_at_least_target)
+
+        under_visited_regions = sorted(
+            (
+                (region_key, int(count))
+                for region_key, count in normalized_region_visits.items()
+                if int(count) < int(visit_target)
+            ),
+            key=lambda item: (
+                int(item[1]),
+                int(self._serpentine_region_rank(str(item[0]))),
+                str(item[0]),
+            ),
+        )
+
+        cross_under_visited = bool(
+            cross_region_key != "NA"
+            and self._parse_region_key(cross_region_key) is not None
+            and int(cross_region_visit_count) < int(visit_target)
+        )
+        if cross_under_visited:
+            goal_region_key = str(cross_region_key)
+        elif under_visited_regions:
+            goal_region_key = str(under_visited_regions[0][0])
+        else:
+            diagnostics["enabled"] = True
+            diagnostics["mode"] = "prepass_complete"
+            diagnostics["prepass_complete"] = True
+            return None, diagnostics
+        diagnostics["goal_region_key"] = str(goal_region_key)
+
+        adjacency = self._region_graph_adjacency(region_graph_snapshot)
+        next_region_key = "NA"
+        if (
+            self._parse_region_key(current_region_key) is not None
+            and self._parse_region_key(goal_region_key) is not None
+        ):
+            next_region_key = self._bfs_next_region_key(
+                adjacency,
+                start_region_key=str(current_region_key),
+                goal_region_key=str(goal_region_key),
+            )
+        if (
+            next_region_key == "NA"
+            and self._parse_region_key(goal_region_key) is not None
+        ):
+            next_region_key = str(goal_region_key)
+        diagnostics["next_region_key"] = str(next_region_key)
+
+        desired_direction = self._direction_toward_region(
+            source_region_key=str(current_region_key),
+            target_region_key=str(next_region_key),
+        )
+        if desired_direction not in ("dir_l", "dir_r", "dir_u", "dir_d"):
+            desired_direction = self._direction_toward_region(
+                source_region_key=str(current_region_key),
+                target_region_key=str(goal_region_key),
+            )
+        diagnostics["desired_direction"] = str(desired_direction)
+
+        if self._parse_region_key(current_region_key) is None:
+            bootstrap_cycle = [1, 3, 2, 4]
+            desired_action = int(
+                bootstrap_cycle[int(packet.action_counter) % int(len(bootstrap_cycle))]
+            )
+            ordered = sorted(
+                navigation_entries,
+                key=lambda entry: (
+                    0 if int(entry.candidate.action_id) == int(desired_action) else 1,
+                    int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                    int(entry.candidate.action_id),
+                    str(entry.candidate.candidate_id),
+                ),
+            )
+            diagnostics["enabled"] = True
+            diagnostics["mode"] = "bootstrap_cycle"
+            return ordered[0], diagnostics
+
+        def _hard_sort_key(entry: FreeEnergyLedgerEntryV1) -> tuple[Any, ...]:
+            stats = predicted_stats_by_candidate_id.get(
+                str(entry.candidate.candidate_id),
+                {},
+            )
+            entry_direction = self._entry_navigation_direction(entry)
+            edge_attempts = int(stats.get("edge_attempts", 0))
+            edge_blocked_rate = float(stats.get("edge_blocked_rate", 0.0))
+            direction_retry_saturated = bool(
+                edge_attempts >= int(self.coverage_sweep_direction_retry_limit)
+                and edge_blocked_rate >= 0.5
+            )
+            predicted_region_key = str(stats.get("predicted_region_key", "NA"))
+            current_key = str(stats.get("current_region_key", "NA"))
+            return (
+                0
+                if (
+                    desired_direction in ("dir_l", "dir_r", "dir_u", "dir_d")
+                    and str(entry_direction) == str(desired_direction)
+                    and not direction_retry_saturated
+                )
+                else 1,
+                0
+                if (
+                    predicted_region_key != "NA"
+                    and predicted_region_key != str(current_key)
+                )
+                else 1,
+                int(
+                    self._region_distance_from_keys(
+                        str(predicted_region_key),
+                        str(goal_region_key),
+                    )
+                ),
+                int(stats.get("predicted_region_visit_count", 10**6)),
+                int(stats.get("edge_attempts", 10**6)),
+                float(stats.get("edge_blocked_rate", 1.0)),
+                int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                int(entry.candidate.action_id),
+                str(entry.candidate.candidate_id),
+            )
+
+        ordered_entries = sorted(navigation_entries, key=_hard_sort_key)
+        diagnostics["enabled"] = True
+        diagnostics["mode"] = "bfs_two_pass"
+        return ordered_entries[0], diagnostics
 
     def _hierarchy_weights_for_phase(self, phase: str) -> dict[str, float]:
         # Layerwise EFE shaping terms:
@@ -1624,15 +2045,89 @@ class ActiveInferencePolicyEvaluatorV1:
         coverage_target_region_count = int(self.coverage_sweep_target_regions)
         coverage_periodic_resweep_active = False
         coverage_hard_prepass_active = False
+        coverage_prepass_goal_kind = "none"
+        coverage_prepass_goal_region = {"x": -1, "y": -1}
+        coverage_prepass_bfs_next_region_key = "NA"
+        coverage_prepass_bfs_applied = False
         coverage_score_margin_used = 0.0
         coverage_sweep_pattern = "disabled"
         coverage_sweep_target_region = {"x": -1, "y": -1}
         coverage_sweep_target_direction = "na"
+        fixed_two_pass_traversal_applied = False
+        fixed_two_pass_traversal_v1: dict[str, Any] = {
+            "enabled": False,
+            "mode": "inactive",
+            "visit_target": int(max(1, self.coverage_sweep_min_region_visits)),
+            "known_region_count": 0,
+            "min_region_visit_count": 0,
+            "regions_visited_at_least_target": 0,
+            "current_region_key": "NA",
+            "goal_region_key": "NA",
+            "next_region_key": "NA",
+            "desired_direction": "na",
+            "cross_region_key": "NA",
+            "cross_region_visit_count": 0,
+            "cross_visit_target": int(max(1, self.coverage_sweep_min_region_visits)),
+            "prepass_complete": False,
+            "candidate_pool_size": 0,
+        }
         direction_sequence_probe_applied = False
         direction_sequence_probe_candidates: list[dict[str, Any]] = []
 
+        fixed_prepass_entry, fixed_two_pass_traversal_v1 = (
+            self._select_fixed_two_pass_traversal_entry(
+                packet=packet,
+                entries=entries,
+                action_count_map=action_count_map,
+            )
+        )
+        if fixed_prepass_entry is not None:
+            selected_entry = fixed_prepass_entry
+            fixed_two_pass_traversal_applied = True
+            least_tried_probe_applied = True
+            coverage_region_probe_applied = True
+            coverage_sweep_active = True
+            coverage_hard_prepass_active = True
+            coverage_sweep_reason = "fixed_two_pass_prepass"
+            coverage_known_region_count = int(
+                fixed_two_pass_traversal_v1.get("known_region_count", 0)
+            )
+            coverage_min_region_visit_count = int(
+                fixed_two_pass_traversal_v1.get("min_region_visit_count", 0)
+            )
+            coverage_regions_visited_at_least_twice = int(
+                fixed_two_pass_traversal_v1.get("regions_visited_at_least_target", 0)
+            )
+            coverage_prepass_goal_kind = str(
+                fixed_two_pass_traversal_v1.get("mode", "two_pass")
+            )
+            coverage_prepass_bfs_applied = bool(
+                str(fixed_two_pass_traversal_v1.get("mode", ""))
+                == "bfs_two_pass"
+            )
+            coverage_prepass_bfs_next_region_key = str(
+                fixed_two_pass_traversal_v1.get("next_region_key", "NA")
+            )
+            coverage_sweep_target_direction = str(
+                fixed_two_pass_traversal_v1.get("desired_direction", "na")
+            )
+            goal_region_key = str(
+                fixed_two_pass_traversal_v1.get("goal_region_key", "NA")
+            )
+            goal_parsed = self._parse_region_key(goal_region_key)
+            if goal_parsed is not None:
+                goal_rx, goal_ry = goal_parsed
+                coverage_prepass_goal_region = {"x": int(goal_rx), "y": int(goal_ry)}
+                coverage_sweep_target_region = {"x": int(goal_rx), "y": int(goal_ry)}
+            if selected_entry is not entries[0]:
+                entries.remove(selected_entry)
+                entries.insert(0, selected_entry)
+
         early_probe_active = bool(
-            int(early_probe_budget_remaining) > 0 and phase in ("explore", "explain")
+            (not fixed_two_pass_traversal_applied)
+            and (not bool(fixed_two_pass_traversal_v1.get("prepass_complete", False)))
+            and int(early_probe_budget_remaining) > 0
+            and phase in ("explore", "explain")
         )
         if early_probe_active:
             available_action_ids = sorted(
@@ -1726,6 +2221,8 @@ class ActiveInferencePolicyEvaluatorV1:
             or (self.coverage_sweep_force_in_exploit and phase == "exploit")
         )
         if (
+            not fixed_two_pass_traversal_applied
+            and
             not early_probe_applied
             and coverage_phase_allowed
             and int(packet.levels_completed) <= 0
@@ -1777,7 +2274,7 @@ class ActiveInferencePolicyEvaluatorV1:
                     )
                 )
                 coverage_region_goal_unmet = bool(
-                    coverage_known_region_count < int(self.coverage_sweep_target_regions)
+                    coverage_known_region_count <= 0
                 )
                 coverage_revisit_goal_unmet = bool(
                     int(self.coverage_sweep_min_region_visits) > 1
@@ -1827,6 +2324,8 @@ class ActiveInferencePolicyEvaluatorV1:
                     target_ry = -1
                     target_direction = "na"
                     current_region_visit_reference = 0
+                    prepass_goal_region_key = "NA"
+                    prepass_current_region_key = "NA"
                     if self.coverage_matrix_sweep_enabled:
                         coverage_sweep_pattern = "row_serpentine_up"
                         sample_stats = predicted_stats_by_candidate_id.get(
@@ -1867,6 +2366,116 @@ class ActiveInferencePolicyEvaluatorV1:
                         "y": int(target_ry),
                     }
                     coverage_sweep_target_direction = str(target_direction)
+                    if coverage_hard_prepass_active and navigation_entries:
+                        sample_entry = navigation_entries[0]
+                        sample_candidate_id = str(sample_entry.candidate.candidate_id)
+                        sample_stats = predicted_stats_by_candidate_id.get(
+                            sample_candidate_id,
+                            {},
+                        )
+                        prepass_current_region_key = str(
+                            sample_stats.get("current_region_key", "NA")
+                        )
+                        navigation_target = sample_entry.candidate.metadata.get(
+                            "navigation_target_features_v1",
+                            {},
+                        )
+                        if not isinstance(navigation_target, dict):
+                            navigation_target = {}
+                        region_graph_snapshot = sample_entry.candidate.metadata.get(
+                            "region_graph_snapshot_v1",
+                            {},
+                        )
+                        if not isinstance(region_graph_snapshot, dict):
+                            region_graph_snapshot = {}
+
+                        region_visit_histogram = region_graph_snapshot.get(
+                            "region_visit_histogram",
+                            {},
+                        )
+                        if not isinstance(region_visit_histogram, dict):
+                            region_visit_histogram = {}
+
+                        least_region_key = "NA"
+                        least_region_count = 10**9
+                        for region_key_raw, count_raw in region_visit_histogram.items():
+                            region_key = str(region_key_raw)
+                            if self._parse_region_key(region_key) is None:
+                                continue
+                            count = int(max(0, count_raw))
+                            if count < least_region_count:
+                                least_region_count = int(count)
+                                least_region_key = str(region_key)
+
+                        cross_enabled = bool(navigation_target.get("cross_like_enabled", False))
+                        cross_region = navigation_target.get("cross_like_target_region", {})
+                        if not isinstance(cross_region, dict):
+                            cross_region = {}
+                        cross_rx = int(cross_region.get("x", -1))
+                        cross_ry = int(cross_region.get("y", -1))
+                        cross_region_key = (
+                            f"{cross_rx}:{cross_ry}"
+                            if cross_rx >= 0 and cross_ry >= 0
+                            else "NA"
+                        )
+                        cross_region_visit_count = int(
+                            max(
+                                0,
+                                navigation_target.get(
+                                    "cross_like_target_region_visit_count",
+                                    region_visit_histogram.get(cross_region_key, 0),
+                                ),
+                            )
+                        )
+
+                        if (
+                            cross_enabled
+                            and cross_region_key != "NA"
+                            and cross_region_visit_count <= 0
+                        ):
+                            prepass_goal_region_key = str(cross_region_key)
+                            coverage_prepass_goal_kind = "cross_like_unvisited"
+                            coverage_sweep_reason = f"{coverage_sweep_reason}|cross_goal"
+                        elif least_region_key != "NA":
+                            prepass_goal_region_key = str(least_region_key)
+                            coverage_prepass_goal_kind = "least_visited_region"
+                            coverage_sweep_reason = f"{coverage_sweep_reason}|coverage_goal"
+
+                        parsed_goal_region = self._parse_region_key(prepass_goal_region_key)
+                        if parsed_goal_region is not None:
+                            goal_rx, goal_ry = parsed_goal_region
+                            target_rx = int(goal_rx)
+                            target_ry = int(goal_ry)
+                            coverage_prepass_goal_region = {
+                                "x": int(goal_rx),
+                                "y": int(goal_ry),
+                            }
+                            coverage_sweep_target_region = {
+                                "x": int(goal_rx),
+                                "y": int(goal_ry),
+                            }
+
+                        adjacency = self._region_graph_adjacency(region_graph_snapshot)
+                        if (
+                            self._parse_region_key(prepass_current_region_key) is not None
+                            and self._parse_region_key(prepass_goal_region_key) is not None
+                        ):
+                            bfs_next_region_key = self._bfs_next_region_key(
+                                adjacency,
+                                start_region_key=str(prepass_current_region_key),
+                                goal_region_key=str(prepass_goal_region_key),
+                            )
+                            if (
+                                bfs_next_region_key != "NA"
+                                and bfs_next_region_key != str(prepass_current_region_key)
+                            ):
+                                coverage_prepass_bfs_next_region_key = str(
+                                    bfs_next_region_key
+                                )
+                                coverage_prepass_bfs_applied = True
+                                coverage_sweep_reason = f"{coverage_sweep_reason}|bfs_path"
+                            elif prepass_goal_region_key != "NA":
+                                coverage_sweep_reason = f"{coverage_sweep_reason}|bfs_fallback"
                     best_navigation_score = min(
                         float(
                             selection_score_by_candidate.get(
@@ -2064,6 +2673,30 @@ class ActiveInferencePolicyEvaluatorV1:
                         if coverage_hard_prepass_active:
                             coverage_pool.sort(
                                 key=lambda entry: (
+                                    0
+                                    if (
+                                        bool(coverage_prepass_bfs_applied)
+                                        and str(coverage_prepass_bfs_next_region_key) != "NA"
+                                        and str(
+                                            predicted_stats_by_candidate_id.get(
+                                                str(entry.candidate.candidate_id),
+                                                {},
+                                            ).get("predicted_region_key", "NA")
+                                        )
+                                        == str(coverage_prepass_bfs_next_region_key)
+                                    )
+                                    else 1,
+                                    int(
+                                        self._region_distance_from_keys(
+                                            str(
+                                                predicted_stats_by_candidate_id.get(
+                                                    str(entry.candidate.candidate_id),
+                                                    {},
+                                                ).get("predicted_region_key", "NA")
+                                            ),
+                                            str(prepass_goal_region_key),
+                                        )
+                                    ),
                                     int(_coverage_frontier_visit(entry)),
                                     int(
                                         predicted_stats_by_candidate_id.get(
@@ -3018,7 +3651,11 @@ class ActiveInferencePolicyEvaluatorV1:
             candidate_count_map.get(str(entries[0].candidate.candidate_id), 0)
         )
         selected_transition_stats = self._candidate_transition_stats(entries[0].candidate)
-        if early_probe_applied:
+        if fixed_two_pass_traversal_applied:
+            tie_breaker_rule_applied = (
+                "fixed_two_pass_traversal_prepass(bfs_goal,min_visit<target,cross_priority)"
+            )
+        elif early_probe_applied:
             tie_breaker_rule_applied = "early_probe_budget_least_tried"
         elif coverage_region_probe_applied:
             tie_breaker_rule_applied = (
@@ -3118,6 +3755,15 @@ class ActiveInferencePolicyEvaluatorV1:
             "coverage_sweep_min_region_visits": int(self.coverage_sweep_min_region_visits),
             "coverage_prepass_steps": int(self.coverage_prepass_steps),
             "coverage_hard_prepass_active": bool(coverage_hard_prepass_active),
+            "coverage_prepass_goal_kind": str(coverage_prepass_goal_kind),
+            "coverage_prepass_goal_region": {
+                "x": int(coverage_prepass_goal_region.get("x", -1)),
+                "y": int(coverage_prepass_goal_region.get("y", -1)),
+            },
+            "coverage_prepass_bfs_applied": bool(coverage_prepass_bfs_applied),
+            "coverage_prepass_bfs_next_region_key": str(
+                coverage_prepass_bfs_next_region_key
+            ),
             "coverage_periodic_resweep_active": bool(
                 coverage_periodic_resweep_active
             ),
@@ -3137,6 +3783,8 @@ class ActiveInferencePolicyEvaluatorV1:
             ),
             "coverage_resweep_interval": int(self.coverage_resweep_interval),
             "coverage_resweep_span": int(self.coverage_resweep_span),
+            "fixed_two_pass_traversal_applied": bool(fixed_two_pass_traversal_applied),
+            "fixed_two_pass_traversal_v1": dict(fixed_two_pass_traversal_v1),
             "action6_only_space": bool(action6_only_space),
             "action6_stagnated": bool(action6_stagnated),
             "action6_only_stagnation_probe_applied": bool(

@@ -213,7 +213,7 @@ class ActiveInferenceEFE(Agent):
             0,
             _env_int(
                 "ACTIVE_INFERENCE_COVERAGE_PREPASS_STEPS",
-                min(192, int(self.MAX_ACTIONS)),
+                min(300, int(self.MAX_ACTIONS)),
             ),
         )
         self.coverage_matrix_sweep_enabled = _env_bool(
@@ -808,6 +808,9 @@ class ActiveInferenceEFE(Agent):
                 "target_direction_bucket": "dir_unknown",
                 "distance_before": -1.0,
                 "target_salience": 0.0,
+                "cross_like_enabled": False,
+                "cross_like_target_region": {"x": -1, "y": -1},
+                "cross_like_target_region_visit_count": 0,
                 "targets": [],
             }
 
@@ -832,6 +835,24 @@ class ActiveInferenceEFE(Agent):
                 and float(distance_before) > 0.0
             )
 
+        cross_target = next(
+            (row for row in targets if str(row.get("kind", "")) == "cross_like"),
+            None,
+        )
+        if isinstance(cross_target, dict):
+            cross_rx = int(max(0, min(7, int(cross_target.get("centroid_x", -1)) // 8)))
+            cross_ry = int(max(0, min(7, int(cross_target.get("centroid_y", -1)) // 8)))
+            cross_region_key = f"{cross_rx}:{cross_ry}"
+            cross_like_enabled = True
+            cross_like_target_region = {"x": int(cross_rx), "y": int(cross_ry)}
+            cross_like_target_region_visit_count = int(
+                self._region_visit_counts.get(cross_region_key, 0)
+            )
+        else:
+            cross_like_enabled = False
+            cross_like_target_region = {"x": -1, "y": -1}
+            cross_like_target_region_visit_count = 0
+
         return {
             "schema_name": "active_inference_navigation_target_features_v1",
             "schema_version": 1,
@@ -852,6 +873,9 @@ class ActiveInferenceEFE(Agent):
                 "x": int(max(0, min(7, int(primary.get("centroid_x", -1)) // 8))),
                 "y": int(max(0, min(7, int(primary.get("centroid_y", -1)) // 8))),
             },
+            "cross_like_enabled": bool(cross_like_enabled),
+            "cross_like_target_region": dict(cross_like_target_region),
+            "cross_like_target_region_visit_count": int(cross_like_target_region_visit_count),
             "distance_before": float(distance_before),
             "target_direction_bucket": str(direction_bucket),
             "targets": [
@@ -868,6 +892,60 @@ class ActiveInferenceEFE(Agent):
                 }
                 for row in targets[:3]
             ],
+        }
+
+    def _region_graph_snapshot_v1(self, *, max_edges: int = 256) -> dict[str, Any]:
+        current_region_key = "NA"
+        if self._last_known_agent_pos_region is not None:
+            rx, ry = self._last_known_agent_pos_region
+            current_region_key = f"{int(rx)}:{int(ry)}"
+
+        edges: list[dict[str, Any]] = []
+        for region_action_key, target_histogram in self._region_action_transition_counts.items():
+            if not isinstance(target_histogram, dict):
+                continue
+            try:
+                source_key, action_token = str(region_action_key).split("|a", 1)
+                action_id = int(action_token)
+            except Exception:
+                continue
+            for target_key, count_raw in target_histogram.items():
+                count = int(max(0, count_raw))
+                if count <= 0:
+                    continue
+                target_region_key = str(target_key)
+                edges.append(
+                    {
+                        "source_region_key": str(source_key),
+                        "target_region_key": str(target_region_key),
+                        "action_id": int(action_id),
+                        "count": int(count),
+                    }
+                )
+        edges.sort(
+            key=lambda row: (
+                -int(row.get("count", 0)),
+                int(row.get("action_id", 0)),
+                str(row.get("source_region_key", "")),
+                str(row.get("target_region_key", "")),
+            )
+        )
+        if len(edges) > int(max_edges):
+            edges = edges[: int(max_edges)]
+
+        return {
+            "schema_name": "active_inference_region_graph_snapshot_v1",
+            "schema_version": 1,
+            "current_region_key": str(current_region_key),
+            "region_visit_histogram": {
+                str(key): int(value)
+                for (key, value) in sorted(
+                    self._region_visit_counts.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )[:128]
+            },
+            "edge_count": int(len(edges)),
+            "edges": list(edges),
         }
 
     def _action_context_payload_v1(
@@ -2500,6 +2578,7 @@ class ActiveInferenceEFE(Agent):
                         navigation_target_features = self._navigation_target_features_v1(
                             representation
                         )
+                        region_graph_snapshot = self._region_graph_snapshot_v1()
                         for candidate in candidates:
                             action_key = str(int(candidate.action_id))
                             action_posterior = dict(control_schema.get(action_key, {}))
@@ -2531,6 +2610,9 @@ class ActiveInferenceEFE(Agent):
                                 target_payload = dict(navigation_target_features)
                                 target_payload["candidate_action_id"] = int(candidate.action_id)
                                 candidate.metadata["navigation_target_features_v1"] = target_payload
+                                candidate.metadata["region_graph_snapshot_v1"] = dict(
+                                    region_graph_snapshot
+                                )
                             if int(candidate.action_id) == 6:
                                 click_bucket = self._click_context_bucket_from_candidate(candidate)
                                 click_subcluster = self._click_context_subcluster_from_candidate(
