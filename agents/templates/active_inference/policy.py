@@ -55,6 +55,8 @@ class ActiveInferencePolicyEvaluatorV1:
         coverage_sweep_direction_retry_limit: int = 8,
         coverage_matrix_sweep_enabled: bool = True,
         coverage_sweep_force_in_exploit: bool = True,
+        high_info_focus_release_after_first_pass: bool = True,
+        high_info_focus_release_action_counter: int = -1,
         navigation_confidence_gating_enabled: bool = True,
         sequence_causal_term_enabled: bool = True,
         sequence_causal_bonus_weight: float = 0.55,
@@ -109,6 +111,12 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         self.coverage_matrix_sweep_enabled = bool(coverage_matrix_sweep_enabled)
         self.coverage_sweep_force_in_exploit = bool(coverage_sweep_force_in_exploit)
+        self.high_info_focus_release_after_first_pass = bool(
+            high_info_focus_release_after_first_pass
+        )
+        self.high_info_focus_release_action_counter = int(
+            high_info_focus_release_action_counter
+        )
         self.navigation_confidence_gating_enabled = bool(
             navigation_confidence_gating_enabled
         )
@@ -269,11 +277,18 @@ class ActiveInferencePolicyEvaluatorV1:
             return "dir_d"
         return "na"
 
+    @staticmethod
+    def _serpentine_single_pass_length() -> int:
+        row_count = 8
+        horizontal_span = 12
+        vertical_span = 1
+        return int((row_count * horizontal_span) + ((row_count - 1) * vertical_span))
+
     def _two_pass_serpentine_action_id(self, action_counter: int) -> int | None:
         row_count = 8
         horizontal_span = 12
         vertical_span = 1
-        pass_length = int((row_count * horizontal_span) + ((row_count - 1) * vertical_span))
+        pass_length = int(self._serpentine_single_pass_length())
         total_length = int(2 * pass_length)
         step = int(max(0, action_counter))
         if step >= int(total_length):
@@ -837,6 +852,27 @@ class ActiveInferencePolicyEvaluatorV1:
                 sequence_causal_penalty = float(
                     sequence_causal_penalty + (0.20 * self.sequence_causal_penalty_weight)
                 )
+        high_info_focus = self._candidate_high_info_focus_features(candidate)
+        high_info_focus_enabled = bool(high_info_focus.get("enabled", False))
+        high_info_focus_active = bool(high_info_focus.get("active", False))
+        high_info_focus_stage = str(high_info_focus.get("stage", "idle"))
+        high_info_target_score = self._clamp01(float(high_info_focus.get("target_score", 0.0)))
+        high_info_bonus_hint = float(max(0.0, high_info_focus.get("bonus_hint", 0.0)))
+        high_info_penalty_hint = float(max(0.0, high_info_focus.get("penalty_hint", 0.0)))
+        high_info_verify_action_candidate = bool(
+            high_info_focus.get("verify_action_candidate", False)
+        )
+        high_info_bonus = 0.0
+        high_info_penalty = 0.0
+        if high_info_focus_enabled and high_info_focus_active:
+            high_info_bonus = float(
+                (0.55 + (0.45 * high_info_target_score)) * high_info_bonus_hint
+            )
+            high_info_penalty = float(
+                (0.40 + (0.60 * high_info_target_score)) * high_info_penalty_hint
+            )
+            if high_info_verify_action_candidate:
+                high_info_bonus = float(high_info_bonus + (0.45 * high_info_target_score))
         navigation_projection = candidate.metadata.get(
             "navigation_step_projection_features_v1",
             {},
@@ -938,6 +974,12 @@ class ActiveInferencePolicyEvaluatorV1:
         projection_away_penalty_effective = float(
             projection_away_penalty * projection_confidence * geometry_term_gate
         )
+        high_info_bonus_effective = float(
+            high_info_bonus * geometry_term_gate
+        )
+        high_info_penalty_effective = float(
+            high_info_penalty * geometry_term_gate
+        )
 
         # Level 1 (operability/control): risk captures blocked tendencies and
         # control uncertainty in movement outcomes.
@@ -969,6 +1011,7 @@ class ActiveInferencePolicyEvaluatorV1:
                 operability_risk
                 + (0.25 * key_target_away_penalty_effective)
                 + (0.35 * projection_away_penalty_effective)
+                + (0.40 * high_info_penalty_effective)
                 + (0.10 * coverage_repeat_penalty)
                 - (
                     0.30
@@ -987,6 +1030,9 @@ class ActiveInferencePolicyEvaluatorV1:
                     * max(0.25, float(translation_probability))
                 ),
             )
+        )
+        operability_risk = float(
+            max(0.0, operability_risk - (0.55 * high_info_bonus_effective))
         )
         operability_risk = float(
             max(
@@ -1040,6 +1086,15 @@ class ActiveInferencePolicyEvaluatorV1:
             "projection_away_penalty_effective": float(
                 projection_away_penalty_effective
             ),
+            "high_info_focus_enabled": bool(high_info_focus_enabled),
+            "high_info_focus_active": bool(high_info_focus_active),
+            "high_info_focus_stage": str(high_info_focus_stage),
+            "high_info_target_score": float(high_info_target_score),
+            "high_info_verify_action_candidate": bool(high_info_verify_action_candidate),
+            "high_info_bonus": float(high_info_bonus),
+            "high_info_penalty": float(high_info_penalty),
+            "high_info_bonus_effective": float(high_info_bonus_effective),
+            "high_info_penalty_effective": float(high_info_penalty_effective),
             "navigation_confidence_gating_enabled": bool(
                 self.navigation_confidence_gating_enabled
             ),
@@ -1130,11 +1185,13 @@ class ActiveInferencePolicyEvaluatorV1:
                     + (0.20 * repeated_no_progress_penalty)
                     + (0.18 * key_target_away_penalty_effective)
                     + (0.24 * projection_away_penalty_effective)
+                    + (0.30 * high_info_penalty_effective)
                     + (0.20 * coverage_repeat_penalty)
                     + (0.28 * sequence_causal_penalty)
                     - (0.25 * leave_high_revisit_potential)
                     - (0.30 * key_target_escape_bonus_effective)
                     - (0.34 * projection_toward_bonus_effective)
+                    - (0.38 * high_info_bonus_effective)
                     - (0.35 * coverage_frontier_bonus)
                     - (0.45 * sequence_causal_bonus)
                 ),
@@ -1159,10 +1216,12 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         habit_risk += float(max(0.0, 0.25 * key_target_away_penalty_effective))
         habit_risk += float(max(0.0, 0.30 * projection_away_penalty_effective))
+        habit_risk += float(max(0.0, 0.34 * high_info_penalty_effective))
         habit_risk += float(max(0.0, 0.30 * coverage_repeat_penalty))
         habit_risk += float(max(0.0, 0.24 * sequence_causal_penalty))
         habit_risk = float(max(0.0, habit_risk - (0.22 * key_target_escape_bonus_effective)))
         habit_risk = float(max(0.0, habit_risk - (0.28 * projection_toward_bonus_effective)))
+        habit_risk = float(max(0.0, habit_risk - (0.34 * high_info_bonus_effective)))
         habit_risk = float(max(0.0, habit_risk - (0.26 * coverage_frontier_bonus)))
         habit_risk = float(max(0.0, habit_risk - (0.30 * sequence_causal_bonus)))
         progress_information_gain = float(
@@ -1176,6 +1235,7 @@ class ActiveInferencePolicyEvaluatorV1:
                     + (0.25 * evidence_novelty)
                     + (0.20 * key_target_escape_bonus_effective)
                     + (0.30 * projection_toward_bonus_effective)
+                    + (0.34 * high_info_bonus_effective)
                     + (0.28 * coverage_frontier_bonus)
                     + (0.35 * sequence_causal_bonus)
                     + (0.20 * navigation_relocalization_bonus)
@@ -1246,6 +1306,15 @@ class ActiveInferencePolicyEvaluatorV1:
             "projection_away_penalty_effective": float(
                 projection_away_penalty_effective
             ),
+            "high_info_focus_enabled": bool(high_info_focus_enabled),
+            "high_info_focus_active": bool(high_info_focus_active),
+            "high_info_focus_stage": str(high_info_focus_stage),
+            "high_info_target_score": float(high_info_target_score),
+            "high_info_verify_action_candidate": bool(high_info_verify_action_candidate),
+            "high_info_bonus": float(high_info_bonus),
+            "high_info_penalty": float(high_info_penalty),
+            "high_info_bonus_effective": float(high_info_bonus_effective),
+            "high_info_penalty_effective": float(high_info_penalty_effective),
             "geometry_term_gate": float(geometry_term_gate),
             "coverage_enabled": bool(coverage_enabled),
             "coverage_confidence": float(coverage_confidence),
@@ -1669,6 +1738,42 @@ class ActiveInferencePolicyEvaluatorV1:
                 max(0, raw.get("predicted_distance_to_target", 10**6))
             ),
             "distance_delta_to_target": int(raw.get("distance_delta_to_target", 0)),
+        }
+
+    def _candidate_high_info_focus_features(
+        self,
+        candidate: ActionCandidateV1,
+    ) -> dict[str, Any]:
+        raw = candidate.metadata.get("high_info_focus_features_v1", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        verify_action_ids = raw.get("verify_action_ids", [])
+        if not isinstance(verify_action_ids, list):
+            verify_action_ids = []
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "active": bool(raw.get("active", False)),
+            "stage": str(raw.get("stage", "idle")),
+            "current_region_key": str(raw.get("current_region_key", "NA")),
+            "target_region_key": str(raw.get("target_region_key", "NA")),
+            "predicted_region_key": str(raw.get("predicted_region_key", "NA")),
+            "queue_length": int(max(0, raw.get("queue_length", 0))),
+            "steps_remaining": int(max(0, raw.get("steps_remaining", 0))),
+            "target_score": self._clamp01(float(raw.get("target_score", 0.0))),
+            "distance_before": int(raw.get("distance_before", 10**6)),
+            "distance_after": int(raw.get("distance_after", 10**6)),
+            "distance_delta": int(raw.get("distance_delta", 0)),
+            "moves_toward_target_region": bool(raw.get("moves_toward_target_region", False)),
+            "moves_away_target_region": bool(raw.get("moves_away_target_region", False)),
+            "reaches_target_region": bool(raw.get("reaches_target_region", False)),
+            "verify_action_candidate": bool(raw.get("verify_action_candidate", False)),
+            "verify_action_ids": [
+                int(v)
+                for v in verify_action_ids
+                if isinstance(v, int) or str(v).isdigit()
+            ],
+            "bonus_hint": float(max(0.0, raw.get("bonus_hint", 0.0))),
+            "penalty_hint": float(max(0.0, raw.get("penalty_hint", 0.0))),
         }
 
     def _candidate_frontier_graph_cost(self, candidate: ActionCandidateV1) -> float:
@@ -2398,6 +2503,41 @@ class ActiveInferencePolicyEvaluatorV1:
         }
         direction_sequence_probe_applied = False
         direction_sequence_probe_candidates: list[dict[str, Any]] = []
+        high_info_focus_probe_applied = False
+        high_info_focus_probe_reason = "inactive"
+        high_info_focus_probe_candidates: list[dict[str, Any]] = []
+        high_info_focus_active_present = False
+        high_info_focus_priority_available = False
+        high_info_release_action_counter = int(
+            self.high_info_focus_release_action_counter
+        )
+        if high_info_release_action_counter < 0:
+            high_info_release_action_counter = int(
+                self._serpentine_single_pass_length()
+            )
+        for entry in entries:
+            focus_features = self._candidate_high_info_focus_features(entry.candidate)
+            if not (
+                bool(focus_features.get("enabled", False))
+                and bool(focus_features.get("active", False))
+            ):
+                continue
+            high_info_focus_active_present = True
+            if bool(focus_features.get("verify_action_candidate", False)):
+                high_info_focus_priority_available = True
+                break
+            if bool(focus_features.get("reaches_target_region", False)):
+                high_info_focus_priority_available = True
+                break
+            if bool(focus_features.get("moves_toward_target_region", False)):
+                high_info_focus_priority_available = True
+                break
+        high_info_after_first_pass_gate_open = bool(
+            self.high_info_focus_release_after_first_pass
+            and high_info_focus_priority_available
+            and int(packet.action_counter) >= int(high_info_release_action_counter)
+        )
+        fixed_two_pass_suppressed_by_high_info = False
         sequence_causal_probe_applied = False
         sequence_causal_probe_reason = "inactive"
         sequence_causal_probe_candidates: list[dict[str, Any]] = []
@@ -2409,7 +2549,7 @@ class ActiveInferencePolicyEvaluatorV1:
                 action_count_map=action_count_map,
             )
         )
-        if fixed_prepass_entry is not None:
+        if fixed_prepass_entry is not None and not high_info_after_first_pass_gate_open:
             selected_entry = fixed_prepass_entry
             fixed_two_pass_traversal_applied = True
             least_tried_probe_applied = True
@@ -2450,6 +2590,12 @@ class ActiveInferencePolicyEvaluatorV1:
             if selected_entry is not entries[0]:
                 entries.remove(selected_entry)
                 entries.insert(0, selected_entry)
+        elif fixed_prepass_entry is not None and high_info_after_first_pass_gate_open:
+            fixed_two_pass_suppressed_by_high_info = True
+            fixed_two_pass_traversal_v1["enabled"] = True
+            fixed_two_pass_traversal_v1["mode"] = (
+                "suppressed_by_high_info_after_first_pass"
+            )
 
         early_probe_active = bool(
             (not fixed_two_pass_traversal_applied)
@@ -2545,8 +2691,11 @@ class ActiveInferencePolicyEvaluatorV1:
                         entries.insert(0, selected_entry)
 
         coverage_phase_allowed = bool(
-            phase in ("explore", "explain")
-            or (self.coverage_sweep_force_in_exploit and phase == "exploit")
+            (
+                phase in ("explore", "explain")
+                or (self.coverage_sweep_force_in_exploit and phase == "exploit")
+            )
+            and (not high_info_after_first_pass_gate_open)
         )
         if (
             not fixed_two_pass_traversal_applied
@@ -3402,10 +3551,126 @@ class ActiveInferencePolicyEvaluatorV1:
                             for entry in coverage_pool[:10]
                         ]
 
+        if not early_probe_applied:
+            high_info_rows: list[dict[str, Any]] = []
+            for entry in entries:
+                focus_features = self._candidate_high_info_focus_features(entry.candidate)
+                if not (
+                    bool(focus_features.get("enabled", False))
+                    and bool(focus_features.get("active", False))
+                ):
+                    continue
+                high_info_rows.append(
+                    {
+                        "entry": entry,
+                        "features": focus_features,
+                        "score": float(
+                            selection_score_by_candidate.get(
+                                entry.candidate.candidate_id,
+                                entry.total_efe,
+                            )
+                        ),
+                    }
+                )
+            if high_info_rows:
+                high_info_focus_probe_reason = "active_no_override"
+                best_high_info_score = min(float(row["score"]) for row in high_info_rows)
+                verify_pool = [
+                    row
+                    for row in high_info_rows
+                    if bool(row["features"].get("verify_action_candidate", False))
+                ]
+                if verify_pool:
+                    verify_pool.sort(
+                        key=lambda row: (
+                            -float(row["features"].get("bonus_hint", 0.0)),
+                            float(row["score"]),
+                            int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                            int(row["entry"].candidate.action_id),
+                            str(row["entry"].candidate.candidate_id),
+                        )
+                    )
+                    best_verify = verify_pool[0]
+                    verify_margin = float(max(self.sequence_probe_score_margin, 0.55))
+                    if float(best_verify["score"]) <= (best_high_info_score + verify_margin):
+                        selected_entry = best_verify["entry"]
+                        high_info_focus_probe_applied = True
+                        high_info_focus_probe_reason = "verify_action_priority"
+                if not high_info_focus_probe_applied:
+                    seek_pool = [
+                        row
+                        for row in high_info_rows
+                        if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                        and (
+                            bool(row["features"].get("moves_toward_target_region", False))
+                            or bool(row["features"].get("reaches_target_region", False))
+                        )
+                    ]
+                    if seek_pool:
+                        seek_pool.sort(
+                            key=lambda row: (
+                                0 if bool(row["features"].get("reaches_target_region", False)) else 1,
+                                int(row["features"].get("distance_after", 10**6)),
+                                -float(row["features"].get("target_score", 0.0)),
+                                -float(row["features"].get("bonus_hint", 0.0)),
+                                float(row["score"]),
+                                int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                                int(row["entry"].candidate.action_id),
+                                str(row["entry"].candidate.candidate_id),
+                            )
+                        )
+                        best_seek = seek_pool[0]
+                        seek_margin = float(max(self.sequence_probe_score_margin, 0.40))
+                        if bool(best_seek["features"].get("reaches_target_region", False)) or float(
+                            best_seek["score"]
+                        ) <= (best_high_info_score + seek_margin):
+                            selected_entry = best_seek["entry"]
+                            high_info_focus_probe_applied = True
+                            high_info_focus_probe_reason = "seek_target_priority"
+                if high_info_focus_probe_applied:
+                    least_tried_probe_applied = True
+                    if selected_entry is not entries[0]:
+                        entries.remove(selected_entry)
+                        entries.insert(0, selected_entry)
+                high_info_focus_probe_candidates = [
+                    {
+                        "candidate_id": str(row["entry"].candidate.candidate_id),
+                        "action_id": int(row["entry"].candidate.action_id),
+                        "score": float(row["score"]),
+                        "stage": str(row["features"].get("stage", "idle")),
+                        "current_region_key": str(
+                            row["features"].get("current_region_key", "NA")
+                        ),
+                        "target_region_key": str(
+                            row["features"].get("target_region_key", "NA")
+                        ),
+                        "predicted_region_key": str(
+                            row["features"].get("predicted_region_key", "NA")
+                        ),
+                        "distance_before": int(row["features"].get("distance_before", 10**6)),
+                        "distance_after": int(row["features"].get("distance_after", 10**6)),
+                        "target_score": float(row["features"].get("target_score", 0.0)),
+                        "moves_toward_target_region": bool(
+                            row["features"].get("moves_toward_target_region", False)
+                        ),
+                        "reaches_target_region": bool(
+                            row["features"].get("reaches_target_region", False)
+                        ),
+                        "verify_action_candidate": bool(
+                            row["features"].get("verify_action_candidate", False)
+                        ),
+                        "bonus_hint": float(row["features"].get("bonus_hint", 0.0)),
+                        "penalty_hint": float(row["features"].get("penalty_hint", 0.0)),
+                        "steps_remaining": int(row["features"].get("steps_remaining", 0)),
+                    }
+                    for row in high_info_rows[:12]
+                ]
+
         if (
             self.sequence_causal_term_enabled
             and not fixed_two_pass_traversal_applied
             and not early_probe_applied
+            and not high_info_focus_probe_applied
         ):
             sequence_rows: list[dict[str, Any]] = []
             for entry in entries:
@@ -4102,6 +4367,11 @@ class ActiveInferencePolicyEvaluatorV1:
             )
         elif early_probe_applied:
             tie_breaker_rule_applied = "early_probe_budget_least_tried"
+        elif high_info_focus_probe_applied:
+            tie_breaker_rule_applied = (
+                f"high_info_focus_probe_{str(high_info_focus_probe_reason)}"
+                "(target_score,stage,distance,bonus,score,action_usage)"
+            )
         elif sequence_causal_probe_applied:
             tie_breaker_rule_applied = (
                 f"sequence_causal_probe_{str(sequence_causal_probe_reason)}"
@@ -4177,6 +4447,19 @@ class ActiveInferencePolicyEvaluatorV1:
             "sequence_probe_score_margin": float(self.sequence_probe_score_margin),
             "sequence_probe_trigger_steps": int(self.sequence_probe_trigger_steps),
             "sequence_causal_term_enabled": bool(self.sequence_causal_term_enabled),
+            "high_info_focus_active_present": bool(high_info_focus_active_present),
+            "high_info_focus_priority_available": bool(
+                high_info_focus_priority_available
+            ),
+            "high_info_after_first_pass_gate_open": bool(
+                high_info_after_first_pass_gate_open
+            ),
+            "high_info_release_action_counter": int(high_info_release_action_counter),
+            "fixed_two_pass_suppressed_by_high_info": bool(
+                fixed_two_pass_suppressed_by_high_info
+            ),
+            "high_info_focus_probe_applied": bool(high_info_focus_probe_applied),
+            "high_info_focus_probe_reason": str(high_info_focus_probe_reason),
             "sequence_causal_probe_applied": bool(sequence_causal_probe_applied),
             "sequence_causal_probe_reason": str(sequence_causal_probe_reason),
             "previous_navigation_direction": str(previous_navigation_direction),
@@ -4249,6 +4532,7 @@ class ActiveInferencePolicyEvaluatorV1:
             "navigation_stagnation_probe_applied": bool(
                 navigation_stagnation_probe_applied
             ),
+            "high_info_focus_probe_candidates": list(high_info_focus_probe_candidates),
             "sequence_causal_probe_candidates": list(sequence_causal_probe_candidates),
             "selected_action_usage_count_before": int(selected_action_usage_count),
             "selected_cluster_id": selected_cluster_id,

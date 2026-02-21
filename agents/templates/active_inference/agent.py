@@ -225,6 +225,14 @@ class ActiveInferenceEFE(Agent):
             "ACTIVE_INFERENCE_COVERAGE_SWEEP_FORCE_IN_EXPLOIT",
             True,
         )
+        self.high_info_focus_release_after_first_pass = _env_bool(
+            "ACTIVE_INFERENCE_HIGH_INFO_RELEASE_AFTER_FIRST_PASS",
+            True,
+        )
+        self.high_info_focus_release_action_counter = _env_int(
+            "ACTIVE_INFERENCE_HIGH_INFO_RELEASE_ACTION_COUNTER",
+            -1,
+        )
         self.enable_navigation_confidence_gating = _env_bool(
             "ACTIVE_INFERENCE_NAV_CONFIDENCE_GATING_ENABLED",
             True,
@@ -251,6 +259,22 @@ class ActiveInferenceEFE(Agent):
         self.sequence_causal_target_region_key = str(
             os.getenv("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TARGET_REGION", "4:1").strip()
             or "4:1"
+        )
+        self.high_info_focus_window_steps = max(
+            4,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_FOCUS_WINDOW_STEPS", 16),
+        )
+        self.high_info_focus_max_targets = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_FOCUS_MAX_TARGETS", 3),
+        )
+        self.high_info_focus_min_trigger_score = max(
+            0.0,
+            min(1.0, _env_float("ACTIVE_INFERENCE_HIGH_INFO_MIN_TRIGGER_SCORE", 0.50)),
+        )
+        self.high_info_strong_change_pixels = max(
+            64,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_STRONG_CHANGE_PIXELS", 512),
         )
         self.enable_empirical_region_override = _env_bool(
             "ACTIVE_INFERENCE_ENABLE_EMPIRICAL_REGION_OVERRIDE",
@@ -360,6 +384,8 @@ class ActiveInferenceEFE(Agent):
             coverage_sweep_direction_retry_limit=self.coverage_sweep_direction_retry_limit,
             coverage_matrix_sweep_enabled=self.coverage_matrix_sweep_enabled,
             coverage_sweep_force_in_exploit=self.coverage_sweep_force_in_exploit,
+            high_info_focus_release_after_first_pass=self.high_info_focus_release_after_first_pass,
+            high_info_focus_release_action_counter=self.high_info_focus_release_action_counter,
             navigation_confidence_gating_enabled=self.enable_navigation_confidence_gating,
             sequence_causal_term_enabled=self.enable_sequence_causal_term,
         )
@@ -397,6 +423,10 @@ class ActiveInferenceEFE(Agent):
         self._edge_attempt_counts: dict[str, int] = {}
         self._region_visit_counts: dict[str, int] = {}
         self._region_action_transition_counts: dict[str, dict[str, int]] = {}
+        self._region_action_event_counts: dict[str, dict[str, int]] = {}
+        self._region_action_non_no_change_counts: dict[str, int] = {}
+        self._region_action_strong_change_counts: dict[str, int] = {}
+        self._region_action_progress_counts: dict[str, int] = {}
         self._click_bucket_stats: dict[str, dict[str, int]] = {}
         self._click_subcluster_stats: dict[str, dict[str, int]] = {}
         self._state_visit_count: dict[str, int] = {}
@@ -421,6 +451,27 @@ class ActiveInferenceEFE(Agent):
             "deadline_action_counter": -1,
             "verify_deadline_action_counter": -1,
             "last_reached_action_counter": -1,
+            "verify_action_ids": [],
+            "last_status": "idle",
+        }
+        self._high_info_focus_state_v1: dict[str, Any] = {
+            "enabled": True,
+            "active": False,
+            "stage": "idle",
+            "window_steps": int(self.high_info_focus_window_steps),
+            "steps_remaining": 0,
+            "trigger_count": 0,
+            "completion_count": 0,
+            "timeout_count": 0,
+            "source_region_key": "NA",
+            "trigger_event_type": "NA",
+            "trigger_action_counter": -1,
+            "deadline_action_counter": -1,
+            "current_target_region_key": "NA",
+            "target_region_queue": [],
+            "target_region_scores": {},
+            "completed_target_regions": [],
+            "verify_action_ids": [],
             "last_status": "idle",
         }
 
@@ -1161,7 +1212,343 @@ class ActiveInferenceEFE(Agent):
                 state.get("verify_deadline_action_counter", -1)
             ),
             "last_reached_action_counter": int(state.get("last_reached_action_counter", -1)),
+            "verify_action_ids": [
+                int(v)
+                for v in state.get("verify_action_ids", [])
+                if isinstance(v, int) or str(v).isdigit()
+            ],
             "last_status": str(state.get("last_status", "idle")),
+        }
+
+    def _high_info_focus_state_snapshot_v1(self) -> dict[str, Any]:
+        state = (
+            self._high_info_focus_state_v1
+            if isinstance(self._high_info_focus_state_v1, dict)
+            else {}
+        )
+        verify_action_ids = state.get("verify_action_ids", [])
+        if not isinstance(verify_action_ids, list):
+            verify_action_ids = []
+        queue = state.get("target_region_queue", [])
+        if not isinstance(queue, list):
+            queue = []
+        completed = state.get("completed_target_regions", [])
+        if not isinstance(completed, list):
+            completed = []
+        scores = state.get("target_region_scores", {})
+        if not isinstance(scores, dict):
+            scores = {}
+        return {
+            "schema_name": "active_inference_high_info_focus_state_v1",
+            "schema_version": 1,
+            "enabled": bool(state.get("enabled", False)),
+            "active": bool(state.get("active", False)),
+            "stage": str(state.get("stage", "idle")),
+            "window_steps": int(max(0, state.get("window_steps", 0))),
+            "steps_remaining": int(max(0, state.get("steps_remaining", 0))),
+            "trigger_count": int(max(0, state.get("trigger_count", 0))),
+            "completion_count": int(max(0, state.get("completion_count", 0))),
+            "timeout_count": int(max(0, state.get("timeout_count", 0))),
+            "source_region_key": str(state.get("source_region_key", "NA")),
+            "trigger_event_type": str(state.get("trigger_event_type", "NA")),
+            "trigger_action_counter": int(state.get("trigger_action_counter", -1)),
+            "deadline_action_counter": int(state.get("deadline_action_counter", -1)),
+            "current_target_region_key": str(state.get("current_target_region_key", "NA")),
+            "target_region_queue": [str(v) for v in queue[:8]],
+            "target_region_scores": {
+                str(k): float(v)
+                for (k, v) in sorted(scores.items(), key=lambda item: str(item[0]))[:16]
+            },
+            "completed_target_regions": [str(v) for v in completed[-8:]],
+            "verify_action_ids": [int(v) for v in verify_action_ids],
+            "last_status": str(state.get("last_status", "idle")),
+        }
+
+    def _high_info_region_scoreboard_v1(
+        self,
+        *,
+        max_regions: int = 12,
+    ) -> dict[str, Any]:
+        region_rows: dict[str, dict[str, Any]] = {}
+        for region_action_key, histogram_raw in self._region_action_event_counts.items():
+            if not isinstance(histogram_raw, dict):
+                continue
+            try:
+                region_key, action_token = str(region_action_key).split("|a", 1)
+                action_id = int(action_token)
+            except Exception:
+                continue
+            if self._parse_region_key_v1(str(region_key)) is None:
+                continue
+            histogram = {
+                str(k): int(max(0, v))
+                for (k, v) in histogram_raw.items()
+                if int(max(0, v)) > 0
+            }
+            attempts = int(sum(histogram.values()))
+            if attempts <= 0:
+                continue
+            non_no_change = int(self._region_action_non_no_change_counts.get(region_action_key, 0))
+            strong_change = int(self._region_action_strong_change_counts.get(region_action_key, 0))
+            cc_count_change = int(histogram.get("CC_COUNT_CHANGE", 0))
+            entropy = 0.0
+            for count in histogram.values():
+                p = float(count / float(max(1, attempts)))
+                if p <= 0.0:
+                    continue
+                entropy -= p * math.log2(p)
+            entropy_norm = float(entropy / max(1.0, math.log2(float(max(2, len(histogram))))))
+            non_no_change_rate = float(non_no_change / float(max(1, attempts)))
+            strong_change_rate = float(strong_change / float(max(1, attempts)))
+            cc_rate = float(cc_count_change / float(max(1, attempts)))
+            visit_count = int(self._region_visit_counts.get(str(region_key), 0))
+            visit_novelty = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 10.0)))
+            info_score = float(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        (0.34 * cc_rate)
+                        + (0.28 * strong_change_rate)
+                        + (0.20 * non_no_change_rate)
+                        + (0.12 * entropy_norm)
+                        + (0.06 * visit_novelty),
+                    ),
+                )
+            )
+            current = region_rows.get(str(region_key))
+            row = {
+                "region_key": str(region_key),
+                "best_action_id": int(action_id),
+                "info_score": float(info_score),
+                "attempts": int(attempts),
+                "event_entropy_norm": float(entropy_norm),
+                "non_no_change_rate": float(non_no_change_rate),
+                "strong_change_rate": float(strong_change_rate),
+                "cc_count_change_rate": float(cc_rate),
+                "visit_count": int(visit_count),
+                "event_histogram": {str(k): int(v) for (k, v) in sorted(histogram.items())},
+            }
+            if current is None or float(row["info_score"]) > float(current.get("info_score", 0.0)):
+                region_rows[str(region_key)] = row
+
+        rows = sorted(
+            region_rows.values(),
+            key=lambda row: (
+                -float(row.get("info_score", 0.0)),
+                int(row.get("visit_count", 10**9)),
+                -int(row.get("attempts", 0)),
+                str(row.get("region_key", "")),
+            ),
+        )
+        if len(rows) > int(max_regions):
+            rows = rows[: int(max_regions)]
+        return {
+            "schema_name": "active_inference_high_info_region_scoreboard_v1",
+            "schema_version": 1,
+            "region_count": int(len(region_rows)),
+            "rows": rows,
+        }
+
+    def _region_action_semantics_v1(
+        self,
+        *,
+        action_id: int,
+        current_region_key: str,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_name": "active_inference_region_action_semantics_v1",
+            "schema_version": 1,
+            "enabled": False,
+            "action_id": int(action_id),
+            "current_region_key": str(current_region_key),
+            "attempts": 0,
+            "moved_count": 0,
+            "blocked_count": 0,
+            "moved_rate": 0.0,
+            "blocked_rate": 0.0,
+            "non_no_change_rate": 0.0,
+            "strong_change_rate": 0.0,
+            "cc_count_change_rate": 0.0,
+            "event_entropy_norm": 0.0,
+            "info_trigger_score": 0.0,
+            "edge_status": "unknown",
+            "event_histogram": {},
+        }
+        if int(action_id) not in (1, 2, 3, 4):
+            payload["reason"] = "non_navigation_action"
+            return payload
+        if self._parse_region_key_v1(str(current_region_key)) is None:
+            payload["reason"] = "unknown_region"
+            return payload
+        region_action_key = f"{str(current_region_key)}|a{int(action_id)}"
+        histogram_raw = self._region_action_event_counts.get(region_action_key, {})
+        if not isinstance(histogram_raw, dict):
+            histogram_raw = {}
+        histogram = {
+            str(k): int(max(0, v))
+            for (k, v) in histogram_raw.items()
+            if int(max(0, v)) > 0
+        }
+        attempts = int(sum(histogram.values()))
+        edge_key = f"region={str(current_region_key)}|action={int(action_id)}"
+        blocked_count = int(self._blocked_edge_counts.get(edge_key, 0))
+        moved_count = int(
+            sum(
+                int(max(0, count))
+                for count in self._region_action_transition_counts.get(region_action_key, {}).values()
+            )
+        )
+        if attempts <= 0:
+            payload["attempts"] = int(max(blocked_count, moved_count))
+            payload["reason"] = "insufficient_evidence"
+            return payload
+        non_no_change_count = int(self._region_action_non_no_change_counts.get(region_action_key, 0))
+        strong_change_count = int(self._region_action_strong_change_counts.get(region_action_key, 0))
+        cc_count_change_count = int(histogram.get("CC_COUNT_CHANGE", 0))
+        entropy = 0.0
+        for count in histogram.values():
+            p = float(count / float(max(1, attempts)))
+            if p <= 0.0:
+                continue
+            entropy -= p * math.log2(p)
+        entropy_norm = float(entropy / max(1.0, math.log2(float(max(2, len(histogram))))))
+        moved_rate = float(moved_count / float(max(1, attempts)))
+        blocked_rate = float(blocked_count / float(max(1, attempts)))
+        non_no_change_rate = float(non_no_change_count / float(max(1, attempts)))
+        strong_change_rate = float(strong_change_count / float(max(1, attempts)))
+        cc_rate = float(cc_count_change_count / float(max(1, attempts)))
+        info_trigger_score = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (0.38 * cc_rate)
+                    + (0.30 * strong_change_rate)
+                    + (0.20 * non_no_change_rate)
+                    + (0.12 * entropy_norm),
+                ),
+            )
+        )
+        if attempts < 2:
+            edge_status = "unknown"
+        elif blocked_rate >= 0.75 and moved_rate <= 0.25:
+            edge_status = "blocked"
+        elif moved_rate >= 0.55 and blocked_rate <= 0.45:
+            edge_status = "passable"
+        else:
+            edge_status = "mixed"
+        payload.update(
+            {
+                "enabled": True,
+                "attempts": int(attempts),
+                "moved_count": int(moved_count),
+                "blocked_count": int(blocked_count),
+                "moved_rate": float(moved_rate),
+                "blocked_rate": float(blocked_rate),
+                "non_no_change_rate": float(non_no_change_rate),
+                "strong_change_rate": float(strong_change_rate),
+                "cc_count_change_rate": float(cc_rate),
+                "event_entropy_norm": float(entropy_norm),
+                "info_trigger_score": float(info_trigger_score),
+                "edge_status": str(edge_status),
+                "event_histogram": {str(k): int(v) for (k, v) in sorted(histogram.items())},
+            }
+        )
+        return payload
+
+    def _high_info_focus_candidate_features_v1(
+        self,
+        *,
+        candidate: ActionCandidateV1,
+        predicted_region_features: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        state = self._high_info_focus_state_snapshot_v1()
+        current_region_key = self._current_region_key_v1()
+        target_region_key = str(state.get("current_target_region_key", "NA"))
+        predicted_region_key = str(current_region_key)
+        if isinstance(predicted_region_features, dict):
+            key = str(predicted_region_features.get("predicted_region_key", "NA"))
+            if self._parse_region_key_v1(key) is not None:
+                predicted_region_key = str(key)
+        distance_before = int(self._region_distance_v1(current_region_key, target_region_key))
+        distance_after = int(self._region_distance_v1(predicted_region_key, target_region_key))
+        distance_delta = int(distance_after - distance_before)
+        verify_action_ids = state.get("verify_action_ids", [])
+        if not isinstance(verify_action_ids, list):
+            verify_action_ids = []
+        verify_action_set = {int(v) for v in verify_action_ids}
+        action_id = int(candidate.action_id)
+        reaches_target = bool(
+            self._parse_region_key_v1(predicted_region_key) is not None
+            and str(predicted_region_key) == str(target_region_key)
+        )
+        moves_toward_target = bool(distance_after < distance_before)
+        moves_away_target = bool(distance_after > distance_before)
+        in_target_now = bool(
+            self._parse_region_key_v1(current_region_key) is not None
+            and str(current_region_key) == str(target_region_key)
+        )
+        verify_action_candidate = bool(
+            str(state.get("stage", "idle")) == "verify"
+            and in_target_now
+            and action_id in verify_action_set
+        )
+        target_score = float(
+            state.get("target_region_scores", {}).get(target_region_key, 0.0)
+            if isinstance(state.get("target_region_scores", {}), dict)
+            else 0.0
+        )
+        bonus_hint = 0.0
+        penalty_hint = 0.0
+        if bool(state.get("active", False)):
+            if verify_action_candidate:
+                bonus_hint += 1.0
+            elif action_id in (1, 2, 3, 4):
+                if reaches_target:
+                    bonus_hint += 0.85
+                elif moves_toward_target:
+                    bonus_hint += 0.45
+                if moves_away_target:
+                    penalty_hint += 0.45
+            elif str(state.get("stage", "idle")) == "verify":
+                penalty_hint += 0.20
+        urgency = float(
+            min(
+                1.0,
+                max(
+                    0.0,
+                    1.0
+                    - (
+                        float(state.get("steps_remaining", 0))
+                        / float(max(1, state.get("window_steps", 1)))
+                    ),
+                ),
+            )
+        )
+        bonus_hint = float((0.75 + (0.25 * urgency)) * bonus_hint)
+        return {
+            "schema_name": "active_inference_high_info_focus_features_v1",
+            "schema_version": 1,
+            "enabled": bool(state.get("enabled", False)),
+            "active": bool(state.get("active", False)),
+            "stage": str(state.get("stage", "idle")),
+            "current_region_key": str(current_region_key),
+            "target_region_key": str(target_region_key),
+            "predicted_region_key": str(predicted_region_key),
+            "queue_length": int(len(state.get("target_region_queue", []))),
+            "steps_remaining": int(max(0, state.get("steps_remaining", 0))),
+            "target_score": float(target_score),
+            "distance_before": int(distance_before),
+            "distance_after": int(distance_after),
+            "distance_delta": int(distance_delta),
+            "moves_toward_target_region": bool(moves_toward_target),
+            "moves_away_target_region": bool(moves_away_target),
+            "reaches_target_region": bool(reaches_target),
+            "verify_action_ids": [int(v) for v in sorted(verify_action_set)],
+            "verify_action_candidate": bool(verify_action_candidate),
+            "bonus_hint": float(max(0.0, bonus_hint)),
+            "penalty_hint": float(max(0.0, penalty_hint)),
         }
 
     def _sequence_causal_candidate_features_v1(
@@ -1198,9 +1585,17 @@ class ActiveInferenceEFE(Agent):
         moves_away_from_target = bool(
             predicted_distance > current_distance
         )
+        verify_action_ids_raw = state.get("verify_action_ids", [])
+        if not isinstance(verify_action_ids_raw, list):
+            verify_action_ids_raw = []
+        verify_action_ids = {
+            int(v) for v in verify_action_ids_raw if isinstance(v, int) or str(v).isdigit()
+        }
+        if not verify_action_ids:
+            verify_action_ids = {6}
         verify_action_candidate = bool(
             str(state.get("stage", "idle")) == "verify"
-            and action_id in (6, 7)
+            and action_id in verify_action_ids
         )
         bonus_hint = 0.0
         penalty_hint = 0.0
@@ -1250,6 +1645,7 @@ class ActiveInferenceEFE(Agent):
             "moves_away_from_target": bool(moves_away_from_target),
             "reaches_target": bool(reaches_target),
             "verify_action_candidate": bool(verify_action_candidate),
+            "verify_action_ids": [int(v) for v in sorted(verify_action_ids)],
             "bonus_hint": float(max(0.0, bonus_hint)),
             "penalty_hint": float(max(0.0, penalty_hint)),
         }
@@ -1272,6 +1668,16 @@ class ActiveInferenceEFE(Agent):
             state["steps_remaining"] = 0
             state["last_status"] = "disabled"
             return
+        verify_action_ids = sorted(
+            {
+                int(v)
+                for v in current_packet.available_actions
+                if int(v) > 4 and int(v) != 0
+            }
+        )
+        if not verify_action_ids:
+            verify_action_ids = [6]
+        state["verify_action_ids"] = [int(v) for v in verify_action_ids]
         current_counter = int(getattr(current_packet, "action_counter", 0))
         if bool(state.get("active", False)):
             deadline_counter = int(state.get("deadline_action_counter", -1))
@@ -1341,7 +1747,7 @@ class ActiveInferenceEFE(Agent):
             verify_deadline = int(state.get("verify_deadline_action_counter", -1))
             verified = bool(
                 in_target_region
-                and executed_action_id in (6, 7)
+                and executed_action_id in set(int(v) for v in verify_action_ids)
                 and str(obs_change_type) != "NO_CHANGE"
             )
             if verified:
@@ -1356,6 +1762,216 @@ class ActiveInferenceEFE(Agent):
                 state["steps_remaining"] = 0
                 state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
                 state["last_status"] = "verify_timeout"
+
+    def _update_high_info_focus_state_v1(
+        self,
+        *,
+        current_packet: ObservationPacketV1,
+        transition_record: TransitionRecordV1 | None,
+        causal_signature: Any,
+        navigation_state_estimate: dict[str, Any],
+        executed_candidate: ActionCandidateV1 | None,
+    ) -> None:
+        state = self._high_info_focus_state_v1
+        if not isinstance(state, dict):
+            return
+        if not bool(state.get("enabled", False)):
+            state["active"] = False
+            state["stage"] = "idle"
+            state["steps_remaining"] = 0
+            state["last_status"] = "disabled"
+            return
+
+        verify_action_ids = sorted(
+            {
+                int(v)
+                for v in current_packet.available_actions
+                if int(v) > 4 and int(v) != 0
+            }
+        )
+        state["verify_action_ids"] = [int(v) for v in verify_action_ids]
+        current_counter = int(getattr(current_packet, "action_counter", 0))
+        deadline = int(state.get("deadline_action_counter", -1))
+        if bool(state.get("active", False)) and deadline >= 0 and current_counter > deadline:
+            state["active"] = False
+            state["stage"] = "idle"
+            state["steps_remaining"] = 0
+            state["target_region_queue"] = []
+            state["current_target_region_key"] = "NA"
+            state["target_region_scores"] = {}
+            state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
+            state["last_status"] = "timeout"
+
+        source_region_key = "NA"
+        if transition_record is not None:
+            context = transition_record.action_context
+            if isinstance(context, dict):
+                source_region_key = str(context.get("action_region_before", "NA"))
+        nav_region_key = self._current_region_key_v1()
+        if self._parse_region_key_v1(source_region_key) is None:
+            source_region_key = str(nav_region_key)
+
+        obs_change_type = str(getattr(causal_signature, "obs_change_type", ""))
+        changed_pixels = int(max(0, getattr(causal_signature, "changed_pixel_count", 0)))
+        strong_event = bool(
+            obs_change_type in ("CC_COUNT_CHANGE", "GLOBAL_PATTERN_CHANGE", "METADATA_PROGRESS_CHANGE")
+            or changed_pixels >= int(self.high_info_strong_change_pixels)
+        )
+        action_id = int(executed_candidate.action_id) if executed_candidate is not None else -1
+        trigger_semantics = self._region_action_semantics_v1(
+            action_id=int(action_id),
+            current_region_key=str(source_region_key),
+        )
+        trigger_score = float(trigger_semantics.get("info_trigger_score", 0.0))
+        should_trigger = bool(
+            strong_event
+            and self._parse_region_key_v1(str(source_region_key)) is not None
+            and (
+                trigger_score >= float(self.high_info_focus_min_trigger_score)
+                or obs_change_type == "CC_COUNT_CHANGE"
+            )
+        )
+
+        if should_trigger:
+            scoreboard = self._high_info_region_scoreboard_v1(max_regions=16)
+            rows = scoreboard.get("rows", [])
+            if not isinstance(rows, list):
+                rows = []
+            target_scores: dict[str, float] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                region_key = str(row.get("region_key", "NA"))
+                if self._parse_region_key_v1(region_key) is None:
+                    continue
+                if region_key == str(source_region_key):
+                    continue
+                visit_count = int(self._region_visit_counts.get(region_key, 0))
+                score = float(row.get("info_score", 0.0)) + float(
+                    max(0.0, 1.0 - min(1.0, float(visit_count) / 8.0))
+                ) * 0.20
+                target_scores[region_key] = max(float(target_scores.get(region_key, 0.0)), score)
+
+            if executed_candidate is not None:
+                nav_target = executed_candidate.metadata.get("navigation_target_features_v1", {})
+                if isinstance(nav_target, dict):
+                    cross_region = nav_target.get("cross_like_target_region", {})
+                    if isinstance(cross_region, dict):
+                        cross_rx = int(cross_region.get("x", -1))
+                        cross_ry = int(cross_region.get("y", -1))
+                        if cross_rx >= 0 and cross_ry >= 0:
+                            key = f"{cross_rx}:{cross_ry}"
+                            if key != str(source_region_key):
+                                target_scores[key] = max(float(target_scores.get(key, 0.0)), 0.65)
+                    primary_target = nav_target.get("target_region", {})
+                    if isinstance(primary_target, dict):
+                        tx = int(primary_target.get("x", -1))
+                        ty = int(primary_target.get("y", -1))
+                        if tx >= 0 and ty >= 0:
+                            key = f"{tx}:{ty}"
+                            if key != str(source_region_key):
+                                target_scores[key] = max(float(target_scores.get(key, 0.0)), 0.55)
+
+            queue = sorted(
+                target_scores.items(),
+                key=lambda item: (
+                    -float(item[1]),
+                    int(self._region_distance_v1(str(source_region_key), str(item[0]))),
+                    int(self._region_visit_counts.get(str(item[0]), 0)),
+                    str(item[0]),
+                ),
+            )
+            queue_keys = [str(region_key) for (region_key, _) in queue[: int(self.high_info_focus_max_targets)]]
+            if queue_keys:
+                state["active"] = True
+                state["stage"] = "seek"
+                state["window_steps"] = int(self.high_info_focus_window_steps)
+                state["steps_remaining"] = int(self.high_info_focus_window_steps)
+                state["trigger_count"] = int(state.get("trigger_count", 0) + 1)
+                state["source_region_key"] = str(source_region_key)
+                state["trigger_event_type"] = str(obs_change_type)
+                state["trigger_action_counter"] = int(current_counter)
+                state["deadline_action_counter"] = int(
+                    current_counter + int(self.high_info_focus_window_steps)
+                )
+                state["target_region_queue"] = list(queue_keys)
+                state["current_target_region_key"] = str(queue_keys[0])
+                state["target_region_scores"] = {
+                    str(region_key): float(score)
+                    for (region_key, score) in queue[: int(self.high_info_focus_max_targets)]
+                }
+                state["completed_target_regions"] = []
+                state["last_status"] = "triggered"
+
+        if not bool(state.get("active", False)):
+            return
+
+        deadline = int(state.get("deadline_action_counter", current_counter))
+        state["steps_remaining"] = int(max(0, deadline - current_counter))
+        queue = state.get("target_region_queue", [])
+        if not isinstance(queue, list):
+            queue = []
+        queue = [str(v) for v in queue if self._parse_region_key_v1(str(v)) is not None]
+        if not queue:
+            state["active"] = False
+            state["stage"] = "idle"
+            state["steps_remaining"] = 0
+            state["current_target_region_key"] = "NA"
+            state["target_region_queue"] = []
+            state["target_region_scores"] = {}
+            state["completion_count"] = int(state.get("completion_count", 0) + 1)
+            state["last_status"] = "completed"
+            return
+
+        target_region_key = str(queue[0])
+        state["current_target_region_key"] = str(target_region_key)
+        state["target_region_queue"] = list(queue)
+        in_target_region = bool(str(nav_region_key) == str(target_region_key))
+        stage = str(state.get("stage", "seek"))
+        if in_target_region and stage == "seek":
+            state["stage"] = "verify" if verify_action_ids else "seek"
+            state["last_status"] = "target_reached"
+            stage = str(state.get("stage", "seek"))
+            if not verify_action_ids:
+                completed = state.get("completed_target_regions", [])
+                if not isinstance(completed, list):
+                    completed = []
+                completed.append(str(target_region_key))
+                state["completed_target_regions"] = completed[-16:]
+                queue = queue[1:]
+                state["target_region_queue"] = list(queue)
+                state["current_target_region_key"] = str(queue[0]) if queue else "NA"
+                state["stage"] = "seek" if queue else "idle"
+                if not queue:
+                    state["active"] = False
+                    state["steps_remaining"] = 0
+                    state["target_region_scores"] = {}
+                    state["completion_count"] = int(state.get("completion_count", 0) + 1)
+                    state["last_status"] = "completed"
+                return
+
+        if stage == "verify" and in_target_region:
+            verified = bool(
+                action_id in {int(v) for v in verify_action_ids}
+                and str(obs_change_type) != "NO_CHANGE"
+            )
+            if verified:
+                completed = state.get("completed_target_regions", [])
+                if not isinstance(completed, list):
+                    completed = []
+                completed.append(str(target_region_key))
+                state["completed_target_regions"] = completed[-16:]
+                queue = queue[1:]
+                state["target_region_queue"] = list(queue)
+                state["current_target_region_key"] = str(queue[0]) if queue else "NA"
+                state["stage"] = "seek" if queue else "idle"
+                state["last_status"] = "verified"
+                if not queue:
+                    state["active"] = False
+                    state["steps_remaining"] = 0
+                    state["target_region_scores"] = {}
+                    state["completion_count"] = int(state.get("completion_count", 0) + 1)
+                    state["last_status"] = "completed"
 
     @staticmethod
     def _parse_delta_key_v1(delta_key: str) -> tuple[int, int]:
@@ -2490,9 +3106,11 @@ class ActiveInferenceEFE(Agent):
         action_id = int(executed_candidate.action_id)
         obs_change_type = str(getattr(causal_signature, "obs_change_type", "OBSERVED_UNCLASSIFIED"))
         level_delta = int(getattr(causal_signature, "level_delta", 0))
+        changed_pixel_count = int(max(0, getattr(causal_signature, "changed_pixel_count", 0)))
         translation_delta_bucket = str(
             getattr(causal_signature, "translation_delta_bucket", "na")
         )
+        source_region_key = self._current_region_key_v1()
         if action_id in (1, 2, 3, 4):
             self._navigation_attempt_count += 1
             action_key = str(action_id)
@@ -2502,7 +3120,6 @@ class ActiveInferenceEFE(Agent):
             )
             action_stats["attempts"] = int(action_stats.get("attempts", 0) + 1)
             edge_key = None
-            source_region_key = "NA"
             if self._last_known_agent_pos_region is not None:
                 rx, ry = self._last_known_agent_pos_region
                 source_region_key = f"{rx}:{ry}"
@@ -2591,6 +3208,27 @@ class ActiveInferenceEFE(Agent):
                     self._blocked_edge_counts[edge_key] = (
                         int(self._blocked_edge_counts.get(edge_key, 0)) + 1
                     )
+
+        if self._parse_region_key_v1(str(source_region_key)) is not None and action_id != 0:
+            region_action_key = f"{str(source_region_key)}|a{int(action_id)}"
+            histogram = self._region_action_event_counts.setdefault(region_action_key, {})
+            histogram[str(obs_change_type)] = int(histogram.get(str(obs_change_type), 0) + 1)
+            if str(obs_change_type) != "NO_CHANGE":
+                self._region_action_non_no_change_counts[region_action_key] = int(
+                    self._region_action_non_no_change_counts.get(region_action_key, 0) + 1
+                )
+            strong_change = bool(
+                str(obs_change_type) in ("CC_COUNT_CHANGE", "GLOBAL_PATTERN_CHANGE")
+                or int(changed_pixel_count) >= int(self.high_info_strong_change_pixels)
+            )
+            if strong_change:
+                self._region_action_strong_change_counts[region_action_key] = int(
+                    self._region_action_strong_change_counts.get(region_action_key, 0) + 1
+                )
+            if int(level_delta) > 0:
+                self._region_action_progress_counts[region_action_key] = int(
+                    self._region_action_progress_counts.get(region_action_key, 0) + 1
+                )
 
         if action_id == 6:
             bucket = self._click_context_bucket_from_candidate(executed_candidate)
@@ -2699,6 +3337,10 @@ class ActiveInferenceEFE(Agent):
             "click_subcluster_effectiveness": click_subcluster_summary,
             "navigation_semantic_features_v1": self._navigation_semantic_features_v1(),
             "sequence_causal_state_v1": self._sequence_causal_state_snapshot_v1(),
+            "high_info_focus_state_v1": self._high_info_focus_state_snapshot_v1(),
+            "high_info_region_scoreboard_v1": self._high_info_region_scoreboard_v1(
+                max_regions=12
+            ),
         }
 
     def _navigation_sequence_diagnostics_v1(self) -> dict[str, Any]:
@@ -2809,6 +3451,13 @@ class ActiveInferenceEFE(Agent):
                 if str(current.digest) == tracked_digest:
                     track_penalty -= 2
 
+            # Prefer non-HUD, non-boundary objects for navigation tracking.
+            boundary_penalty = 0
+            if bool(getattr(previous, "touches_boundary", False)):
+                boundary_penalty += 18
+            if bool(getattr(current, "touches_boundary", False)):
+                boundary_penalty += 18
+
             continuity_bonus = 0
             if str(previous.object_id) == str(current.object_id):
                 continuity_bonus = 6
@@ -2819,6 +3468,7 @@ class ActiveInferenceEFE(Agent):
                 + int(direction_penalty)
                 + (int(projection_error) * 2)
                 + int(track_penalty)
+                + int(boundary_penalty)
                 - int(continuity_bonus)
             )
             return {
@@ -2829,6 +3479,7 @@ class ActiveInferenceEFE(Agent):
                 "direction_alignment": float(max(-1.0, min(1.0, direction_alignment))),
                 "projection_error": float(projection_error),
                 "area_gap": float(area_gap),
+                "boundary_penalty": float(boundary_penalty),
             }
 
         def search(previous_pool: list[Any]) -> tuple[tuple[Any, Any] | None, dict[str, float]]:
@@ -3203,6 +3854,13 @@ class ActiveInferenceEFE(Agent):
                     navigation_state_estimate=navigation_state_estimate,
                     executed_candidate=self._previous_action_candidate,
                 )
+                self._update_high_info_focus_state_v1(
+                    current_packet=packet,
+                    transition_record=transition_record,
+                    causal_signature=causal_signature,
+                    navigation_state_estimate=navigation_state_estimate,
+                    executed_candidate=self._previous_action_candidate,
+                )
                 self._latest_navigation_state_estimate = dict(navigation_state_estimate)
                 progress_proxy_event = self._is_progress_proxy_event(causal_signature)
                 if str(causal_signature.obs_change_type) == "NO_CHANGE":
@@ -3478,6 +4136,10 @@ class ActiveInferenceEFE(Agent):
                         )
                         navigation_semantic_features = self._navigation_semantic_features_v1()
                         sequence_causal_state = self._sequence_causal_state_snapshot_v1()
+                        high_info_focus_state = self._high_info_focus_state_snapshot_v1()
+                        high_info_region_scoreboard = self._high_info_region_scoreboard_v1(
+                            max_regions=12
+                        )
                         region_graph_snapshot = self._region_graph_snapshot_v1()
                         for candidate in candidates:
                             action_key = str(int(candidate.action_id))
@@ -3503,6 +4165,12 @@ class ActiveInferenceEFE(Agent):
                             candidate.metadata["sequence_causal_state_v1"] = dict(
                                 sequence_causal_state
                             )
+                            candidate.metadata["high_info_focus_state_v1"] = dict(
+                                high_info_focus_state
+                            )
+                            candidate.metadata["high_info_region_scoreboard_v1"] = dict(
+                                high_info_region_scoreboard
+                            )
                             predicted_region_features: dict[str, Any] | None = None
                             if int(candidate.action_id) in (1, 2, 3, 4):
                                 candidate.metadata["blocked_edge_observed_stats"] = (
@@ -3526,6 +4194,19 @@ class ActiveInferenceEFE(Agent):
                                         predicted_region_features=predicted_region_features,
                                     )
                                 )
+                                candidate.metadata["region_action_semantics_v1"] = (
+                                    self._region_action_semantics_v1(
+                                        action_id=int(candidate.action_id),
+                                        current_region_key=str(
+                                            predicted_region_features.get(
+                                                "current_region_key",
+                                                self._current_region_key_v1(),
+                                            )
+                                            if isinstance(predicted_region_features, dict)
+                                            else self._current_region_key_v1()
+                                        ),
+                                    )
+                                )
                                 candidate.metadata["region_graph_snapshot_v1"] = dict(
                                     region_graph_snapshot
                                 )
@@ -3542,6 +4223,12 @@ class ActiveInferenceEFE(Agent):
                                 )
                             candidate.metadata["sequence_causal_features_v1"] = (
                                 self._sequence_causal_candidate_features_v1(
+                                    candidate=candidate,
+                                    predicted_region_features=predicted_region_features,
+                                )
+                            )
+                            candidate.metadata["high_info_focus_features_v1"] = (
+                                self._high_info_focus_candidate_features_v1(
                                     candidate=candidate,
                                     predicted_region_features=predicted_region_features,
                                 )
