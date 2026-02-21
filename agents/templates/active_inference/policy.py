@@ -3627,6 +3627,34 @@ class ActiveInferencePolicyEvaluatorV1:
                             selected_entry = best_seek["entry"]
                             high_info_focus_probe_applied = True
                             high_info_focus_probe_reason = "seek_target_priority"
+                if not high_info_focus_probe_applied:
+                    value_pool = [
+                        row
+                        for row in high_info_rows
+                        if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                        and float(row["features"].get("target_score", 0.0)) >= 0.32
+                    ]
+                    if value_pool:
+                        value_pool.sort(
+                            key=lambda row: (
+                                -float(row["features"].get("target_score", 0.0)),
+                                -float(row["features"].get("bonus_hint", 0.0)),
+                                int(row["features"].get("distance_after", 10**6)),
+                                float(row["score"]),
+                                int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                                int(row["entry"].candidate.action_id),
+                                str(row["entry"].candidate.candidate_id),
+                            )
+                        )
+                        best_value = value_pool[0]
+                        value_margin = float(max(0.22, 0.75 * self.sequence_probe_score_margin))
+                        if (
+                            float(best_value["features"].get("target_score", 0.0)) >= 0.70
+                            or float(best_value["score"]) <= (best_high_info_score + value_margin)
+                        ):
+                            selected_entry = best_value["entry"]
+                            high_info_focus_probe_applied = True
+                            high_info_focus_probe_reason = "high_value_region_priority"
                 if high_info_focus_probe_applied:
                     least_tried_probe_applied = True
                     if selected_entry is not entries[0]:

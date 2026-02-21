@@ -1791,8 +1791,8 @@ class ActiveInferenceEFE(Agent):
         )
         state["verify_action_ids"] = [int(v) for v in verify_action_ids]
         current_counter = int(getattr(current_packet, "action_counter", 0))
-        deadline = int(state.get("deadline_action_counter", -1))
-        if bool(state.get("active", False)) and deadline >= 0 and current_counter > deadline:
+        deadline_counter = int(state.get("deadline_action_counter", -1))
+        if bool(state.get("active", False)) and deadline_counter >= 0 and current_counter > deadline_counter:
             state["active"] = False
             state["stage"] = "idle"
             state["steps_remaining"] = 0
@@ -1801,6 +1801,21 @@ class ActiveInferenceEFE(Agent):
             state["target_region_scores"] = {}
             state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
             state["last_status"] = "timeout"
+
+        score_memory = state.get("target_region_scores", {})
+        if not isinstance(score_memory, dict):
+            score_memory = {}
+        score_memory = {
+            str(k): float(v)
+            for (k, v) in score_memory.items()
+            if self._parse_region_key_v1(str(k)) is not None and float(v) > 0.0
+        }
+        completed_regions = state.get("completed_target_regions", [])
+        if not isinstance(completed_regions, list):
+            completed_regions = []
+        completed_regions = [
+            str(v) for v in completed_regions if self._parse_region_key_v1(str(v)) is not None
+        ][-16:]
 
         source_region_key = "NA"
         if transition_record is not None:
@@ -1832,25 +1847,31 @@ class ActiveInferenceEFE(Agent):
             )
         )
 
-        if should_trigger:
+        def _collect_hot_targets(anchor_region_key: str) -> dict[str, float]:
+            target_scores_local: dict[str, float] = {}
             scoreboard = self._high_info_region_scoreboard_v1(max_regions=16)
             rows = scoreboard.get("rows", [])
             if not isinstance(rows, list):
                 rows = []
-            target_scores: dict[str, float] = {}
             for row in rows:
                 if not isinstance(row, dict):
                     continue
                 region_key = str(row.get("region_key", "NA"))
                 if self._parse_region_key_v1(region_key) is None:
                     continue
-                if region_key == str(source_region_key):
+                info_score = float(max(0.0, row.get("info_score", 0.0)))
+                if info_score <= 0.0:
                     continue
                 visit_count = int(self._region_visit_counts.get(region_key, 0))
-                score = float(row.get("info_score", 0.0)) + float(
-                    max(0.0, 1.0 - min(1.0, float(visit_count) / 8.0))
-                ) * 0.20
-                target_scores[region_key] = max(float(target_scores.get(region_key, 0.0)), score)
+                novelty_bonus = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 10.0))) * 0.20
+                revisit_penalty = float(min(0.18, float(visit_count) / 20.0))
+                score = float(max(0.0, info_score + novelty_bonus - revisit_penalty))
+                if region_key == str(anchor_region_key) and strong_event:
+                    score = float(max(score, 0.62))
+                target_scores_local[region_key] = max(
+                    float(target_scores_local.get(region_key, 0.0)),
+                    float(score),
+                )
 
             if executed_candidate is not None:
                 nav_target = executed_candidate.metadata.get("navigation_target_features_v1", {})
@@ -1861,57 +1882,105 @@ class ActiveInferenceEFE(Agent):
                         cross_ry = int(cross_region.get("y", -1))
                         if cross_rx >= 0 and cross_ry >= 0:
                             key = f"{cross_rx}:{cross_ry}"
-                            if key != str(source_region_key):
-                                target_scores[key] = max(float(target_scores.get(key, 0.0)), 0.65)
+                            target_scores_local[key] = max(
+                                float(target_scores_local.get(key, 0.0)),
+                                0.66,
+                            )
                     primary_target = nav_target.get("target_region", {})
                     if isinstance(primary_target, dict):
                         tx = int(primary_target.get("x", -1))
                         ty = int(primary_target.get("y", -1))
                         if tx >= 0 and ty >= 0:
                             key = f"{tx}:{ty}"
-                            if key != str(source_region_key):
-                                target_scores[key] = max(float(target_scores.get(key, 0.0)), 0.55)
+                            target_scores_local[key] = max(
+                                float(target_scores_local.get(key, 0.0)),
+                                0.56,
+                            )
+            return target_scores_local
 
-            queue = sorted(
-                target_scores.items(),
-                key=lambda item: (
-                    -float(item[1]),
-                    int(self._region_distance_v1(str(source_region_key), str(item[0]))),
-                    int(self._region_visit_counts.get(str(item[0]), 0)),
-                    str(item[0]),
-                ),
-            )
-            queue_keys = [str(region_key) for (region_key, _) in queue[: int(self.high_info_focus_max_targets)]]
-            if queue_keys:
-                state["active"] = True
-                state["stage"] = "seek"
-                state["window_steps"] = int(self.high_info_focus_window_steps)
-                state["steps_remaining"] = int(self.high_info_focus_window_steps)
-                state["trigger_count"] = int(state.get("trigger_count", 0) + 1)
-                state["source_region_key"] = str(source_region_key)
-                state["trigger_event_type"] = str(obs_change_type)
-                state["trigger_action_counter"] = int(current_counter)
-                state["deadline_action_counter"] = int(
-                    current_counter + int(self.high_info_focus_window_steps)
+        def _rank_queue(
+            target_scores_raw: dict[str, float],
+            *,
+            anchor_region_key: str,
+            completed_recent: set[str],
+        ) -> list[str]:
+            current_target = str(state.get("current_target_region_key", "NA"))
+            rows: list[tuple[int, int, float, int, int, str]] = []
+            for region_key, score in target_scores_raw.items():
+                region_key = str(region_key)
+                if self._parse_region_key_v1(region_key) is None:
+                    continue
+                score_value = float(score)
+                if score_value <= 0.0:
+                    continue
+                carry_priority = 0 if region_key == current_target else 1
+                completed_priority = 1 if region_key in completed_recent else 0
+                rows.append(
+                    (
+                        int(carry_priority),
+                        int(completed_priority),
+                        float(-score_value),
+                        int(self._region_distance_v1(str(anchor_region_key), region_key)),
+                        int(self._region_visit_counts.get(region_key, 0)),
+                        region_key,
+                    )
                 )
-                state["target_region_queue"] = list(queue_keys)
-                state["current_target_region_key"] = str(queue_keys[0])
-                state["target_region_scores"] = {
-                    str(region_key): float(score)
-                    for (region_key, score) in queue[: int(self.high_info_focus_max_targets)]
-                }
-                state["completed_target_regions"] = []
-                state["last_status"] = "triggered"
+            rows.sort()
+            limit = int(max(1, self.high_info_focus_max_targets))
+            return [str(row[-1]) for row in rows[:limit]]
+
+        if should_trigger:
+            was_active_before_trigger = bool(state.get("active", False))
+            new_targets = _collect_hot_targets(str(source_region_key))
+            merged_scores: dict[str, float] = {}
+            for region_key, old_score in score_memory.items():
+                merged_scores[str(region_key)] = float(max(0.0, 0.86 * float(old_score)))
+            for region_key, new_score in new_targets.items():
+                merged_scores[str(region_key)] = max(
+                    float(merged_scores.get(str(region_key), 0.0)),
+                    float(new_score),
+                )
+            min_keep = float(max(0.12, 0.35 * float(self.high_info_focus_min_trigger_score)))
+            merged_scores = {
+                str(region_key): float(score)
+                for (region_key, score) in merged_scores.items()
+                if self._parse_region_key_v1(str(region_key)) is not None and float(score) >= min_keep
+            }
+            score_memory = dict(merged_scores)
+            state["active"] = bool(score_memory)
+            state["stage"] = "seek"
+            state["window_steps"] = int(self.high_info_focus_window_steps)
+            state["steps_remaining"] = int(self.high_info_focus_window_steps)
+            state["trigger_count"] = int(state.get("trigger_count", 0) + 1)
+            state["source_region_key"] = str(source_region_key)
+            state["trigger_event_type"] = str(obs_change_type)
+            state["trigger_action_counter"] = int(current_counter)
+            state["deadline_action_counter"] = int(
+                max(
+                    int(state.get("deadline_action_counter", -1)),
+                    int(current_counter + int(self.high_info_focus_window_steps)),
+                )
+            )
+            state["last_status"] = (
+                "retriggered_chain" if was_active_before_trigger else "triggered"
+            )
 
         if not bool(state.get("active", False)):
+            state["target_region_scores"] = dict(score_memory)
+            state["completed_target_regions"] = list(completed_regions[-16:])
             return
 
-        deadline = int(state.get("deadline_action_counter", current_counter))
-        state["steps_remaining"] = int(max(0, deadline - current_counter))
-        queue = state.get("target_region_queue", [])
-        if not isinstance(queue, list):
-            queue = []
-        queue = [str(v) for v in queue if self._parse_region_key_v1(str(v)) is not None]
+        if not score_memory:
+            score_memory = _collect_hot_targets(str(source_region_key))
+        completed_recent = set(str(v) for v in completed_regions[-8:])
+        anchor_key = str(nav_region_key)
+        if self._parse_region_key_v1(anchor_key) is None:
+            anchor_key = str(source_region_key)
+        queue = _rank_queue(
+            score_memory,
+            anchor_region_key=str(anchor_key),
+            completed_recent=completed_recent,
+        )
         if not queue:
             state["active"] = False
             state["stage"] = "idle"
@@ -1921,57 +1990,47 @@ class ActiveInferenceEFE(Agent):
             state["target_region_scores"] = {}
             state["completion_count"] = int(state.get("completion_count", 0) + 1)
             state["last_status"] = "completed"
+            state["completed_target_regions"] = list(completed_regions[-16:])
             return
 
+        deadline = int(state.get("deadline_action_counter", current_counter))
+        state["steps_remaining"] = int(max(0, deadline - current_counter))
         target_region_key = str(queue[0])
         state["current_target_region_key"] = str(target_region_key)
         state["target_region_queue"] = list(queue)
+        state["target_region_scores"] = dict(score_memory)
+        state["completed_target_regions"] = list(completed_regions[-16:])
+        state["stage"] = "seek"
         in_target_region = bool(str(nav_region_key) == str(target_region_key))
-        stage = str(state.get("stage", "seek"))
-        if in_target_region and stage == "seek":
-            state["stage"] = "verify" if verify_action_ids else "seek"
-            state["last_status"] = "target_reached"
-            stage = str(state.get("stage", "seek"))
-            if not verify_action_ids:
-                completed = state.get("completed_target_regions", [])
-                if not isinstance(completed, list):
-                    completed = []
-                completed.append(str(target_region_key))
-                state["completed_target_regions"] = completed[-16:]
-                queue = queue[1:]
-                state["target_region_queue"] = list(queue)
-                state["current_target_region_key"] = str(queue[0]) if queue else "NA"
-                state["stage"] = "seek" if queue else "idle"
-                if not queue:
-                    state["active"] = False
-                    state["steps_remaining"] = 0
-                    state["target_region_scores"] = {}
-                    state["completion_count"] = int(state.get("completion_count", 0) + 1)
-                    state["last_status"] = "completed"
-                return
-
-        if stage == "verify" and in_target_region:
-            verified = bool(
-                action_id in {int(v) for v in verify_action_ids}
-                and str(obs_change_type) != "NO_CHANGE"
+        if in_target_region:
+            if not completed_regions or str(completed_regions[-1]) != str(target_region_key):
+                completed_regions.append(str(target_region_key))
+            completed_regions = completed_regions[-16:]
+            state["completed_target_regions"] = list(completed_regions)
+            if str(target_region_key) in score_memory:
+                score_memory[str(target_region_key)] = float(
+                    max(0.10, 0.72 * float(score_memory.get(str(target_region_key), 0.0)))
+                )
+            refreshed_queue = _rank_queue(
+                score_memory,
+                anchor_region_key=str(nav_region_key),
+                completed_recent=set(str(v) for v in completed_regions[-8:]),
             )
-            if verified:
-                completed = state.get("completed_target_regions", [])
-                if not isinstance(completed, list):
-                    completed = []
-                completed.append(str(target_region_key))
-                state["completed_target_regions"] = completed[-16:]
-                queue = queue[1:]
-                state["target_region_queue"] = list(queue)
-                state["current_target_region_key"] = str(queue[0]) if queue else "NA"
-                state["stage"] = "seek" if queue else "idle"
-                state["last_status"] = "verified"
-                if not queue:
-                    state["active"] = False
-                    state["steps_remaining"] = 0
-                    state["target_region_scores"] = {}
-                    state["completion_count"] = int(state.get("completion_count", 0) + 1)
-                    state["last_status"] = "completed"
+            refreshed_queue = [str(v) for v in refreshed_queue if str(v) != str(target_region_key)]
+            if refreshed_queue:
+                state["target_region_queue"] = list(refreshed_queue)
+                state["current_target_region_key"] = str(refreshed_queue[0])
+                state["target_region_scores"] = dict(score_memory)
+                state["last_status"] = "target_sampled"
+            else:
+                state["active"] = False
+                state["stage"] = "idle"
+                state["steps_remaining"] = 0
+                state["current_target_region_key"] = "NA"
+                state["target_region_queue"] = []
+                state["target_region_scores"] = {}
+                state["completion_count"] = int(state.get("completion_count", 0) + 1)
+                state["last_status"] = "completed"
 
     @staticmethod
     def _parse_delta_key_v1(delta_key: str) -> tuple[int, int]:
