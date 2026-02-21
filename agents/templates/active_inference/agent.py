@@ -280,6 +280,14 @@ class ActiveInferenceEFE(Agent):
             1,
             _env_int("ACTIVE_INFERENCE_HIGH_INFO_MIN_SAMPLES_PER_TARGET", 2),
         )
+        self.orientation_alignment_min_similarity = max(
+            0.35,
+            min(0.95, _env_float("ACTIVE_INFERENCE_ORIENTATION_MIN_SIMILARITY", 0.68)),
+        )
+        self.orientation_alignment_improve_delta = max(
+            0.01,
+            min(0.30, _env_float("ACTIVE_INFERENCE_ORIENTATION_IMPROVE_DELTA", 0.04)),
+        )
         self.enable_empirical_region_override = _env_bool(
             "ACTIVE_INFERENCE_ENABLE_EMPIRICAL_REGION_OVERRIDE",
             True,
@@ -424,6 +432,22 @@ class ActiveInferenceEFE(Agent):
         self._navigation_semantic_compare_count = 0
         self._navigation_semantic_mismatch_count = 0
         self._navigation_action_stats: dict[str, dict[str, int]] = {}
+        self._orientation_action_stats: dict[str, dict[str, int]] = {}
+        self._latest_orientation_alignment_state_v1: dict[str, Any] = {
+            "schema_name": "active_inference_orientation_alignment_state_v1",
+            "schema_version": 1,
+            "enabled": False,
+            "detected": False,
+            "aligned": False,
+            "similarity": 0.0,
+            "best_rotation_deg": -1,
+            "rotation_bucket": "rot_unknown",
+            "source_digest": "NA",
+            "target_digest": "NA",
+            "source_area": 0,
+            "target_area": 0,
+            "reason": "uninitialized",
+        }
         self._blocked_edge_counts: dict[str, int] = {}
         self._edge_attempt_counts: dict[str, int] = {}
         self._region_visit_counts: dict[str, int] = {}
@@ -432,6 +456,8 @@ class ActiveInferenceEFE(Agent):
         self._region_action_non_no_change_counts: dict[str, int] = {}
         self._region_action_strong_change_counts: dict[str, int] = {}
         self._region_action_progress_counts: dict[str, int] = {}
+        self._region_action_palette_change_counts: dict[str, int] = {}
+        self._region_action_palette_delta_total_sum: dict[str, int] = {}
         self._click_bucket_stats: dict[str, dict[str, int]] = {}
         self._click_subcluster_stats: dict[str, dict[str, int]] = {}
         self._state_visit_count: dict[str, int] = {}
@@ -874,6 +900,389 @@ class ActiveInferenceEFE(Agent):
                     ],
                 }
         return None
+
+    @staticmethod
+    def _orientation_rotation_bucket_v1(rotation_deg: int) -> str:
+        mapping = {
+            0: "rot_0",
+            90: "rot_90",
+            180: "rot_180",
+            270: "rot_270",
+        }
+        return str(mapping.get(int(rotation_deg), "rot_unknown"))
+
+    def _empty_orientation_alignment_state_v1(self, *, reason: str) -> dict[str, Any]:
+        return {
+            "schema_name": "active_inference_orientation_alignment_state_v1",
+            "schema_version": 1,
+            "enabled": True,
+            "detected": False,
+            "aligned": False,
+            "similarity": 0.0,
+            "best_rotation_deg": -1,
+            "rotation_bucket": "rot_unknown",
+            "source_digest": "NA",
+            "target_digest": "NA",
+            "source_area": 0,
+            "target_area": 0,
+            "source_color": -1,
+            "target_color": -1,
+            "source_bbox": [-1, -1, -1, -1],
+            "target_bbox": [-1, -1, -1, -1],
+            "reason": str(reason),
+        }
+
+    def _extract_object_cells_from_frame_v1(
+        self,
+        *,
+        frame: list[list[int]],
+        object_row: dict[str, Any],
+    ) -> set[tuple[int, int]]:
+        if not frame or not frame[0]:
+            return set()
+        frame_height = int(len(frame))
+        frame_width = int(len(frame[0]))
+        color = int(object_row.get("color", -1))
+        bbox = object_row.get("bbox", [])
+        if not isinstance(bbox, list) or len(bbox) < 4:
+            return set()
+        min_x = int(max(0, min(frame_width - 1, int(bbox[0]))))
+        min_y = int(max(0, min(frame_height - 1, int(bbox[1]))))
+        max_x = int(max(0, min(frame_width - 1, int(bbox[2]))))
+        max_y = int(max(0, min(frame_height - 1, int(bbox[3]))))
+        if min_x > max_x or min_y > max_y:
+            return set()
+
+        centroid_x = int(object_row.get("centroid_x", -1))
+        centroid_y = int(object_row.get("centroid_y", -1))
+        seeds: list[tuple[int, int]] = []
+        if (
+            min_x <= centroid_x <= max_x
+            and min_y <= centroid_y <= max_y
+            and int(frame[centroid_y][centroid_x]) == color
+        ):
+            seeds.append((int(centroid_x), int(centroid_y)))
+        if not seeds:
+            best_seed: tuple[int, int] | None = None
+            best_distance = 10**9
+            for y in range(min_y, max_y + 1):
+                row = frame[y]
+                for x in range(min_x, max_x + 1):
+                    if int(row[x]) != color:
+                        continue
+                    if centroid_x >= 0 and centroid_y >= 0:
+                        distance = int(abs(int(x) - centroid_x) + abs(int(y) - centroid_y))
+                    else:
+                        distance = 0
+                    if distance < best_distance:
+                        best_distance = int(distance)
+                        best_seed = (int(x), int(y))
+            if best_seed is None:
+                return set()
+            seeds.append(best_seed)
+
+        cells: set[tuple[int, int]] = set()
+        stack: list[tuple[int, int]] = list(seeds)
+        visited: set[tuple[int, int]] = set(seeds)
+        while stack:
+            x, y = stack.pop()
+            if x < min_x or x > max_x or y < min_y or y > max_y:
+                continue
+            if int(frame[y][x]) != color:
+                continue
+            cells.add((int(x), int(y)))
+            neighbors = (
+                (int(x - 1), int(y)),
+                (int(x + 1), int(y)),
+                (int(x), int(y - 1)),
+                (int(x), int(y + 1)),
+            )
+            for nx, ny in neighbors:
+                if nx < min_x or nx > max_x or ny < min_y or ny > max_y:
+                    continue
+                key = (int(nx), int(ny))
+                if key in visited:
+                    continue
+                visited.add(key)
+                stack.append(key)
+        return cells
+
+    @staticmethod
+    def _rasterize_cells_to_grid_v1(
+        *,
+        cells: set[tuple[int, int]],
+        bbox: list[int],
+        grid_size: int = 8,
+    ) -> set[tuple[int, int]]:
+        if not cells or not isinstance(bbox, list) or len(bbox) < 4:
+            return set()
+        min_x = int(bbox[0])
+        min_y = int(bbox[1])
+        max_x = int(bbox[2])
+        max_y = int(bbox[3])
+        width = int(max(1, max_x - min_x + 1))
+        height = int(max(1, max_y - min_y + 1))
+        g = int(max(2, grid_size))
+        points: set[tuple[int, int]] = set()
+        for x, y in cells:
+            local_x = int(max(0, min(width - 1, int(x) - min_x)))
+            local_y = int(max(0, min(height - 1, int(y) - min_y)))
+            gx = int(min(g - 1, max(0, int((local_x * g) / float(width)))))
+            gy = int(min(g - 1, max(0, int((local_y * g) / float(height)))))
+            points.add((int(gx), int(gy)))
+        return points
+
+    @staticmethod
+    def _rotate_grid_points_v1(
+        *,
+        points: set[tuple[int, int]],
+        steps: int,
+        grid_size: int = 8,
+    ) -> set[tuple[int, int]]:
+        g = int(max(2, grid_size))
+        out = set((int(x), int(y)) for (x, y) in points)
+        for _ in range(int(steps) % 4):
+            out = {(int(g - 1 - y), int(x)) for (x, y) in out}
+        return out
+
+    @staticmethod
+    def _iou_points_v1(a: set[tuple[int, int]], b: set[tuple[int, int]]) -> float:
+        if not a and not b:
+            return 1.0
+        if not a or not b:
+            return 0.0
+        inter = int(len(a & b))
+        union = int(len(a | b))
+        return float(inter / float(max(1, union)))
+
+    def _orientation_alignment_state_from_targets_v1(
+        self,
+        *,
+        packet: ObservationPacketV1,
+        representation: RepresentationStateV1,
+        targets: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not packet.frame or not packet.frame[0]:
+            return self._empty_orientation_alignment_state_v1(reason="empty_frame")
+        if not targets:
+            return self._empty_orientation_alignment_state_v1(reason="no_targets")
+
+        cross_target = next(
+            (
+                row
+                for row in targets
+                if isinstance(row, dict) and str(row.get("kind", "")) == "cross_like"
+            ),
+            None,
+        )
+        if not isinstance(cross_target, dict):
+            return self._empty_orientation_alignment_state_v1(reason="no_cross_target")
+
+        target_digest = str(cross_target.get("digest", "NA"))
+        target_obj = self._find_object_by_digest_v1(representation, target_digest)
+        if not isinstance(target_obj, dict):
+            return self._empty_orientation_alignment_state_v1(reason="target_not_found")
+
+        target_color = int(target_obj.get("color", -1))
+        target_area = int(max(0, target_obj.get("area", 0)))
+        source_candidates: list[dict[str, Any]] = []
+        for obj in representation.object_nodes:
+            if str(obj.digest) == str(target_digest):
+                continue
+            if int(obj.color) != int(target_color):
+                continue
+            source_candidates.append(
+                {
+                    "object_id": str(obj.object_id),
+                    "digest": str(obj.digest),
+                    "color": int(obj.color),
+                    "area": int(obj.area),
+                    "centroid_x": int(obj.centroid_x),
+                    "centroid_y": int(obj.centroid_y),
+                    "bbox": [
+                        int(obj.bbox_min_x),
+                        int(obj.bbox_min_y),
+                        int(obj.bbox_max_x),
+                        int(obj.bbox_max_y),
+                    ],
+                    "touches_boundary": bool(obj.touches_boundary),
+                }
+            )
+        if not source_candidates:
+            return self._empty_orientation_alignment_state_v1(reason="no_same_color_source")
+
+        source_candidates.sort(
+            key=lambda row: (
+                1 if bool(row.get("touches_boundary", False)) else 0,
+                -int(max(0, row.get("area", 0))),
+                str(row.get("digest", "")),
+            )
+        )
+        source_obj = source_candidates[0]
+        if int(source_obj.get("area", 0)) < int(target_area):
+            source_candidates.sort(
+                key=lambda row: (
+                    -int(max(0, row.get("area", 0))),
+                    1 if bool(row.get("touches_boundary", False)) else 0,
+                    str(row.get("digest", "")),
+                )
+            )
+            source_obj = source_candidates[0]
+
+        source_bbox = source_obj.get("bbox", [-1, -1, -1, -1])
+        target_bbox = target_obj.get("bbox", [-1, -1, -1, -1])
+        source_cells = self._extract_object_cells_from_frame_v1(
+            frame=packet.frame,
+            object_row=source_obj,
+        )
+        target_cells = self._extract_object_cells_from_frame_v1(
+            frame=packet.frame,
+            object_row=target_obj,
+        )
+        if len(source_cells) < 3 or len(target_cells) < 3:
+            return self._empty_orientation_alignment_state_v1(
+                reason="insufficient_component_cells"
+            )
+
+        source_points = self._rasterize_cells_to_grid_v1(
+            cells=source_cells,
+            bbox=source_bbox if isinstance(source_bbox, list) else [-1, -1, -1, -1],
+            grid_size=8,
+        )
+        target_points = self._rasterize_cells_to_grid_v1(
+            cells=target_cells,
+            bbox=target_bbox if isinstance(target_bbox, list) else [-1, -1, -1, -1],
+            grid_size=8,
+        )
+        if not source_points or not target_points:
+            return self._empty_orientation_alignment_state_v1(
+                reason="empty_raster_points"
+            )
+
+        best_rotation = -1
+        best_similarity = -1.0
+        for rotation_index, rotation_deg in enumerate((0, 90, 180, 270)):
+            rotated_points = self._rotate_grid_points_v1(
+                points=source_points,
+                steps=int(rotation_index),
+                grid_size=8,
+            )
+            similarity = self._iou_points_v1(rotated_points, target_points)
+            if float(similarity) > float(best_similarity):
+                best_similarity = float(similarity)
+                best_rotation = int(rotation_deg)
+
+        aligned = bool(
+            int(best_rotation) == 0
+            and float(best_similarity) >= float(self.orientation_alignment_min_similarity)
+        )
+        return {
+            "schema_name": "active_inference_orientation_alignment_state_v1",
+            "schema_version": 1,
+            "enabled": True,
+            "detected": True,
+            "aligned": bool(aligned),
+            "similarity": float(max(0.0, min(1.0, best_similarity))),
+            "best_rotation_deg": int(best_rotation),
+            "rotation_bucket": self._orientation_rotation_bucket_v1(int(best_rotation)),
+            "source_digest": str(source_obj.get("digest", "NA")),
+            "target_digest": str(target_obj.get("digest", "NA")),
+            "source_area": int(max(0, source_obj.get("area", 0))),
+            "target_area": int(max(0, target_obj.get("area", 0))),
+            "source_color": int(source_obj.get("color", -1)),
+            "target_color": int(target_obj.get("color", -1)),
+            "source_bbox": [
+                int(v) for v in (source_bbox if isinstance(source_bbox, list) else [-1, -1, -1, -1])[:4]
+            ],
+            "target_bbox": [
+                int(v) for v in (target_bbox if isinstance(target_bbox, list) else [-1, -1, -1, -1])[:4]
+            ],
+            "reason": "ok",
+        }
+
+    def _update_orientation_action_stats_v1(
+        self,
+        *,
+        executed_action_id: int,
+        previous_alignment: dict[str, Any] | None,
+        current_alignment: dict[str, Any] | None,
+    ) -> None:
+        action_id = int(executed_action_id)
+        if action_id not in (1, 2, 3, 4):
+            return
+        prev = previous_alignment if isinstance(previous_alignment, dict) else {}
+        cur = current_alignment if isinstance(current_alignment, dict) else {}
+        if not (
+            bool(prev.get("enabled", False))
+            and bool(prev.get("detected", False))
+            and bool(cur.get("enabled", False))
+            and bool(cur.get("detected", False))
+        ):
+            return
+        action_key = str(action_id)
+        stats = self._orientation_action_stats.setdefault(
+            action_key,
+            {"attempts": 0, "improved": 0, "regressed": 0, "aligned_hit": 0},
+        )
+        stats["attempts"] = int(stats.get("attempts", 0) + 1)
+        prev_similarity = float(max(0.0, min(1.0, prev.get("similarity", 0.0))))
+        cur_similarity = float(max(0.0, min(1.0, cur.get("similarity", 0.0))))
+        delta_similarity = float(cur_similarity - prev_similarity)
+        if delta_similarity >= float(self.orientation_alignment_improve_delta):
+            stats["improved"] = int(stats.get("improved", 0) + 1)
+        elif delta_similarity <= -float(self.orientation_alignment_improve_delta):
+            stats["regressed"] = int(stats.get("regressed", 0) + 1)
+        if bool(cur.get("aligned", False)):
+            stats["aligned_hit"] = int(stats.get("aligned_hit", 0) + 1)
+
+    def _orientation_alignment_candidate_features_v1(
+        self,
+        *,
+        candidate: ActionCandidateV1,
+        orientation_state: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        state = orientation_state if isinstance(orientation_state, dict) else {}
+        action_id = int(candidate.action_id)
+        action_stats = self._orientation_action_stats.get(str(action_id), {})
+        attempts = int(max(0, action_stats.get("attempts", 0)))
+        improved = int(max(0, action_stats.get("improved", 0)))
+        regressed = int(max(0, action_stats.get("regressed", 0)))
+        aligned_hit = int(max(0, action_stats.get("aligned_hit", 0)))
+        improve_rate = float(improved / float(max(1, attempts)))
+        regress_rate = float(regressed / float(max(1, attempts)))
+        aligned_hit_rate = float(aligned_hit / float(max(1, attempts)))
+        enabled = bool(state.get("enabled", False)) and bool(state.get("detected", False))
+        similarity = float(max(0.0, min(1.0, state.get("similarity", 0.0))))
+        aligned = bool(state.get("aligned", False))
+        bonus_hint = 0.0
+        penalty_hint = 0.0
+        if enabled and action_id in (1, 2, 3, 4):
+            mismatch = float(max(0.0, 1.0 - similarity))
+            bonus_hint = float(
+                max(0.0, (0.62 * improve_rate) + (0.38 * aligned_hit_rate))
+                * (0.40 + (0.60 * mismatch))
+            )
+            penalty_hint = float(
+                max(0.0, regress_rate) * (0.25 + (0.75 * mismatch))
+            )
+            if aligned:
+                bonus_hint = float(max(bonus_hint, 0.18 * aligned_hit_rate))
+        return {
+            "schema_name": "active_inference_orientation_alignment_features_v1",
+            "schema_version": 1,
+            "enabled": bool(enabled),
+            "detected": bool(state.get("detected", False)),
+            "aligned": bool(aligned),
+            "similarity": float(similarity),
+            "best_rotation_deg": int(state.get("best_rotation_deg", -1)),
+            "rotation_bucket": str(state.get("rotation_bucket", "rot_unknown")),
+            "action_attempts": int(attempts),
+            "action_improve_rate": float(max(0.0, min(1.0, improve_rate))),
+            "action_regress_rate": float(max(0.0, min(1.0, regress_rate))),
+            "action_aligned_hit_rate": float(max(0.0, min(1.0, aligned_hit_rate))),
+            "bonus_hint": float(max(0.0, bonus_hint)),
+            "penalty_hint": float(max(0.0, penalty_hint)),
+        }
 
     @staticmethod
     def _direction_bucket_from_delta_v1(dx: int, dy: int) -> str:
@@ -1349,6 +1758,12 @@ class ActiveInferenceEFE(Agent):
             non_no_change = int(self._region_action_non_no_change_counts.get(region_action_key, 0))
             strong_change = int(self._region_action_strong_change_counts.get(region_action_key, 0))
             cc_count_change = int(histogram.get("CC_COUNT_CHANGE", 0))
+            palette_change_count = int(
+                self._region_action_palette_change_counts.get(region_action_key, 0)
+            )
+            palette_delta_total_sum = int(
+                self._region_action_palette_delta_total_sum.get(region_action_key, 0)
+            )
             entropy = 0.0
             for count in histogram.values():
                 p = float(count / float(max(1, attempts)))
@@ -1359,6 +1774,11 @@ class ActiveInferenceEFE(Agent):
             non_no_change_rate = float(non_no_change / float(max(1, attempts)))
             strong_change_rate = float(strong_change / float(max(1, attempts)))
             cc_rate = float(cc_count_change / float(max(1, attempts)))
+            palette_change_rate = float(palette_change_count / float(max(1, attempts)))
+            palette_delta_mean = float(palette_delta_total_sum / float(max(1, attempts)))
+            palette_delta_mean_norm = float(
+                palette_delta_mean / (palette_delta_mean + 16.0)
+            )
             visit_count = int(self._region_visit_counts.get(str(region_key), 0))
             visit_novelty = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 10.0)))
             info_score = float(
@@ -1366,10 +1786,12 @@ class ActiveInferenceEFE(Agent):
                     0.0,
                     min(
                         1.0,
-                        (0.34 * cc_rate)
-                        + (0.28 * strong_change_rate)
-                        + (0.20 * non_no_change_rate)
-                        + (0.12 * entropy_norm)
+                        (0.30 * cc_rate)
+                        + (0.24 * strong_change_rate)
+                        + (0.18 * non_no_change_rate)
+                        + (0.10 * entropy_norm)
+                        + (0.12 * palette_change_rate)
+                        + (0.06 * palette_delta_mean_norm)
                         + (0.06 * visit_novelty),
                     ),
                 )
@@ -1384,6 +1806,9 @@ class ActiveInferenceEFE(Agent):
                 "non_no_change_rate": float(non_no_change_rate),
                 "strong_change_rate": float(strong_change_rate),
                 "cc_count_change_rate": float(cc_rate),
+                "palette_change_rate": float(palette_change_rate),
+                "palette_delta_mean": float(palette_delta_mean),
+                "palette_delta_mean_norm": float(palette_delta_mean_norm),
                 "visit_count": int(visit_count),
                 "event_histogram": {str(k): int(v) for (k, v) in sorted(histogram.items())},
             }
@@ -1428,6 +1853,9 @@ class ActiveInferenceEFE(Agent):
             "non_no_change_rate": 0.0,
             "strong_change_rate": 0.0,
             "cc_count_change_rate": 0.0,
+            "palette_change_rate": 0.0,
+            "palette_delta_mean": 0.0,
+            "palette_delta_mean_norm": 0.0,
             "event_entropy_norm": 0.0,
             "info_trigger_score": 0.0,
             "edge_status": "unknown",
@@ -1464,6 +1892,12 @@ class ActiveInferenceEFE(Agent):
         non_no_change_count = int(self._region_action_non_no_change_counts.get(region_action_key, 0))
         strong_change_count = int(self._region_action_strong_change_counts.get(region_action_key, 0))
         cc_count_change_count = int(histogram.get("CC_COUNT_CHANGE", 0))
+        palette_change_count = int(
+            self._region_action_palette_change_counts.get(region_action_key, 0)
+        )
+        palette_delta_total_sum = int(
+            self._region_action_palette_delta_total_sum.get(region_action_key, 0)
+        )
         entropy = 0.0
         for count in histogram.values():
             p = float(count / float(max(1, attempts)))
@@ -1476,15 +1910,22 @@ class ActiveInferenceEFE(Agent):
         non_no_change_rate = float(non_no_change_count / float(max(1, attempts)))
         strong_change_rate = float(strong_change_count / float(max(1, attempts)))
         cc_rate = float(cc_count_change_count / float(max(1, attempts)))
+        palette_change_rate = float(palette_change_count / float(max(1, attempts)))
+        palette_delta_mean = float(palette_delta_total_sum / float(max(1, attempts)))
+        palette_delta_mean_norm = float(
+            palette_delta_mean / (palette_delta_mean + 16.0)
+        )
         info_trigger_score = float(
             max(
                 0.0,
                 min(
                     1.0,
-                    (0.38 * cc_rate)
-                    + (0.30 * strong_change_rate)
-                    + (0.20 * non_no_change_rate)
-                    + (0.12 * entropy_norm),
+                    (0.32 * cc_rate)
+                    + (0.25 * strong_change_rate)
+                    + (0.18 * non_no_change_rate)
+                    + (0.11 * entropy_norm)
+                    + (0.09 * palette_change_rate)
+                    + (0.05 * palette_delta_mean_norm),
                 ),
             )
         )
@@ -1507,6 +1948,9 @@ class ActiveInferenceEFE(Agent):
                 "non_no_change_rate": float(non_no_change_rate),
                 "strong_change_rate": float(strong_change_rate),
                 "cc_count_change_rate": float(cc_rate),
+                "palette_change_rate": float(palette_change_rate),
+                "palette_delta_mean": float(palette_delta_mean),
+                "palette_delta_mean_norm": float(palette_delta_mean_norm),
                 "event_entropy_norm": float(entropy_norm),
                 "info_trigger_score": float(info_trigger_score),
                 "edge_status": str(edge_status),
@@ -2371,12 +2815,18 @@ class ActiveInferenceEFE(Agent):
 
     def _navigation_target_features_v1(
         self,
+        packet: ObservationPacketV1,
         representation: RepresentationStateV1,
     ) -> dict[str, Any]:
         agent_pos_xy = self._current_agent_position_xy_v1(representation)
         targets = self._navigation_key_targets_v1(
             representation,
             agent_pos_xy=agent_pos_xy,
+        )
+        orientation_alignment = self._orientation_alignment_state_from_targets_v1(
+            packet=packet,
+            representation=representation,
+            targets=targets,
         )
         if not targets:
             return {
@@ -2391,6 +2841,23 @@ class ActiveInferenceEFE(Agent):
                 "cross_like_enabled": False,
                 "cross_like_target_region": {"x": -1, "y": -1},
                 "cross_like_target_region_visit_count": 0,
+                "orientation_alignment_enabled": bool(orientation_alignment.get("enabled", False)),
+                "orientation_alignment_detected": bool(
+                    orientation_alignment.get("detected", False)
+                ),
+                "orientation_alignment_aligned": bool(
+                    orientation_alignment.get("aligned", False)
+                ),
+                "orientation_alignment_similarity": float(
+                    max(0.0, min(1.0, orientation_alignment.get("similarity", 0.0)))
+                ),
+                "orientation_alignment_best_rotation_deg": int(
+                    orientation_alignment.get("best_rotation_deg", -1)
+                ),
+                "orientation_alignment_rotation_bucket": str(
+                    orientation_alignment.get("rotation_bucket", "rot_unknown")
+                ),
+                "orientation_alignment_v1": dict(orientation_alignment),
                 "targets": [],
             }
 
@@ -2456,6 +2923,21 @@ class ActiveInferenceEFE(Agent):
             "cross_like_enabled": bool(cross_like_enabled),
             "cross_like_target_region": dict(cross_like_target_region),
             "cross_like_target_region_visit_count": int(cross_like_target_region_visit_count),
+            "orientation_alignment_enabled": bool(orientation_alignment.get("enabled", False)),
+            "orientation_alignment_detected": bool(
+                orientation_alignment.get("detected", False)
+            ),
+            "orientation_alignment_aligned": bool(orientation_alignment.get("aligned", False)),
+            "orientation_alignment_similarity": float(
+                max(0.0, min(1.0, orientation_alignment.get("similarity", 0.0)))
+            ),
+            "orientation_alignment_best_rotation_deg": int(
+                orientation_alignment.get("best_rotation_deg", -1)
+            ),
+            "orientation_alignment_rotation_bucket": str(
+                orientation_alignment.get("rotation_bucket", "rot_unknown")
+            ),
+            "orientation_alignment_v1": dict(orientation_alignment),
             "distance_before": float(distance_before),
             "target_direction_bucket": str(direction_bucket),
             "targets": [
@@ -2689,6 +3171,21 @@ class ActiveInferenceEFE(Agent):
                 getattr(observed_signature, "changed_area_ratio", 0.0)
             ),
             "event_tags": list(getattr(observed_signature, "event_tags", [])),
+            "palette_delta_topk": {
+                str(k): int(v)
+                for (k, v) in dict(
+                    getattr(observed_signature, "palette_delta_topk", {}) or {}
+                ).items()
+            },
+            "palette_delta_total": int(
+                sum(
+                    abs(int(v))
+                    for v in dict(
+                        getattr(observed_signature, "palette_delta_topk", {}) or {}
+                    ).values()
+                    if isinstance(v, int) or str(v).lstrip("-").isdigit()
+                )
+            ),
             "navigation_state_estimate_v1": dict(navigation_state_estimate),
         }
         return TransitionRecordV1(
@@ -3286,6 +3783,17 @@ class ActiveInferenceEFE(Agent):
         translation_delta_bucket = str(
             getattr(causal_signature, "translation_delta_bucket", "na")
         )
+        palette_delta_topk = getattr(causal_signature, "palette_delta_topk", {})
+        if not isinstance(palette_delta_topk, dict):
+            palette_delta_topk = {}
+        palette_delta_total = int(
+            sum(
+                abs(int(v))
+                for v in palette_delta_topk.values()
+                if isinstance(v, int) or str(v).lstrip("-").isdigit()
+            )
+        )
+        palette_changed = bool(palette_delta_total > 0)
         source_region_key = self._current_region_key_v1()
         if action_id in (1, 2, 3, 4):
             self._navigation_attempt_count += 1
@@ -3405,6 +3913,15 @@ class ActiveInferenceEFE(Agent):
                 self._region_action_progress_counts[region_action_key] = int(
                     self._region_action_progress_counts.get(region_action_key, 0) + 1
                 )
+            if palette_changed:
+                self._region_action_palette_change_counts[region_action_key] = int(
+                    self._region_action_palette_change_counts.get(region_action_key, 0)
+                    + 1
+                )
+            self._region_action_palette_delta_total_sum[region_action_key] = int(
+                self._region_action_palette_delta_total_sum.get(region_action_key, 0)
+                + int(palette_delta_total)
+            )
 
         if action_id == 6:
             bucket = self._click_context_bucket_from_candidate(executed_candidate)
@@ -3509,9 +4026,47 @@ class ActiveInferenceEFE(Agent):
                     key=lambda item: (-int(item[1]), item[0]),
                 )[:128]
             },
+            "region_action_palette_change_histogram": {
+                str(key): int(max(0, value))
+                for (key, value) in sorted(
+                    self._region_action_palette_change_counts.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )[:128]
+            },
+            "region_action_palette_delta_total_histogram": {
+                str(key): int(max(0, value))
+                for (key, value) in sorted(
+                    self._region_action_palette_delta_total_sum.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )[:128]
+            },
             "click_bucket_effectiveness": click_summary,
             "click_subcluster_effectiveness": click_subcluster_summary,
             "navigation_semantic_features_v1": self._navigation_semantic_features_v1(),
+            "orientation_alignment_state_v1": dict(
+                self._latest_orientation_alignment_state_v1
+            ),
+            "orientation_action_stats": {
+                str(action_key): {
+                    "attempts": int(max(0, stats.get("attempts", 0))),
+                    "improved": int(max(0, stats.get("improved", 0))),
+                    "regressed": int(max(0, stats.get("regressed", 0))),
+                    "aligned_hit": int(max(0, stats.get("aligned_hit", 0))),
+                    "improve_rate": float(
+                        float(max(0, stats.get("improved", 0)))
+                        / float(max(1, int(max(0, stats.get("attempts", 0)))))
+                    ),
+                    "regress_rate": float(
+                        float(max(0, stats.get("regressed", 0)))
+                        / float(max(1, int(max(0, stats.get("attempts", 0)))))
+                    ),
+                    "aligned_hit_rate": float(
+                        float(max(0, stats.get("aligned_hit", 0)))
+                        / float(max(1, int(max(0, stats.get("attempts", 0)))))
+                    ),
+                }
+                for (action_key, stats) in sorted(self._orientation_action_stats.items())
+            },
             "sequence_causal_state_v1": self._sequence_causal_state_snapshot_v1(),
             "high_info_focus_state_v1": self._high_info_focus_state_snapshot_v1(),
             "high_info_region_scoreboard_v1": self._high_info_region_scoreboard_v1(
@@ -4019,6 +4574,38 @@ class ActiveInferenceEFE(Agent):
                     tracked_token_before=tracked_token_before,
                 )
                 self._update_transition_graph_v1(transition_record)
+                previous_targets = self._navigation_key_targets_v1(
+                    self._previous_representation,
+                    agent_pos_xy=self._current_agent_position_xy_v1(
+                        self._previous_representation
+                    ),
+                )
+                previous_orientation_alignment = (
+                    self._orientation_alignment_state_from_targets_v1(
+                        packet=self._previous_packet,
+                        representation=self._previous_representation,
+                        targets=previous_targets,
+                    )
+                )
+                current_targets = self._navigation_key_targets_v1(
+                    representation,
+                    agent_pos_xy=self._current_agent_position_xy_v1(representation),
+                )
+                current_orientation_alignment = (
+                    self._orientation_alignment_state_from_targets_v1(
+                        packet=packet,
+                        representation=representation,
+                        targets=current_targets,
+                    )
+                )
+                self._update_orientation_action_stats_v1(
+                    executed_action_id=int(self._previous_action_candidate.action_id),
+                    previous_alignment=previous_orientation_alignment,
+                    current_alignment=current_orientation_alignment,
+                )
+                self._latest_orientation_alignment_state_v1 = dict(
+                    current_orientation_alignment
+                )
                 self._update_operability_stats_v1(
                     executed_candidate=self._previous_action_candidate,
                     causal_signature=causal_signature,
@@ -4072,6 +4659,9 @@ class ActiveInferenceEFE(Agent):
                             posterior_report.get("mode_transition_soft_confidence", 0.0)
                         ),
                         "navigation_state_estimate_v1": dict(navigation_state_estimate),
+                        "orientation_alignment_state_v1": dict(
+                            self._latest_orientation_alignment_state_v1
+                        ),
                         "transition_record_previous_step_v1": (
                             transition_record.to_dict()
                             if transition_record is not None
@@ -4309,8 +4899,19 @@ class ActiveInferenceEFE(Agent):
                         state_digest_current = self._state_digest_v1(packet, representation)
                         control_schema = self._control_schema_posterior()
                         navigation_target_features = self._navigation_target_features_v1(
-                            representation
+                            packet,
+                            representation,
                         )
+                        if isinstance(
+                            navigation_target_features.get("orientation_alignment_v1"),
+                            dict,
+                        ):
+                            self._latest_orientation_alignment_state_v1 = dict(
+                                navigation_target_features.get(
+                                    "orientation_alignment_v1",
+                                    {},
+                                )
+                            )
                         navigation_semantic_features = self._navigation_semantic_features_v1()
                         sequence_causal_state = self._sequence_causal_state_snapshot_v1()
                         high_info_focus_state = self._high_info_focus_state_snapshot_v1()
@@ -4371,6 +4972,15 @@ class ActiveInferenceEFE(Agent):
                                         predicted_region_features=predicted_region_features,
                                     )
                                 )
+                                candidate.metadata["orientation_alignment_features_v1"] = (
+                                    self._orientation_alignment_candidate_features_v1(
+                                        candidate=candidate,
+                                        orientation_state=target_payload.get(
+                                            "orientation_alignment_v1",
+                                            {},
+                                        ),
+                                    )
+                                )
                                 candidate.metadata["region_action_semantics_v1"] = (
                                     self._region_action_semantics_v1(
                                         action_id=int(candidate.action_id),
@@ -4386,6 +4996,16 @@ class ActiveInferenceEFE(Agent):
                                 )
                                 candidate.metadata["region_graph_snapshot_v1"] = dict(
                                     region_graph_snapshot
+                                )
+                            else:
+                                candidate.metadata["orientation_alignment_features_v1"] = (
+                                    self._orientation_alignment_candidate_features_v1(
+                                        candidate=candidate,
+                                        orientation_state=navigation_target_features.get(
+                                            "orientation_alignment_v1",
+                                            {},
+                                        ),
+                                    )
                                 )
                             if int(candidate.action_id) == 6:
                                 click_bucket = self._click_context_bucket_from_candidate(candidate)

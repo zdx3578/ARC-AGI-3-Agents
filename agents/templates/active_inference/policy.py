@@ -873,6 +873,104 @@ class ActiveInferencePolicyEvaluatorV1:
             )
             if high_info_verify_action_candidate:
                 high_info_bonus = float(high_info_bonus + (0.45 * high_info_target_score))
+        orientation_alignment = self._candidate_orientation_alignment_features(candidate)
+        orientation_alignment_enabled = bool(
+            int(candidate.action_id) in (1, 2, 3, 4)
+            and orientation_alignment.get("enabled", False)
+            and orientation_alignment.get("detected", False)
+        )
+        orientation_alignment_aligned = bool(orientation_alignment.get("aligned", False))
+        orientation_alignment_similarity = self._clamp01(
+            float(orientation_alignment.get("similarity", 0.0))
+        )
+        orientation_alignment_mismatch = float(max(0.0, 1.0 - orientation_alignment_similarity))
+        orientation_alignment_bonus_hint = self._clamp01(
+            float(orientation_alignment.get("bonus_hint", 0.0))
+        )
+        orientation_alignment_penalty_hint = self._clamp01(
+            float(orientation_alignment.get("penalty_hint", 0.0))
+        )
+        orientation_action_improve_rate = self._clamp01(
+            float(orientation_alignment.get("action_improve_rate", 0.0))
+        )
+        orientation_action_regress_rate = self._clamp01(
+            float(orientation_alignment.get("action_regress_rate", 0.0))
+        )
+        orientation_action_aligned_hit_rate = self._clamp01(
+            float(orientation_alignment.get("action_aligned_hit_rate", 0.0))
+        )
+        orientation_alignment_bonus = 0.0
+        orientation_alignment_penalty = 0.0
+        if orientation_alignment_enabled:
+            orientation_alignment_bonus = float(
+                orientation_alignment_bonus_hint
+                * (0.45 + (0.55 * orientation_alignment_mismatch))
+            )
+            orientation_alignment_penalty = float(
+                orientation_alignment_penalty_hint
+                * (0.30 + (0.70 * orientation_alignment_mismatch))
+            )
+            orientation_alignment_bonus += float(
+                0.20 * orientation_action_improve_rate * orientation_alignment_mismatch
+            )
+            orientation_alignment_penalty += float(
+                0.15 * orientation_action_regress_rate * orientation_alignment_mismatch
+            )
+            if orientation_alignment_aligned:
+                orientation_alignment_bonus = float(
+                    max(
+                        orientation_alignment_bonus,
+                        0.18 * orientation_action_aligned_hit_rate,
+                    )
+                )
+        region_action_semantics = self._candidate_region_action_semantics(candidate)
+        region_action_semantics_enabled = bool(
+            int(candidate.action_id) in (1, 2, 3, 4)
+            and region_action_semantics.get("enabled", False)
+        )
+        region_info_trigger_score = self._clamp01(
+            float(region_action_semantics.get("info_trigger_score", 0.0))
+        )
+        region_palette_change_rate = self._clamp01(
+            float(region_action_semantics.get("palette_change_rate", 0.0))
+        )
+        region_palette_delta_mean_norm = self._clamp01(
+            float(region_action_semantics.get("palette_delta_mean_norm", 0.0))
+        )
+        region_cc_count_change_rate = self._clamp01(
+            float(region_action_semantics.get("cc_count_change_rate", 0.0))
+        )
+        region_strong_change_rate = self._clamp01(
+            float(region_action_semantics.get("strong_change_rate", 0.0))
+        )
+        region_semantics_edge_status = str(
+            region_action_semantics.get("edge_status", "unknown")
+        )
+        region_semantics_moved_rate = self._clamp01(
+            float(region_action_semantics.get("moved_rate", 0.0))
+        )
+        color_coupling_signal = 0.0
+        color_coupling_bonus = 0.0
+        color_coupling_penalty = 0.0
+        if region_action_semantics_enabled:
+            color_coupling_signal = self._clamp01(
+                (0.35 * region_info_trigger_score)
+                + (0.20 * region_palette_change_rate)
+                + (0.15 * region_palette_delta_mean_norm)
+                + (0.15 * region_cc_count_change_rate)
+                + (0.15 * region_strong_change_rate)
+            )
+            color_coupling_bonus = float(
+                color_coupling_signal
+                * (0.30 + (0.70 * frontier_novelty))
+                * (0.30 + (0.70 * region_novelty))
+            )
+            if region_semantics_edge_status == "blocked":
+                color_coupling_penalty = float(
+                    0.30 * color_coupling_signal * (0.55 + (0.45 * blocked_probability))
+                )
+            elif region_semantics_moved_rate <= 0.20:
+                color_coupling_penalty = float(0.12 * color_coupling_signal)
         navigation_projection = candidate.metadata.get(
             "navigation_step_projection_features_v1",
             {},
@@ -980,6 +1078,18 @@ class ActiveInferencePolicyEvaluatorV1:
         high_info_penalty_effective = float(
             high_info_penalty * geometry_term_gate
         )
+        orientation_alignment_bonus_effective = float(
+            orientation_alignment_bonus * geometry_term_gate
+        )
+        orientation_alignment_penalty_effective = float(
+            orientation_alignment_penalty * geometry_term_gate
+        )
+        color_coupling_bonus_effective = float(
+            color_coupling_bonus * (0.65 + (0.35 * geometry_term_gate))
+        )
+        color_coupling_penalty_effective = float(
+            color_coupling_penalty * (0.65 + (0.35 * geometry_term_gate))
+        )
 
         # Level 1 (operability/control): risk captures blocked tendencies and
         # control uncertainty in movement outcomes.
@@ -1012,6 +1122,8 @@ class ActiveInferencePolicyEvaluatorV1:
                 + (0.25 * key_target_away_penalty_effective)
                 + (0.35 * projection_away_penalty_effective)
                 + (0.40 * high_info_penalty_effective)
+                + (0.28 * orientation_alignment_penalty_effective)
+                + (0.18 * color_coupling_penalty_effective)
                 + (0.10 * coverage_repeat_penalty)
                 - (
                     0.30
@@ -1029,6 +1141,14 @@ class ActiveInferencePolicyEvaluatorV1:
                     * projection_toward_bonus_effective
                     * max(0.25, float(translation_probability))
                 ),
+            )
+        )
+        operability_risk = float(
+            max(
+                0.0,
+                operability_risk
+                - (0.40 * orientation_alignment_bonus_effective)
+                - (0.28 * color_coupling_bonus_effective),
             )
         )
         operability_risk = float(
@@ -1095,6 +1215,35 @@ class ActiveInferencePolicyEvaluatorV1:
             "high_info_penalty": float(high_info_penalty),
             "high_info_bonus_effective": float(high_info_bonus_effective),
             "high_info_penalty_effective": float(high_info_penalty_effective),
+            "orientation_alignment_enabled": bool(orientation_alignment_enabled),
+            "orientation_alignment_aligned": bool(orientation_alignment_aligned),
+            "orientation_alignment_similarity": float(orientation_alignment_similarity),
+            "orientation_alignment_bonus": float(orientation_alignment_bonus),
+            "orientation_alignment_penalty": float(orientation_alignment_penalty),
+            "orientation_alignment_bonus_effective": float(
+                orientation_alignment_bonus_effective
+            ),
+            "orientation_alignment_penalty_effective": float(
+                orientation_alignment_penalty_effective
+            ),
+            "orientation_rotation_bucket": str(
+                orientation_alignment.get("rotation_bucket", "rot_unknown")
+            ),
+            "orientation_best_rotation_deg": int(
+                orientation_alignment.get("best_rotation_deg", -1)
+            ),
+            "region_action_semantics_enabled": bool(region_action_semantics_enabled),
+            "region_info_trigger_score": float(region_info_trigger_score),
+            "region_palette_change_rate": float(region_palette_change_rate),
+            "region_palette_delta_mean_norm": float(region_palette_delta_mean_norm),
+            "region_cc_count_change_rate": float(region_cc_count_change_rate),
+            "region_strong_change_rate": float(region_strong_change_rate),
+            "region_semantics_edge_status": str(region_semantics_edge_status),
+            "color_coupling_signal": float(color_coupling_signal),
+            "color_coupling_bonus": float(color_coupling_bonus),
+            "color_coupling_penalty": float(color_coupling_penalty),
+            "color_coupling_bonus_effective": float(color_coupling_bonus_effective),
+            "color_coupling_penalty_effective": float(color_coupling_penalty_effective),
             "navigation_confidence_gating_enabled": bool(
                 self.navigation_confidence_gating_enabled
             ),
@@ -1186,12 +1335,16 @@ class ActiveInferencePolicyEvaluatorV1:
                     + (0.18 * key_target_away_penalty_effective)
                     + (0.24 * projection_away_penalty_effective)
                     + (0.30 * high_info_penalty_effective)
+                    + (0.24 * orientation_alignment_penalty_effective)
+                    + (0.20 * color_coupling_penalty_effective)
                     + (0.20 * coverage_repeat_penalty)
                     + (0.28 * sequence_causal_penalty)
                     - (0.25 * leave_high_revisit_potential)
                     - (0.30 * key_target_escape_bonus_effective)
                     - (0.34 * projection_toward_bonus_effective)
                     - (0.38 * high_info_bonus_effective)
+                    - (0.30 * orientation_alignment_bonus_effective)
+                    - (0.32 * color_coupling_bonus_effective)
                     - (0.35 * coverage_frontier_bonus)
                     - (0.45 * sequence_causal_bonus)
                 ),
@@ -1217,11 +1370,15 @@ class ActiveInferencePolicyEvaluatorV1:
         habit_risk += float(max(0.0, 0.25 * key_target_away_penalty_effective))
         habit_risk += float(max(0.0, 0.30 * projection_away_penalty_effective))
         habit_risk += float(max(0.0, 0.34 * high_info_penalty_effective))
+        habit_risk += float(max(0.0, 0.26 * orientation_alignment_penalty_effective))
+        habit_risk += float(max(0.0, 0.22 * color_coupling_penalty_effective))
         habit_risk += float(max(0.0, 0.30 * coverage_repeat_penalty))
         habit_risk += float(max(0.0, 0.24 * sequence_causal_penalty))
         habit_risk = float(max(0.0, habit_risk - (0.22 * key_target_escape_bonus_effective)))
         habit_risk = float(max(0.0, habit_risk - (0.28 * projection_toward_bonus_effective)))
         habit_risk = float(max(0.0, habit_risk - (0.34 * high_info_bonus_effective)))
+        habit_risk = float(max(0.0, habit_risk - (0.25 * orientation_alignment_bonus_effective)))
+        habit_risk = float(max(0.0, habit_risk - (0.26 * color_coupling_bonus_effective)))
         habit_risk = float(max(0.0, habit_risk - (0.26 * coverage_frontier_bonus)))
         habit_risk = float(max(0.0, habit_risk - (0.30 * sequence_causal_bonus)))
         progress_information_gain = float(
@@ -1236,6 +1393,9 @@ class ActiveInferencePolicyEvaluatorV1:
                     + (0.20 * key_target_escape_bonus_effective)
                     + (0.30 * projection_toward_bonus_effective)
                     + (0.34 * high_info_bonus_effective)
+                    + (0.28 * orientation_alignment_bonus_effective)
+                    + (0.34 * color_coupling_bonus_effective)
+                    + (0.20 * color_coupling_signal)
                     + (0.28 * coverage_frontier_bonus)
                     + (0.35 * sequence_causal_bonus)
                     + (0.20 * navigation_relocalization_bonus)
@@ -1315,7 +1475,36 @@ class ActiveInferencePolicyEvaluatorV1:
             "high_info_penalty": float(high_info_penalty),
             "high_info_bonus_effective": float(high_info_bonus_effective),
             "high_info_penalty_effective": float(high_info_penalty_effective),
+            "orientation_alignment_enabled": bool(orientation_alignment_enabled),
+            "orientation_alignment_aligned": bool(orientation_alignment_aligned),
+            "orientation_alignment_similarity": float(orientation_alignment_similarity),
+            "orientation_alignment_bonus": float(orientation_alignment_bonus),
+            "orientation_alignment_penalty": float(orientation_alignment_penalty),
+            "orientation_alignment_bonus_effective": float(
+                orientation_alignment_bonus_effective
+            ),
+            "orientation_alignment_penalty_effective": float(
+                orientation_alignment_penalty_effective
+            ),
+            "orientation_rotation_bucket": str(
+                orientation_alignment.get("rotation_bucket", "rot_unknown")
+            ),
+            "orientation_best_rotation_deg": int(
+                orientation_alignment.get("best_rotation_deg", -1)
+            ),
             "geometry_term_gate": float(geometry_term_gate),
+            "region_action_semantics_enabled": bool(region_action_semantics_enabled),
+            "region_info_trigger_score": float(region_info_trigger_score),
+            "region_palette_change_rate": float(region_palette_change_rate),
+            "region_palette_delta_mean_norm": float(region_palette_delta_mean_norm),
+            "region_cc_count_change_rate": float(region_cc_count_change_rate),
+            "region_strong_change_rate": float(region_strong_change_rate),
+            "region_semantics_edge_status": str(region_semantics_edge_status),
+            "color_coupling_signal": float(color_coupling_signal),
+            "color_coupling_bonus": float(color_coupling_bonus),
+            "color_coupling_penalty": float(color_coupling_penalty),
+            "color_coupling_bonus_effective": float(color_coupling_bonus_effective),
+            "color_coupling_penalty_effective": float(color_coupling_penalty_effective),
             "coverage_enabled": bool(coverage_enabled),
             "coverage_confidence": float(coverage_confidence),
             "coverage_next_region_key": str(coverage_next_region_key),
@@ -1388,6 +1577,12 @@ class ActiveInferencePolicyEvaluatorV1:
         sequence_causal_penalty = self._clamp01(
             float(level2_terms.get("sequence_causal_penalty", 0.0))
         )
+        orientation_alignment_bonus_effective = self._clamp01(
+            float(level2_terms.get("orientation_alignment_bonus_effective", 0.0))
+        )
+        color_coupling_signal = self._clamp01(
+            float(level2_terms.get("color_coupling_signal", 0.0))
+        )
         sequence_causal_active = bool(level2_terms.get("sequence_causal_active", False))
         stuck_score = self._clamp01(
             (0.30 * stagnation_context)
@@ -1396,6 +1591,8 @@ class ActiveInferencePolicyEvaluatorV1:
             + (0.15 * habit_pressure)
             + (0.10 * sequence_causal_penalty)
             + (0.10 * (1.0 - navigation_confidence_gate))
+            - (0.12 * orientation_alignment_bonus_effective)
+            - (0.10 * color_coupling_signal)
         )
 
         phase_focus = "balanced"
@@ -1583,6 +1780,10 @@ class ActiveInferencePolicyEvaluatorV1:
             "sequence_causal_active": bool(sequence_causal_active),
             "sequence_causal_bonus": float(sequence_causal_bonus),
             "sequence_causal_penalty": float(sequence_causal_penalty),
+            "orientation_alignment_bonus_effective": float(
+                orientation_alignment_bonus_effective
+            ),
+            "color_coupling_signal": float(color_coupling_signal),
             "evidence_count_effective": int(level2_terms.get("evidence_count_effective", 0)),
             "evidence_regime": str(level2_terms.get("evidence_regime", "unknown")),
             "effect_thresholds": {
@@ -1776,6 +1977,59 @@ class ActiveInferencePolicyEvaluatorV1:
             ],
             "bonus_hint": float(max(0.0, raw.get("bonus_hint", 0.0))),
             "penalty_hint": float(max(0.0, raw.get("penalty_hint", 0.0))),
+        }
+
+    def _candidate_orientation_alignment_features(
+        self,
+        candidate: ActionCandidateV1,
+    ) -> dict[str, Any]:
+        raw = candidate.metadata.get("orientation_alignment_features_v1", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "detected": bool(raw.get("detected", False)),
+            "aligned": bool(raw.get("aligned", False)),
+            "similarity": self._clamp01(float(raw.get("similarity", 0.0))),
+            "best_rotation_deg": int(raw.get("best_rotation_deg", -1)),
+            "rotation_bucket": str(raw.get("rotation_bucket", "rot_unknown")),
+            "action_attempts": int(max(0, raw.get("action_attempts", 0))),
+            "action_improve_rate": self._clamp01(float(raw.get("action_improve_rate", 0.0))),
+            "action_regress_rate": self._clamp01(float(raw.get("action_regress_rate", 0.0))),
+            "action_aligned_hit_rate": self._clamp01(
+                float(raw.get("action_aligned_hit_rate", 0.0))
+            ),
+            "bonus_hint": self._clamp01(float(raw.get("bonus_hint", 0.0))),
+            "penalty_hint": self._clamp01(float(raw.get("penalty_hint", 0.0))),
+        }
+
+    def _candidate_region_action_semantics(
+        self,
+        candidate: ActionCandidateV1,
+    ) -> dict[str, Any]:
+        raw = candidate.metadata.get("region_action_semantics_v1", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "action_id": int(raw.get("action_id", int(candidate.action_id))),
+            "current_region_key": str(raw.get("current_region_key", "NA")),
+            "attempts": int(max(0, raw.get("attempts", 0))),
+            "moved_count": int(max(0, raw.get("moved_count", 0))),
+            "blocked_count": int(max(0, raw.get("blocked_count", 0))),
+            "moved_rate": self._clamp01(float(raw.get("moved_rate", 0.0))),
+            "blocked_rate": self._clamp01(float(raw.get("blocked_rate", 0.0))),
+            "non_no_change_rate": self._clamp01(float(raw.get("non_no_change_rate", 0.0))),
+            "strong_change_rate": self._clamp01(float(raw.get("strong_change_rate", 0.0))),
+            "cc_count_change_rate": self._clamp01(float(raw.get("cc_count_change_rate", 0.0))),
+            "palette_change_rate": self._clamp01(float(raw.get("palette_change_rate", 0.0))),
+            "palette_delta_mean": float(max(0.0, raw.get("palette_delta_mean", 0.0))),
+            "palette_delta_mean_norm": self._clamp01(
+                float(raw.get("palette_delta_mean_norm", 0.0))
+            ),
+            "event_entropy_norm": self._clamp01(float(raw.get("event_entropy_norm", 0.0))),
+            "info_trigger_score": self._clamp01(float(raw.get("info_trigger_score", 0.0))),
+            "edge_status": str(raw.get("edge_status", "unknown")),
         }
 
     def _candidate_frontier_graph_cost(self, candidate: ActionCandidateV1) -> float:
