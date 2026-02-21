@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections import deque
 import math
+from collections import deque
 from typing import Any
 
 from .contracts import (
@@ -55,6 +55,10 @@ class ActiveInferencePolicyEvaluatorV1:
         coverage_sweep_direction_retry_limit: int = 8,
         coverage_matrix_sweep_enabled: bool = True,
         coverage_sweep_force_in_exploit: bool = True,
+        navigation_confidence_gating_enabled: bool = True,
+        sequence_causal_term_enabled: bool = True,
+        sequence_causal_bonus_weight: float = 0.55,
+        sequence_causal_penalty_weight: float = 0.35,
         hierarchy_weight_overrides: dict[str, dict[str, float]] | None = None,
     ) -> None:
         self.explore_steps = int(max(1, explore_steps))
@@ -105,6 +109,12 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         self.coverage_matrix_sweep_enabled = bool(coverage_matrix_sweep_enabled)
         self.coverage_sweep_force_in_exploit = bool(coverage_sweep_force_in_exploit)
+        self.navigation_confidence_gating_enabled = bool(
+            navigation_confidence_gating_enabled
+        )
+        self.sequence_causal_term_enabled = bool(sequence_causal_term_enabled)
+        self.sequence_causal_bonus_weight = float(max(0.0, sequence_causal_bonus_weight))
+        self.sequence_causal_penalty_weight = float(max(0.0, sequence_causal_penalty_weight))
         self.hierarchy_weight_overrides = hierarchy_weight_overrides or {}
 
     @staticmethod
@@ -770,6 +780,63 @@ class ActiveInferencePolicyEvaluatorV1:
         navigation_target = candidate.metadata.get("navigation_target_features_v1", {})
         if not isinstance(navigation_target, dict):
             navigation_target = {}
+        navigation_semantic = candidate.metadata.get("navigation_semantic_features_v1", {})
+        if not isinstance(navigation_semantic, dict):
+            navigation_semantic = {}
+        nav_semantic_enabled = bool(navigation_semantic.get("enabled", False))
+        nav_semantic_compare_count = int(max(0, navigation_semantic.get("compare_count", 0)))
+        nav_semantic_mismatch_rate = self._clamp01(
+            float(navigation_semantic.get("mismatch_rate", 0.0))
+        )
+        nav_semantic_confidence = self._clamp01(
+            float(navigation_semantic.get("confidence", 1.0))
+        )
+        navigation_confidence_gate = 1.0
+        if self.navigation_confidence_gating_enabled and nav_semantic_enabled:
+            navigation_confidence_gate = float(nav_semantic_confidence)
+            if nav_semantic_compare_count >= 12 and nav_semantic_mismatch_rate >= 0.40:
+                navigation_confidence_gate = float(
+                    max(0.0, min(1.0, navigation_confidence_gate * 0.75))
+                )
+        navigation_relocalization_bonus = float(
+            max(
+                0.0,
+                (1.0 - navigation_confidence_gate)
+                * max(action_frontier_novelty, state_action_frontier_novelty)
+                * max(translation_probability, action_moved_rate),
+            )
+        )
+
+        sequence_causal = candidate.metadata.get("sequence_causal_features_v1", {})
+        if not isinstance(sequence_causal, dict):
+            sequence_causal = {}
+        sequence_causal_enabled = bool(
+            self.sequence_causal_term_enabled and sequence_causal.get("enabled", False)
+        )
+        sequence_causal_active = bool(sequence_causal.get("active", False))
+        sequence_causal_stage = str(sequence_causal.get("stage", "idle"))
+        sequence_causal_bonus_hint = float(max(0.0, sequence_causal.get("bonus_hint", 0.0)))
+        sequence_causal_penalty_hint = float(max(0.0, sequence_causal.get("penalty_hint", 0.0)))
+        sequence_causal_bonus = 0.0
+        sequence_causal_penalty = 0.0
+        if sequence_causal_enabled and sequence_causal_active:
+            sequence_causal_bonus = float(
+                self.sequence_causal_bonus_weight * sequence_causal_bonus_hint
+            )
+            sequence_causal_penalty = float(
+                self.sequence_causal_penalty_weight * sequence_causal_penalty_hint
+            )
+            if bool(sequence_causal.get("verify_action_candidate", False)):
+                sequence_causal_bonus = float(
+                    sequence_causal_bonus + (0.30 * self.sequence_causal_bonus_weight)
+                )
+            elif (
+                int(candidate.action_id) in (1, 2, 3, 4)
+                and bool(sequence_causal.get("moves_away_from_target", False))
+            ):
+                sequence_causal_penalty = float(
+                    sequence_causal_penalty + (0.20 * self.sequence_causal_penalty_weight)
+                )
         key_target_enabled = bool(navigation_target.get("enabled", False))
         key_target_direction_bucket = str(
             navigation_target.get("target_direction_bucket", "dir_unknown")
@@ -822,6 +889,17 @@ class ActiveInferencePolicyEvaluatorV1:
             key_target_away_penalty = float(
                 max(0.0, key_target_expected_distance_delta) * key_target_salience
             )
+        geometry_term_gate = (
+            float(navigation_confidence_gate)
+            if self.navigation_confidence_gating_enabled
+            else 1.0
+        )
+        key_target_escape_bonus_effective = float(
+            key_target_escape_bonus * geometry_term_gate
+        )
+        key_target_away_penalty_effective = float(
+            key_target_away_penalty * geometry_term_gate
+        )
 
         # Level 1 (operability/control): risk captures blocked tendencies and
         # control uncertainty in movement outcomes.
@@ -851,17 +929,30 @@ class ActiveInferencePolicyEvaluatorV1:
             max(
                 0.0,
                 operability_risk
-                + (0.25 * key_target_away_penalty)
+                + (0.25 * key_target_away_penalty_effective)
                 + (0.10 * coverage_repeat_penalty)
                 - (
                     0.30
-                    * key_target_escape_bonus
+                    * key_target_escape_bonus_effective
                     * max(0.25, float(translation_probability))
                 ),
             )
         )
         operability_risk = float(
-            max(0.0, operability_risk - (0.12 * coverage_frontier_bonus))
+            max(
+                0.0,
+                operability_risk
+                + (0.18 * sequence_causal_penalty)
+                - (0.22 * sequence_causal_bonus),
+            )
+        )
+        operability_risk = float(
+            max(
+                0.0,
+                operability_risk
+                - (0.12 * coverage_frontier_bonus)
+                - (0.18 * navigation_relocalization_bonus),
+            )
         )
         level1 = {
             "risk": float(operability_risk),
@@ -881,6 +972,19 @@ class ActiveInferencePolicyEvaluatorV1:
             "key_target_direction_alignment": float(key_target_direction_alignment),
             "key_target_expected_distance_delta": float(key_target_expected_distance_delta),
             "key_target_expected_distance_after": float(key_target_expected_distance_after),
+            "navigation_confidence_gating_enabled": bool(
+                self.navigation_confidence_gating_enabled
+            ),
+            "navigation_confidence_gate": float(navigation_confidence_gate),
+            "navigation_semantic_confidence": float(nav_semantic_confidence),
+            "navigation_semantic_compare_count": int(nav_semantic_compare_count),
+            "navigation_semantic_mismatch_rate": float(nav_semantic_mismatch_rate),
+            "navigation_relocalization_bonus": float(navigation_relocalization_bonus),
+            "sequence_causal_enabled": bool(sequence_causal_enabled),
+            "sequence_causal_active": bool(sequence_causal_active),
+            "sequence_causal_stage": str(sequence_causal_stage),
+            "sequence_causal_bonus": float(sequence_causal_bonus),
+            "sequence_causal_penalty": float(sequence_causal_penalty),
         }
 
         # Level 2 (task/progress): penalize repetitive no-progress attractors.
@@ -956,11 +1060,13 @@ class ActiveInferencePolicyEvaluatorV1:
                     + (0.18 * (1.0 - frontier_novelty))
                     + (0.12 * region_revisit_hard_penalty)
                     + (0.20 * repeated_no_progress_penalty)
-                    + (0.18 * key_target_away_penalty)
+                    + (0.18 * key_target_away_penalty_effective)
                     + (0.20 * coverage_repeat_penalty)
+                    + (0.28 * sequence_causal_penalty)
                     - (0.25 * leave_high_revisit_potential)
-                    - (0.30 * key_target_escape_bonus)
+                    - (0.30 * key_target_escape_bonus_effective)
                     - (0.35 * coverage_frontier_bonus)
+                    - (0.45 * sequence_causal_bonus)
                 ),
             )
         )
@@ -981,10 +1087,12 @@ class ActiveInferencePolicyEvaluatorV1:
         habit_risk += float(
             max(0.0, 0.70 * repeated_no_progress_penalty)
         )
-        habit_risk += float(max(0.0, 0.25 * key_target_away_penalty))
+        habit_risk += float(max(0.0, 0.25 * key_target_away_penalty_effective))
         habit_risk += float(max(0.0, 0.30 * coverage_repeat_penalty))
-        habit_risk = float(max(0.0, habit_risk - (0.22 * key_target_escape_bonus)))
+        habit_risk += float(max(0.0, 0.24 * sequence_causal_penalty))
+        habit_risk = float(max(0.0, habit_risk - (0.22 * key_target_escape_bonus_effective)))
         habit_risk = float(max(0.0, habit_risk - (0.26 * coverage_frontier_bonus)))
+        habit_risk = float(max(0.0, habit_risk - (0.30 * sequence_causal_bonus)))
         progress_information_gain = float(
             max(
                 0.0,
@@ -994,8 +1102,10 @@ class ActiveInferencePolicyEvaluatorV1:
                     0.30
                     + (0.45 * frontier_novelty)
                     + (0.25 * evidence_novelty)
-                    + (0.20 * key_target_escape_bonus)
+                    + (0.20 * key_target_escape_bonus_effective)
                     + (0.28 * coverage_frontier_bonus)
+                    + (0.35 * sequence_causal_bonus)
+                    + (0.20 * navigation_relocalization_bonus)
                 ),
             )
         )
@@ -1043,6 +1153,9 @@ class ActiveInferencePolicyEvaluatorV1:
             "key_target_expected_distance_after": float(key_target_expected_distance_after),
             "key_target_escape_bonus": float(key_target_escape_bonus),
             "key_target_away_penalty": float(key_target_away_penalty),
+            "key_target_escape_bonus_effective": float(key_target_escape_bonus_effective),
+            "key_target_away_penalty_effective": float(key_target_away_penalty_effective),
+            "geometry_term_gate": float(geometry_term_gate),
             "coverage_enabled": bool(coverage_enabled),
             "coverage_confidence": float(coverage_confidence),
             "coverage_next_region_key": str(coverage_next_region_key),
@@ -1050,6 +1163,23 @@ class ActiveInferencePolicyEvaluatorV1:
             "coverage_region_novelty": float(coverage_region_novelty),
             "coverage_frontier_bonus": float(coverage_frontier_bonus),
             "coverage_repeat_penalty": float(coverage_repeat_penalty),
+            "navigation_confidence_gating_enabled": bool(
+                self.navigation_confidence_gating_enabled
+            ),
+            "navigation_confidence_gate": float(navigation_confidence_gate),
+            "navigation_semantic_confidence": float(nav_semantic_confidence),
+            "navigation_semantic_compare_count": int(nav_semantic_compare_count),
+            "navigation_semantic_mismatch_rate": float(nav_semantic_mismatch_rate),
+            "navigation_relocalization_bonus": float(navigation_relocalization_bonus),
+            "sequence_causal_enabled": bool(sequence_causal_enabled),
+            "sequence_causal_active": bool(sequence_causal_active),
+            "sequence_causal_stage": str(sequence_causal_stage),
+            "sequence_causal_bonus": float(sequence_causal_bonus),
+            "sequence_causal_penalty": float(sequence_causal_penalty),
+            "sequence_causal_features_v1": {
+                str(k): v
+                for (k, v) in sequence_causal.items()
+            },
         }
 
         return {
@@ -1086,15 +1216,33 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         evidence_novelty = self._clamp01(float(level2_terms.get("evidence_novelty", 0.0)))
         evidence_confidence = self._clamp01(float(level2_terms.get("evidence_confidence", 0.0)))
+        navigation_confidence_gate = self._clamp01(
+            float(level1_terms.get("navigation_confidence_gate", 1.0))
+        )
+        navigation_relocalization_bonus = self._clamp01(
+            float(level1_terms.get("navigation_relocalization_bonus", 0.0))
+        )
+        sequence_causal_bonus = self._clamp01(
+            float(level2_terms.get("sequence_causal_bonus", 0.0))
+        )
+        sequence_causal_penalty = self._clamp01(
+            float(level2_terms.get("sequence_causal_penalty", 0.0))
+        )
+        sequence_causal_active = bool(level2_terms.get("sequence_causal_active", False))
         stuck_score = self._clamp01(
             (0.30 * stagnation_context)
             + (0.30 * region_revisit_ratio)
             + (0.25 * translation_no_progress_amplified)
             + (0.15 * habit_pressure)
+            + (0.10 * sequence_causal_penalty)
+            + (0.10 * (1.0 - navigation_confidence_gate))
         )
 
         phase_focus = "balanced"
         explain_escape_pressure = 0.0
+        low_navigation_confidence = bool(
+            self.navigation_confidence_gating_enabled and navigation_confidence_gate < 0.60
+        )
         if phase == "explore":
             phase_focus = "epistemic_first"
             weights["risk"] = self._scaled_weight(
@@ -1117,6 +1265,19 @@ class ActiveInferencePolicyEvaluatorV1:
                 hierarchy_weights["progress_risk"],
                 1.0 + (0.25 * stuck_score),
             )
+            if low_navigation_confidence:
+                hierarchy_weights["progress_risk"] = self._scaled_weight(
+                    hierarchy_weights["progress_risk"],
+                    0.84,
+                )
+                hierarchy_weights["progress_information_gain"] = self._scaled_weight(
+                    hierarchy_weights["progress_information_gain"],
+                    1.0 + (0.45 * (1.0 - navigation_confidence_gate)),
+                )
+                weights["information_gain_mechanism_dynamics"] = self._scaled_weight(
+                    weights["information_gain_mechanism_dynamics"],
+                    1.0 + (0.35 * (1.0 - navigation_confidence_gate)),
+                )
         elif phase == "explain":
             phase_focus = "mechanism_disambiguation"
             explain_escape_pressure = self._clamp01(
@@ -1167,6 +1328,19 @@ class ActiveInferencePolicyEvaluatorV1:
                     - (0.30 * evidence_confidence),
                 ),
             )
+            if low_navigation_confidence:
+                hierarchy_weights["progress_risk"] = self._scaled_weight(
+                    hierarchy_weights["progress_risk"],
+                    0.82,
+                )
+                hierarchy_weights["progress_information_gain"] = self._scaled_weight(
+                    hierarchy_weights["progress_information_gain"],
+                    1.0 + (0.60 * (1.0 - navigation_confidence_gate)),
+                )
+                weights["information_gain_mechanism_dynamics"] = self._scaled_weight(
+                    weights["information_gain_mechanism_dynamics"],
+                    1.0 + (0.40 * (1.0 - navigation_confidence_gate)),
+                )
         else:
             phase_focus = "progress_with_escape"
             # When stuck, reduce rigid risk pressure to allow escape rollouts.
@@ -1201,6 +1375,32 @@ class ActiveInferencePolicyEvaluatorV1:
                 hierarchy_weights["progress_information_gain"],
                 1.0 + (0.80 * stuck_score * no_progress_signal),
             )
+            if low_navigation_confidence:
+                hierarchy_weights["progress_risk"] = self._scaled_weight(
+                    hierarchy_weights["progress_risk"],
+                    0.78,
+                )
+                hierarchy_weights["progress_information_gain"] = self._scaled_weight(
+                    hierarchy_weights["progress_information_gain"],
+                    1.0 + (0.75 * (1.0 - navigation_confidence_gate)),
+                )
+                weights["information_gain_mechanism_dynamics"] = self._scaled_weight(
+                    weights["information_gain_mechanism_dynamics"],
+                    1.0 + (0.55 * (1.0 - navigation_confidence_gate)),
+                )
+            if self.sequence_causal_term_enabled and sequence_causal_active:
+                hierarchy_weights["progress_risk"] = self._scaled_weight(
+                    hierarchy_weights["progress_risk"],
+                    max(0.72, 1.0 - (0.28 * sequence_causal_bonus)),
+                )
+                hierarchy_weights["progress_information_gain"] = self._scaled_weight(
+                    hierarchy_weights["progress_information_gain"],
+                    1.0 + (0.40 * sequence_causal_bonus),
+                )
+                hierarchy_weights["habit_risk"] = self._scaled_weight(
+                    hierarchy_weights["habit_risk"],
+                    max(0.78, 1.0 - (0.25 * sequence_causal_bonus)),
+                )
 
         diagnostics = {
             "phase_focus": str(phase_focus),
@@ -1217,6 +1417,12 @@ class ActiveInferencePolicyEvaluatorV1:
             "explain_escape_pressure": float(explain_escape_pressure),
             "evidence_confidence": float(evidence_confidence),
             "evidence_novelty": float(evidence_novelty),
+            "navigation_confidence_gate": float(navigation_confidence_gate),
+            "navigation_relocalization_bonus": float(navigation_relocalization_bonus),
+            "low_navigation_confidence": bool(low_navigation_confidence),
+            "sequence_causal_active": bool(sequence_causal_active),
+            "sequence_causal_bonus": float(sequence_causal_bonus),
+            "sequence_causal_penalty": float(sequence_causal_penalty),
             "evidence_count_effective": int(level2_terms.get("evidence_count_effective", 0)),
             "evidence_regime": str(level2_terms.get("evidence_regime", "unknown")),
             "effect_thresholds": {
@@ -1344,6 +1550,34 @@ class ActiveInferencePolicyEvaluatorV1:
             "edge_attempts": int(max(0, raw.get("edge_attempts", 0))),
             "edge_blocked_rate": self._clamp01(float(raw.get("edge_blocked_rate", 0.0))),
             "dominant_delta_key": str(raw.get("dominant_delta_key", "")),
+        }
+
+    def _candidate_sequence_causal_features(
+        self,
+        candidate: ActionCandidateV1,
+    ) -> dict[str, Any]:
+        raw = candidate.metadata.get("sequence_causal_features_v1", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "active": bool(raw.get("active", False)),
+            "stage": str(raw.get("stage", "idle")),
+            "trigger_region_key": str(raw.get("trigger_region_key", "2:4")),
+            "target_region_key": str(raw.get("target_region_key", "4:1")),
+            "current_region_key": str(raw.get("current_region_key", "NA")),
+            "predicted_region_key": str(raw.get("predicted_region_key", "NA")),
+            "steps_remaining": int(max(0, raw.get("steps_remaining", 0))),
+            "advances_to_target": bool(raw.get("advances_to_target", False)),
+            "moves_away_from_target": bool(raw.get("moves_away_from_target", False)),
+            "reaches_target": bool(raw.get("reaches_target", False)),
+            "verify_action_candidate": bool(raw.get("verify_action_candidate", False)),
+            "bonus_hint": float(max(0.0, raw.get("bonus_hint", 0.0))),
+            "penalty_hint": float(max(0.0, raw.get("penalty_hint", 0.0))),
+            "predicted_distance_to_target": int(
+                max(0, raw.get("predicted_distance_to_target", 10**6))
+            ),
+            "distance_delta_to_target": int(raw.get("distance_delta_to_target", 0)),
         }
 
     def _candidate_frontier_graph_cost(self, candidate: ActionCandidateV1) -> float:
@@ -2073,6 +2307,9 @@ class ActiveInferencePolicyEvaluatorV1:
         }
         direction_sequence_probe_applied = False
         direction_sequence_probe_candidates: list[dict[str, Any]] = []
+        sequence_causal_probe_applied = False
+        sequence_causal_probe_reason = "inactive"
+        sequence_causal_probe_candidates: list[dict[str, Any]] = []
 
         fixed_prepass_entry, fixed_two_pass_traversal_v1 = (
             self._select_fixed_two_pass_traversal_entry(
@@ -3074,6 +3311,123 @@ class ActiveInferencePolicyEvaluatorV1:
                             for entry in coverage_pool[:10]
                         ]
 
+        if (
+            self.sequence_causal_term_enabled
+            and not fixed_two_pass_traversal_applied
+            and not early_probe_applied
+        ):
+            sequence_rows: list[dict[str, Any]] = []
+            for entry in entries:
+                seq_features = self._candidate_sequence_causal_features(entry.candidate)
+                if not (
+                    bool(seq_features.get("enabled", False))
+                    and bool(seq_features.get("active", False))
+                ):
+                    continue
+                sequence_rows.append(
+                    {
+                        "entry": entry,
+                        "features": seq_features,
+                        "score": float(
+                            selection_score_by_candidate.get(
+                                entry.candidate.candidate_id,
+                                entry.total_efe,
+                            )
+                        ),
+                    }
+                )
+            if sequence_rows:
+                sequence_causal_probe_reason = "active_no_override"
+                stage = str(sequence_rows[0]["features"].get("stage", "idle"))
+                best_sequence_score = min(float(row["score"]) for row in sequence_rows)
+                if stage == "verify":
+                    verify_pool = [
+                        row
+                        for row in sequence_rows
+                        if bool(row["features"].get("verify_action_candidate", False))
+                    ]
+                    if verify_pool:
+                        verify_pool.sort(
+                            key=lambda row: (
+                                -float(row["features"].get("bonus_hint", 0.0)),
+                                float(row["score"]),
+                                int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                                int(row["entry"].candidate.action_id),
+                                str(row["entry"].candidate.candidate_id),
+                            )
+                        )
+                        best_verify = verify_pool[0]
+                        verify_margin = float(max(self.sequence_probe_score_margin, 0.55))
+                        if float(best_verify["score"]) <= (best_sequence_score + verify_margin):
+                            selected_entry = best_verify["entry"]
+                            sequence_causal_probe_applied = True
+                            sequence_causal_probe_reason = "verify_action_priority"
+                if not sequence_causal_probe_applied:
+                    seek_pool = [
+                        row
+                        for row in sequence_rows
+                        if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                        and (
+                            bool(row["features"].get("advances_to_target", False))
+                            or bool(row["features"].get("reaches_target", False))
+                        )
+                    ]
+                    if seek_pool:
+                        seek_pool.sort(
+                            key=lambda row: (
+                                0 if bool(row["features"].get("reaches_target", False)) else 1,
+                                int(row["features"].get("predicted_distance_to_target", 10**6)),
+                                -float(row["features"].get("bonus_hint", 0.0)),
+                                float(row["score"]),
+                                int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                                int(row["entry"].candidate.action_id),
+                                str(row["entry"].candidate.candidate_id),
+                            )
+                        )
+                        best_seek = seek_pool[0]
+                        seek_margin = float(max(self.sequence_probe_score_margin, 0.45))
+                        if bool(best_seek["features"].get("reaches_target", False)) or float(
+                            best_seek["score"]
+                        ) <= (best_sequence_score + seek_margin):
+                            selected_entry = best_seek["entry"]
+                            sequence_causal_probe_applied = True
+                            sequence_causal_probe_reason = "seek_target_priority"
+                if sequence_causal_probe_applied:
+                    least_tried_probe_applied = True
+                    if selected_entry is not entries[0]:
+                        entries.remove(selected_entry)
+                        entries.insert(0, selected_entry)
+                sequence_causal_probe_candidates = [
+                    {
+                        "candidate_id": str(row["entry"].candidate.candidate_id),
+                        "action_id": int(row["entry"].candidate.action_id),
+                        "score": float(row["score"]),
+                        "stage": str(row["features"].get("stage", "idle")),
+                        "current_region_key": str(
+                            row["features"].get("current_region_key", "NA")
+                        ),
+                        "predicted_region_key": str(
+                            row["features"].get("predicted_region_key", "NA")
+                        ),
+                        "predicted_distance_to_target": int(
+                            row["features"].get("predicted_distance_to_target", 10**6)
+                        ),
+                        "advances_to_target": bool(
+                            row["features"].get("advances_to_target", False)
+                        ),
+                        "reaches_target": bool(
+                            row["features"].get("reaches_target", False)
+                        ),
+                        "verify_action_candidate": bool(
+                            row["features"].get("verify_action_candidate", False)
+                        ),
+                        "bonus_hint": float(row["features"].get("bonus_hint", 0.0)),
+                        "penalty_hint": float(row["features"].get("penalty_hint", 0.0)),
+                        "steps_remaining": int(row["features"].get("steps_remaining", 0)),
+                    }
+                    for row in sequence_rows[:12]
+                ]
+
         if tie_group_size > 1 and not early_probe_applied and not least_tried_probe_applied:
             tie_probe_candidates = entries[:tie_group_size]
             # In exploration/explanation phases, break score ties by probing least-tried actions.
@@ -3657,6 +4011,11 @@ class ActiveInferencePolicyEvaluatorV1:
             )
         elif early_probe_applied:
             tie_breaker_rule_applied = "early_probe_budget_least_tried"
+        elif sequence_causal_probe_applied:
+            tie_breaker_rule_applied = (
+                f"sequence_causal_probe_{str(sequence_causal_probe_reason)}"
+                "(stage,bonus_hint,predicted_distance,score,action_usage)"
+            )
         elif coverage_region_probe_applied:
             tie_breaker_rule_applied = (
                 "coverage_region_probe_least_visited(predicted_next_region,edge_attempts,confidence,action_usage,score)"
@@ -3726,6 +4085,9 @@ class ActiveInferencePolicyEvaluatorV1:
             ),
             "sequence_probe_score_margin": float(self.sequence_probe_score_margin),
             "sequence_probe_trigger_steps": int(self.sequence_probe_trigger_steps),
+            "sequence_causal_term_enabled": bool(self.sequence_causal_term_enabled),
+            "sequence_causal_probe_applied": bool(sequence_causal_probe_applied),
+            "sequence_causal_probe_reason": str(sequence_causal_probe_reason),
             "previous_navigation_direction": str(previous_navigation_direction),
             "direction_sequence_probe_applied": bool(direction_sequence_probe_applied),
             "sequence_rollout_frontier_weight": float(
@@ -3796,6 +4158,7 @@ class ActiveInferencePolicyEvaluatorV1:
             "navigation_stagnation_probe_applied": bool(
                 navigation_stagnation_probe_applied
             ),
+            "sequence_causal_probe_candidates": list(sequence_causal_probe_candidates),
             "selected_action_usage_count_before": int(selected_action_usage_count),
             "selected_cluster_id": selected_cluster_id,
             "selected_cluster_usage_count_before": int(selected_cluster_usage_count),

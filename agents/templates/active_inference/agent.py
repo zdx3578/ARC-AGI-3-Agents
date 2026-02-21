@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import uuid
 from typing import Any
@@ -224,6 +225,33 @@ class ActiveInferenceEFE(Agent):
             "ACTIVE_INFERENCE_COVERAGE_SWEEP_FORCE_IN_EXPLOIT",
             True,
         )
+        self.enable_navigation_confidence_gating = _env_bool(
+            "ACTIVE_INFERENCE_NAV_CONFIDENCE_GATING_ENABLED",
+            True,
+        )
+        self.enable_sequence_causal_term = _env_bool(
+            "ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TERM_ENABLED",
+            True,
+        )
+        self.sequence_causal_window_steps = max(
+            4,
+            _env_int("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_WINDOW_STEPS", 24),
+        )
+        self.sequence_causal_verify_window_steps = max(
+            2,
+            _env_int(
+                "ACTIVE_INFERENCE_SEQUENCE_CAUSAL_VERIFY_WINDOW_STEPS",
+                max(4, int(self.sequence_causal_window_steps // 3)),
+            ),
+        )
+        self.sequence_causal_trigger_region_key = str(
+            os.getenv("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TRIGGER_REGION", "2:4").strip()
+            or "2:4"
+        )
+        self.sequence_causal_target_region_key = str(
+            os.getenv("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TARGET_REGION", "4:1").strip()
+            or "4:1"
+        )
         self.enable_empirical_region_override = _env_bool(
             "ACTIVE_INFERENCE_ENABLE_EMPIRICAL_REGION_OVERRIDE",
             True,
@@ -332,6 +360,8 @@ class ActiveInferenceEFE(Agent):
             coverage_sweep_direction_retry_limit=self.coverage_sweep_direction_retry_limit,
             coverage_matrix_sweep_enabled=self.coverage_matrix_sweep_enabled,
             coverage_sweep_force_in_exploit=self.coverage_sweep_force_in_exploit,
+            navigation_confidence_gating_enabled=self.enable_navigation_confidence_gating,
+            sequence_causal_term_enabled=self.enable_sequence_causal_term,
         )
         self.hypothesis_bank = ActiveInferenceHypothesisBankV1()
 
@@ -359,6 +389,9 @@ class ActiveInferenceEFE(Agent):
         self._navigation_attempt_count = 0
         self._navigation_blocked_count = 0
         self._navigation_moved_count = 0
+        self._navigation_match_count = 0
+        self._navigation_semantic_compare_count = 0
+        self._navigation_semantic_mismatch_count = 0
         self._navigation_action_stats: dict[str, dict[str, int]] = {}
         self._blocked_edge_counts: dict[str, int] = {}
         self._edge_attempt_counts: dict[str, int] = {}
@@ -371,6 +404,25 @@ class ActiveInferenceEFE(Agent):
         self._transition_edge_visit_count: dict[str, int] = {}
         self._state_outgoing_edges: dict[str, set[str]] = {}
         self._latest_transition_record: dict[str, Any] = {}
+        self._sequence_causal_state_v1: dict[str, Any] = {
+            "enabled": bool(self.enable_sequence_causal_term),
+            "trigger_region_key": str(self.sequence_causal_trigger_region_key),
+            "target_region_key": str(self.sequence_causal_target_region_key),
+            "window_steps": int(self.sequence_causal_window_steps),
+            "verify_window_steps": int(self.sequence_causal_verify_window_steps),
+            "active": False,
+            "stage": "idle",
+            "steps_remaining": 0,
+            "trigger_count": 0,
+            "target_reach_count": 0,
+            "success_count": 0,
+            "timeout_count": 0,
+            "trigger_action_counter": -1,
+            "deadline_action_counter": -1,
+            "verify_deadline_action_counter": -1,
+            "last_reached_action_counter": -1,
+            "last_status": "idle",
+        }
 
         self.trace_enabled = _env_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
         self.trace_recorder: ActiveInferenceTraceRecorderV1 | None = None
@@ -568,6 +620,308 @@ class ActiveInferenceEFE(Agent):
         if bucket in ("dir_l", "dir_r", "dir_u", "dir_d"):
             return str(bucket)
         return "na"
+
+    @staticmethod
+    def _parse_region_key_v1(region_key: str) -> tuple[int, int] | None:
+        try:
+            sx, sy = str(region_key).split(":", 1)
+            rx = int(sx)
+            ry = int(sy)
+        except Exception:
+            return None
+        if rx < 0 or ry < 0:
+            return None
+        return (int(rx), int(ry))
+
+    @classmethod
+    def _region_distance_v1(
+        cls,
+        source_region_key: str,
+        target_region_key: str,
+    ) -> int:
+        source = cls._parse_region_key_v1(source_region_key)
+        target = cls._parse_region_key_v1(target_region_key)
+        if source is None or target is None:
+            return 10**6
+        sx, sy = source
+        tx, ty = target
+        return int(abs(int(sx) - int(tx)) + abs(int(sy) - int(ty)))
+
+    def _current_region_key_v1(self) -> str:
+        latest = (
+            self._latest_navigation_state_estimate
+            if isinstance(self._latest_navigation_state_estimate, dict)
+            else {}
+        )
+        region = latest.get("agent_pos_region", {})
+        if bool(latest.get("matched", False)) and isinstance(region, dict):
+            rx = int(region.get("x", -1))
+            ry = int(region.get("y", -1))
+            if rx >= 0 and ry >= 0:
+                return f"{rx}:{ry}"
+        if self._last_known_agent_pos_region is not None:
+            rx, ry = self._last_known_agent_pos_region
+            return f"{int(rx)}:{int(ry)}"
+        return "NA"
+
+    def _navigation_semantic_features_v1(self) -> dict[str, Any]:
+        compare_count = int(max(0, self._navigation_semantic_compare_count))
+        mismatch_count = int(max(0, self._navigation_semantic_mismatch_count))
+        nav_attempts = int(max(0, self._navigation_attempt_count))
+        nav_match_count = int(max(0, self._navigation_match_count))
+        mismatch_rate = float(mismatch_count / float(max(1, compare_count)))
+        consistency = float(max(0.0, min(1.0, 1.0 - mismatch_rate)))
+        match_rate = float(nav_match_count / float(max(1, nav_attempts)))
+        sample_confidence = float(1.0 - math.exp(-float(compare_count) / 24.0))
+        confidence_prior = 0.75
+        confidence_raw = float((0.55 * consistency) + (0.45 * match_rate))
+        confidence = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (sample_confidence * confidence_raw)
+                    + ((1.0 - sample_confidence) * confidence_prior),
+                ),
+            )
+        )
+        return {
+            "schema_name": "active_inference_navigation_semantic_features_v1",
+            "schema_version": 1,
+            "enabled": bool(self.enable_navigation_confidence_gating),
+            "compare_count": int(compare_count),
+            "mismatch_count": int(mismatch_count),
+            "mismatch_rate": float(mismatch_rate),
+            "consistency": float(consistency),
+            "match_rate": float(match_rate),
+            "sample_confidence": float(sample_confidence),
+            "confidence": float(confidence),
+            "low_confidence": bool(confidence < 0.55),
+            "high_mismatch": bool(compare_count >= 12 and mismatch_rate >= 0.40),
+        }
+
+    def _sequence_causal_state_snapshot_v1(self) -> dict[str, Any]:
+        state = (
+            self._sequence_causal_state_v1
+            if isinstance(self._sequence_causal_state_v1, dict)
+            else {}
+        )
+        return {
+            "schema_name": "active_inference_sequence_causal_state_v1",
+            "schema_version": 1,
+            "enabled": bool(state.get("enabled", False)),
+            "trigger_region_key": str(state.get("trigger_region_key", "2:4")),
+            "target_region_key": str(state.get("target_region_key", "4:1")),
+            "window_steps": int(state.get("window_steps", 0)),
+            "verify_window_steps": int(state.get("verify_window_steps", 0)),
+            "active": bool(state.get("active", False)),
+            "stage": str(state.get("stage", "idle")),
+            "steps_remaining": int(max(0, state.get("steps_remaining", 0))),
+            "trigger_count": int(max(0, state.get("trigger_count", 0))),
+            "target_reach_count": int(max(0, state.get("target_reach_count", 0))),
+            "success_count": int(max(0, state.get("success_count", 0))),
+            "timeout_count": int(max(0, state.get("timeout_count", 0))),
+            "trigger_action_counter": int(state.get("trigger_action_counter", -1)),
+            "deadline_action_counter": int(state.get("deadline_action_counter", -1)),
+            "verify_deadline_action_counter": int(
+                state.get("verify_deadline_action_counter", -1)
+            ),
+            "last_reached_action_counter": int(state.get("last_reached_action_counter", -1)),
+            "last_status": str(state.get("last_status", "idle")),
+        }
+
+    def _sequence_causal_candidate_features_v1(
+        self,
+        *,
+        candidate: ActionCandidateV1,
+        predicted_region_features: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        state = self._sequence_causal_state_snapshot_v1()
+        trigger_region_key = str(state.get("trigger_region_key", "2:4"))
+        target_region_key = str(state.get("target_region_key", "4:1"))
+        current_region_key = self._current_region_key_v1()
+        steps_remaining = int(max(0, state.get("steps_remaining", 0)))
+        action_id = int(candidate.action_id)
+        predicted_key = current_region_key
+        if isinstance(predicted_region_features, dict):
+            candidate_key = str(predicted_region_features.get("predicted_region_key", "NA"))
+            if self._parse_region_key_v1(candidate_key) is not None:
+                predicted_key = str(candidate_key)
+        current_distance = int(
+            self._region_distance_v1(current_region_key, target_region_key)
+        )
+        predicted_distance = int(
+            self._region_distance_v1(predicted_key, target_region_key)
+        )
+        distance_delta = int(predicted_distance - current_distance)
+        reaches_target = bool(
+            self._parse_region_key_v1(predicted_key) is not None
+            and str(predicted_key) == str(target_region_key)
+        )
+        advances_to_target = bool(
+            predicted_distance < current_distance
+        )
+        moves_away_from_target = bool(
+            predicted_distance > current_distance
+        )
+        verify_action_candidate = bool(
+            str(state.get("stage", "idle")) == "verify"
+            and action_id in (6, 7)
+        )
+        bonus_hint = 0.0
+        penalty_hint = 0.0
+        stage = str(state.get("stage", "idle"))
+        if bool(state.get("active", False)):
+            if stage == "seek_target":
+                if reaches_target:
+                    bonus_hint += 1.0
+                elif advances_to_target:
+                    bonus_hint += 0.45
+                if moves_away_from_target and action_id in (1, 2, 3, 4):
+                    penalty_hint += 0.35
+            elif stage == "verify":
+                if verify_action_candidate:
+                    bonus_hint += 0.9
+                elif action_id in (1, 2, 3, 4) and moves_away_from_target:
+                    penalty_hint += 0.60
+            urgency = float(
+                min(
+                    1.0,
+                    max(
+                        0.0,
+                        1.0
+                        - (
+                            float(steps_remaining)
+                            / float(max(1, int(state.get("window_steps", 1))))
+                        ),
+                    ),
+                )
+            )
+            bonus_hint = float((0.70 + (0.30 * urgency)) * bonus_hint)
+        return {
+            "schema_name": "active_inference_sequence_causal_features_v1",
+            "schema_version": 1,
+            "enabled": bool(state.get("enabled", False)),
+            "active": bool(state.get("active", False)),
+            "stage": str(stage),
+            "trigger_region_key": str(trigger_region_key),
+            "target_region_key": str(target_region_key),
+            "current_region_key": str(current_region_key),
+            "predicted_region_key": str(predicted_key),
+            "steps_remaining": int(steps_remaining),
+            "current_distance_to_target": int(current_distance),
+            "predicted_distance_to_target": int(predicted_distance),
+            "distance_delta_to_target": int(distance_delta),
+            "advances_to_target": bool(advances_to_target),
+            "moves_away_from_target": bool(moves_away_from_target),
+            "reaches_target": bool(reaches_target),
+            "verify_action_candidate": bool(verify_action_candidate),
+            "bonus_hint": float(max(0.0, bonus_hint)),
+            "penalty_hint": float(max(0.0, penalty_hint)),
+        }
+
+    def _update_sequence_causal_state_v1(
+        self,
+        *,
+        current_packet: ObservationPacketV1,
+        transition_record: TransitionRecordV1 | None,
+        causal_signature: Any,
+        navigation_state_estimate: dict[str, Any],
+        executed_candidate: ActionCandidateV1 | None,
+    ) -> None:
+        state = self._sequence_causal_state_v1
+        if not isinstance(state, dict):
+            return
+        if not bool(state.get("enabled", False)):
+            state["active"] = False
+            state["stage"] = "idle"
+            state["steps_remaining"] = 0
+            state["last_status"] = "disabled"
+            return
+        current_counter = int(getattr(current_packet, "action_counter", 0))
+        if bool(state.get("active", False)):
+            deadline_counter = int(state.get("deadline_action_counter", -1))
+            if deadline_counter >= 0 and current_counter > deadline_counter:
+                state["active"] = False
+                state["stage"] = "idle"
+                state["steps_remaining"] = 0
+                state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
+                state["last_status"] = "seek_timeout"
+        trigger_region_key = str(state.get("trigger_region_key", "2:4"))
+        target_region_key = str(state.get("target_region_key", "4:1"))
+        source_region_key = "NA"
+        if transition_record is not None:
+            action_context = transition_record.action_context
+            if isinstance(action_context, dict):
+                source_region_key = str(action_context.get("action_region_before", "NA"))
+        nav_region = navigation_state_estimate.get("agent_pos_region", {})
+        nav_region_key = "NA"
+        if isinstance(nav_region, dict):
+            nav_rx = int(nav_region.get("x", -1))
+            nav_ry = int(nav_region.get("y", -1))
+            if nav_rx >= 0 and nav_ry >= 0:
+                nav_region_key = f"{nav_rx}:{nav_ry}"
+
+        obs_change_type = str(getattr(causal_signature, "obs_change_type", ""))
+        trigger_match = bool(
+            obs_change_type == "CC_COUNT_CHANGE"
+            and (
+                str(source_region_key) == str(trigger_region_key)
+                or str(nav_region_key) == str(trigger_region_key)
+            )
+        )
+        if trigger_match:
+            state["active"] = True
+            state["stage"] = "seek_target"
+            state["trigger_count"] = int(state.get("trigger_count", 0) + 1)
+            state["trigger_action_counter"] = int(current_counter)
+            state["deadline_action_counter"] = int(
+                current_counter + int(state.get("window_steps", 24))
+            )
+            state["verify_deadline_action_counter"] = -1
+            state["steps_remaining"] = int(state.get("window_steps", 24))
+            state["last_status"] = "triggered"
+
+        if not bool(state.get("active", False)):
+            return
+
+        remaining = int(state.get("deadline_action_counter", current_counter) - current_counter)
+        state["steps_remaining"] = int(max(0, remaining))
+        stage = str(state.get("stage", "idle"))
+        in_target_region = bool(
+            str(nav_region_key) == str(target_region_key)
+            or str(source_region_key) == str(target_region_key)
+        )
+        if stage == "seek_target" and in_target_region:
+            state["stage"] = "verify"
+            state["target_reach_count"] = int(state.get("target_reach_count", 0) + 1)
+            state["last_reached_action_counter"] = int(current_counter)
+            state["verify_deadline_action_counter"] = int(
+                current_counter + int(state.get("verify_window_steps", 6))
+            )
+            state["last_status"] = "target_reached"
+            stage = "verify"
+
+        executed_action_id = int(executed_candidate.action_id) if executed_candidate else -1
+        if stage == "verify":
+            verify_deadline = int(state.get("verify_deadline_action_counter", -1))
+            verified = bool(
+                in_target_region
+                and executed_action_id in (6, 7)
+                and str(obs_change_type) != "NO_CHANGE"
+            )
+            if verified:
+                state["active"] = False
+                state["stage"] = "idle"
+                state["steps_remaining"] = 0
+                state["success_count"] = int(state.get("success_count", 0) + 1)
+                state["last_status"] = "verified_success"
+            elif verify_deadline >= 0 and current_counter > verify_deadline:
+                state["active"] = False
+                state["stage"] = "idle"
+                state["steps_remaining"] = 0
+                state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
+                state["last_status"] = "verify_timeout"
 
     @staticmethod
     def _parse_delta_key_v1(delta_key: str) -> tuple[int, int]:
@@ -1729,14 +2083,24 @@ class ActiveInferenceEFE(Agent):
             nav_dx = int(nav_delta.get("dx", 0))
             nav_dy = int(nav_delta.get("dy", 0))
             nav_has_motion = bool(nav_matched and (abs(nav_dx) + abs(nav_dy) > 0))
+            if nav_matched:
+                self._navigation_match_count += 1
+            navigation_direction_bucket = self._navigation_direction_bucket_from_estimate_v1(
+                navigation_state_estimate
+            )
+            if (
+                nav_has_motion
+                and navigation_direction_bucket in ("dir_l", "dir_r", "dir_u", "dir_d")
+                and translation_delta_bucket in ("dir_l", "dir_r", "dir_u", "dir_d")
+            ):
+                self._navigation_semantic_compare_count += 1
+                if str(navigation_direction_bucket) != str(translation_delta_bucket):
+                    self._navigation_semantic_mismatch_count += 1
             moved = bool(nav_has_motion)
             if moved:
                 self._navigation_moved_count += 1
                 action_stats["moved"] = int(action_stats.get("moved", 0) + 1)
                 movement_direction_bucket = str(translation_delta_bucket)
-                navigation_direction_bucket = self._navigation_direction_bucket_from_estimate_v1(
-                    navigation_state_estimate
-                )
                 if navigation_direction_bucket in ("dir_l", "dir_r", "dir_u", "dir_d"):
                     movement_direction_bucket = str(navigation_direction_bucket)
                 if movement_direction_bucket in ("dir_l", "dir_r", "dir_u", "dir_d"):
@@ -1899,6 +2263,8 @@ class ActiveInferenceEFE(Agent):
             },
             "click_bucket_effectiveness": click_summary,
             "click_subcluster_effectiveness": click_subcluster_summary,
+            "navigation_semantic_features_v1": self._navigation_semantic_features_v1(),
+            "sequence_causal_state_v1": self._sequence_causal_state_snapshot_v1(),
         }
 
     def _navigation_sequence_diagnostics_v1(self) -> dict[str, Any]:
@@ -2305,6 +2671,13 @@ class ActiveInferenceEFE(Agent):
                     causal_signature=causal_signature,
                     navigation_state_estimate=navigation_state_estimate,
                 )
+                self._update_sequence_causal_state_v1(
+                    current_packet=packet,
+                    transition_record=transition_record,
+                    causal_signature=causal_signature,
+                    navigation_state_estimate=navigation_state_estimate,
+                    executed_candidate=self._previous_action_candidate,
+                )
                 self._latest_navigation_state_estimate = dict(navigation_state_estimate)
                 progress_proxy_event = self._is_progress_proxy_event(causal_signature)
                 if str(causal_signature.obs_change_type) == "NO_CHANGE":
@@ -2578,6 +2951,8 @@ class ActiveInferenceEFE(Agent):
                         navigation_target_features = self._navigation_target_features_v1(
                             representation
                         )
+                        navigation_semantic_features = self._navigation_semantic_features_v1()
+                        sequence_causal_state = self._sequence_causal_state_snapshot_v1()
                         region_graph_snapshot = self._region_graph_snapshot_v1()
                         for candidate in candidates:
                             action_key = str(int(candidate.action_id))
@@ -2597,15 +2972,23 @@ class ActiveInferenceEFE(Agent):
                                     candidate=candidate,
                                 )
                             )
+                            candidate.metadata["navigation_semantic_features_v1"] = dict(
+                                navigation_semantic_features
+                            )
+                            candidate.metadata["sequence_causal_state_v1"] = dict(
+                                sequence_causal_state
+                            )
+                            predicted_region_features: dict[str, Any] | None = None
                             if int(candidate.action_id) in (1, 2, 3, 4):
                                 candidate.metadata["blocked_edge_observed_stats"] = (
                                     self._navigation_candidate_stats(int(candidate.action_id))
                                 )
-                                candidate.metadata["predicted_region_features_v1"] = (
-                                    self._predicted_region_features_v1(
-                                        action_id=int(candidate.action_id),
-                                        action_posterior=action_posterior,
-                                    )
+                                predicted_region_features = self._predicted_region_features_v1(
+                                    action_id=int(candidate.action_id),
+                                    action_posterior=action_posterior,
+                                )
+                                candidate.metadata["predicted_region_features_v1"] = dict(
+                                    predicted_region_features
                                 )
                                 target_payload = dict(navigation_target_features)
                                 target_payload["candidate_action_id"] = int(candidate.action_id)
@@ -2624,6 +3007,12 @@ class ActiveInferenceEFE(Agent):
                                 candidate.metadata["click_subcluster_observed_stats"] = dict(
                                     self._click_subcluster_stats.get(click_subcluster, {})
                                 )
+                            candidate.metadata["sequence_causal_features_v1"] = (
+                                self._sequence_causal_candidate_features_v1(
+                                    candidate=candidate,
+                                    predicted_region_features=predicted_region_features,
+                                )
+                            )
 
                         diagnostics.finish_ok(
                             "candidate_generation",
