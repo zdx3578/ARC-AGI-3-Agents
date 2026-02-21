@@ -210,11 +210,12 @@ class ActiveInferenceEFE(Agent):
             1,
             _env_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_MIN_REGION_VISITS", 2),
         )
+        default_coverage_prepass_steps = min(72, int(self.MAX_ACTIONS))
         self.coverage_prepass_steps = max(
             0,
             _env_int(
                 "ACTIVE_INFERENCE_COVERAGE_PREPASS_STEPS",
-                min(220, int(self.MAX_ACTIONS)),
+                int(default_coverage_prepass_steps),
             ),
         )
         self.coverage_prepass_relaxed_completion_ratio = max(
@@ -332,6 +333,27 @@ class ActiveInferenceEFE(Agent):
                 1.0,
                 _env_float("ACTIVE_INFERENCE_HIGH_INFO_COUPLED_SCORE_FLOOR", 0.76),
             ),
+        )
+        self.high_info_recoverable_skip_enabled = _env_bool(
+            "ACTIVE_INFERENCE_HIGH_INFO_RECOVERABLE_SKIP_ENABLED",
+            True,
+        )
+        self.high_info_recover_edge_declared_blocked_moved_rate_threshold = max(
+            0.0,
+            min(
+                1.0,
+                _env_float(
+                    "ACTIVE_INFERENCE_HIGH_INFO_RECOVER_EDGE_DECLARED_MOVED_RATE_THRESHOLD",
+                    0.60,
+                ),
+            ),
+        )
+        self.high_info_force_coupled_pair_enabled = _env_bool(
+            "ACTIVE_INFERENCE_HIGH_INFO_FORCE_COUPLED_PAIR_ENABLED",
+            False,
+        )
+        self.high_info_forced_coupled_region_pair = self._parse_region_pair_env_v1(
+            os.getenv("ACTIVE_INFERENCE_HIGH_INFO_FORCE_COUPLED_PAIR", "")
         )
         self.orientation_alignment_min_similarity = max(
             0.35,
@@ -459,6 +481,8 @@ class ActiveInferenceEFE(Agent):
             high_info_release_min_queue_length=self.high_info_release_min_queue_length,
             navigation_confidence_gating_enabled=self.enable_navigation_confidence_gating,
             sequence_causal_term_enabled=self.enable_sequence_causal_term,
+            high_info_recoverable_skip_enabled=self.high_info_recoverable_skip_enabled,
+            high_info_recover_edge_declared_blocked_moved_rate_threshold=self.high_info_recover_edge_declared_blocked_moved_rate_threshold,
         )
         self.hypothesis_bank = ActiveInferenceHypothesisBankV1()
 
@@ -1615,6 +1639,29 @@ class ActiveInferenceEFE(Agent):
         return (int(rx), int(ry))
 
     @classmethod
+    def _parse_region_pair_env_v1(cls, raw_value: str | None) -> tuple[str, str] | None:
+        text = str(raw_value or "").strip()
+        if not text:
+            return None
+        normalized = (
+            text.replace("->", ",")
+            .replace("=>", ",")
+            .replace(";", ",")
+            .replace("|", ",")
+            .replace("/", ",")
+        )
+        parts = [str(part).strip() for part in normalized.split(",") if str(part).strip()]
+        if len(parts) < 2:
+            return None
+        left = str(parts[0])
+        right = str(parts[1])
+        if cls._parse_region_key_v1(left) is None or cls._parse_region_key_v1(right) is None:
+            return None
+        if left == right:
+            return None
+        return (str(left), str(right))
+
+    @classmethod
     def _region_key_from_region_payload_v1(
         cls,
         payload: dict[str, Any] | None,
@@ -1688,6 +1735,68 @@ class ActiveInferenceEFE(Agent):
         orientation_misaligned = bool(
             orientation_enabled and orientation_detected and (not orientation_aligned)
         )
+        fallback_key = str(fallback_source_region_key)
+        if self._parse_region_key_v1(fallback_key) is None:
+            fallback_key = "NA"
+        forced_pair = (
+            self.high_info_forced_coupled_region_pair
+            if bool(self.high_info_force_coupled_pair_enabled)
+            else None
+        )
+        if isinstance(forced_pair, tuple):
+            primary_region_key = str(forced_pair[0])
+            secondary_region_key = str(forced_pair[1])
+            coupled_region_keys: list[str] = []
+            if self._parse_region_key_v1(primary_region_key) is not None:
+                coupled_region_keys.append(str(primary_region_key))
+            if (
+                self._parse_region_key_v1(secondary_region_key) is not None
+                and str(secondary_region_key) not in coupled_region_keys
+            ):
+                coupled_region_keys.append(str(secondary_region_key))
+            if (
+                fallback_key != "NA"
+                and self._parse_region_key_v1(fallback_key) is not None
+                and fallback_key not in coupled_region_keys
+                and len(coupled_region_keys) < 2
+            ):
+                coupled_region_keys.append(str(fallback_key))
+            if len(coupled_region_keys) >= 2:
+                return {
+                    "selection_method": "forced_pair_override_v1",
+                    "primary_region_key": str(primary_region_key),
+                    "secondary_region_key": str(secondary_region_key),
+                    "primary_region_score": 1.0,
+                    "secondary_region_score": 0.98,
+                    "pair_affinity_score": 1.0,
+                    "primary_nav_hint": float(
+                        max(0.0, min(1.0, nav_region_hints.get(str(primary_region_key), 0.0)))
+                    ),
+                    "secondary_nav_hint": float(
+                        max(
+                            0.0,
+                            min(1.0, nav_region_hints.get(str(secondary_region_key), 0.0)),
+                        )
+                    ),
+                    "primary_nav_kind_bonus": float(
+                        max(
+                            0.0,
+                            min(1.0, nav_region_kind_bonus.get(str(primary_region_key), 0.0)),
+                        )
+                    ),
+                    "secondary_nav_kind_bonus": float(
+                        max(
+                            0.0,
+                            min(1.0, nav_region_kind_bonus.get(str(secondary_region_key), 0.0)),
+                        )
+                    ),
+                    "coupled_region_keys": list(coupled_region_keys),
+                    "fallback_source_region_key": str(fallback_key),
+                    "cross_region_key": str(primary_region_key),
+                    "gate_region_key": str(secondary_region_key),
+                    "orientation_aligned": bool(orientation_aligned),
+                    "orientation_misaligned": bool(orientation_misaligned),
+                }
 
         scoreboard = self._high_info_region_scoreboard_v1(max_regions=64)
         rows_raw = scoreboard.get("rows", [])
@@ -1736,9 +1845,6 @@ class ActiveInferenceEFE(Agent):
                     transition_source_totals.get(str(source_region_key), 0) + int(total)
                 )
 
-        fallback_key = str(fallback_source_region_key)
-        if self._parse_region_key_v1(fallback_key) is None:
-            fallback_key = "NA"
         candidate_region_keys: set[str] = set(row_by_region.keys())
         candidate_region_keys.update(str(k) for k in nav_region_hints.keys())
         if fallback_key != "NA":

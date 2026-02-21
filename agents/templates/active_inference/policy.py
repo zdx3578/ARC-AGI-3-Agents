@@ -72,6 +72,11 @@ class ActiveInferencePolicyEvaluatorV1:
         coverage_repetition_no_progress_attempt_threshold: int = 18,
         coverage_repetition_no_progress_high_info_attempt_threshold: int = 26,
         coverage_repetition_no_progress_moved_rate_threshold: float = 0.45,
+        coverage_bidirectional_loop_min_edge_count: int = 3,
+        coverage_bidirectional_loop_min_total_count: int = 8,
+        coverage_bidirectional_loop_moved_rate_threshold: float = 0.55,
+        high_info_recoverable_skip_enabled: bool = True,
+        high_info_recover_edge_declared_blocked_moved_rate_threshold: float = 0.60,
         high_info_focus_release_after_first_pass: bool = True,
         high_info_focus_release_action_counter: int = -1,
         high_info_release_min_target_score: float = 0.62,
@@ -184,6 +189,22 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         self.coverage_repetition_no_progress_moved_rate_threshold = self._clamp01(
             float(coverage_repetition_no_progress_moved_rate_threshold)
+        )
+        self.coverage_bidirectional_loop_min_edge_count = int(
+            max(1, coverage_bidirectional_loop_min_edge_count)
+        )
+        self.coverage_bidirectional_loop_min_total_count = int(
+            max(
+                int(self.coverage_bidirectional_loop_min_edge_count) * 2,
+                coverage_bidirectional_loop_min_total_count,
+            )
+        )
+        self.coverage_bidirectional_loop_moved_rate_threshold = self._clamp01(
+            float(coverage_bidirectional_loop_moved_rate_threshold)
+        )
+        self.high_info_recoverable_skip_enabled = bool(high_info_recoverable_skip_enabled)
+        self.high_info_recover_edge_declared_blocked_moved_rate_threshold = self._clamp01(
+            float(high_info_recover_edge_declared_blocked_moved_rate_threshold)
         )
         self.high_info_focus_release_after_first_pass = bool(
             high_info_focus_release_after_first_pass
@@ -536,6 +557,17 @@ class ActiveInferencePolicyEvaluatorV1:
                     )
                 )
             ]
+            if (
+                (not safe_entries)
+                and int(packet.action_counter)
+                >= int(max(12, int(self.coverage_sweep_direction_retry_limit) * 2))
+            ):
+                diagnostics["enabled"] = True
+                diagnostics["mode"] = "deterministic_serpentine_blocked_escape"
+                diagnostics["desired_direction"] = str(scripted_direction)
+                diagnostics["blocked_hard_skip_applied"] = True
+                diagnostics["prepass_complete"] = False
+                return None, diagnostics
             if safe_entries:
                 candidate_entries = list(safe_entries)
             ordered_entries = sorted(candidate_entries, key=_script_sort_key)
@@ -792,6 +824,15 @@ class ActiveInferencePolicyEvaluatorV1:
                 )
             )
         ]
+        if (
+            (not safe_entries)
+            and int(packet.action_counter)
+            >= int(max(12, int(self.coverage_sweep_direction_retry_limit) * 2))
+        ):
+            diagnostics["enabled"] = True
+            diagnostics["mode"] = "bfs_two_pass_blocked_escape"
+            diagnostics["blocked_hard_skip_applied"] = True
+            return None, diagnostics
         if safe_entries:
             candidate_entries = list(safe_entries)
         ordered_entries = sorted(candidate_entries, key=_hard_sort_key)
@@ -2360,6 +2401,17 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         progress_rate = self._clamp01(float(region_semantics.get("progress_rate", 0.0)))
         edge_status = str(region_semantics.get("edge_status", "unknown"))
+        current_region_key = str(predicted_stats.get("current_region_key", "NA"))
+        predicted_region_key = str(predicted_stats.get("predicted_region_key", "NA"))
+        empirical_transition_target_key = str(
+            predicted_stats.get("empirical_transition_target_key", "NA")
+        )
+        empirical_transition_total = int(
+            max(0, predicted_stats.get("empirical_transition_total", 0))
+        )
+        empirical_transition_confidence = self._clamp01(
+            float(predicted_stats.get("empirical_transition_confidence", 0.0))
+        )
 
         hard_blocked_edge = bool(
             edge_attempts >= int(self.coverage_blocked_edge_attempt_threshold)
@@ -2383,6 +2435,7 @@ class ActiveInferencePolicyEvaluatorV1:
         edge_declared_blocked = bool(
             edge_status in ("blocked", "ui_blocked", "terminal_failure")
             and action_attempts >= max(2, int(self.coverage_blocked_action_attempt_threshold // 2))
+            and (action_moved_rate <= 0.35 or edge_blocked_rate >= 0.85)
         )
         low_yield_translation_trap = bool(
             region_attempts >= int(self.coverage_low_yield_attempt_threshold)
@@ -2407,6 +2460,56 @@ class ActiveInferencePolicyEvaluatorV1:
             >= float(self.coverage_repetition_no_progress_moved_rate_threshold)
             and progress_rate <= 0.01
         )
+        empirical_self_loop_no_progress_trap = bool(
+            progress_rate <= 0.01
+            and action_moved_rate
+            >= float(self.coverage_repetition_no_progress_moved_rate_threshold)
+            and edge_attempts >= int(max(4, int(self.coverage_sweep_direction_retry_limit // 2)))
+            and current_region_key != "NA"
+            and empirical_transition_target_key == current_region_key
+            and empirical_transition_total >= int(max(3, int(round(0.60 * edge_attempts))))
+            and empirical_transition_confidence >= 0.65
+        )
+        bidirectional_loop_forward_count = 0
+        bidirectional_loop_reverse_count = 0
+        bidirectional_loop_total_count = 0
+        region_graph_snapshot = candidate.metadata.get("region_graph_snapshot_v1", {})
+        if not isinstance(region_graph_snapshot, dict):
+            region_graph_snapshot = {}
+        edge_rows = region_graph_snapshot.get("edges", [])
+        if not isinstance(edge_rows, list):
+            edge_rows = []
+        if (
+            self._parse_region_key(current_region_key) is not None
+            and self._parse_region_key(predicted_region_key) is not None
+            and current_region_key != predicted_region_key
+        ):
+            for edge_row in edge_rows:
+                if not isinstance(edge_row, dict):
+                    continue
+                src = str(edge_row.get("source_region_key", "NA"))
+                dst = str(edge_row.get("target_region_key", "NA"))
+                count = int(max(0, edge_row.get("count", 0)))
+                if count <= 0:
+                    continue
+                if src == current_region_key and dst == predicted_region_key:
+                    bidirectional_loop_forward_count += int(count)
+                elif src == predicted_region_key and dst == current_region_key:
+                    bidirectional_loop_reverse_count += int(count)
+            bidirectional_loop_total_count = int(
+                bidirectional_loop_forward_count + bidirectional_loop_reverse_count
+            )
+        bidirectional_no_progress_loop_trap = bool(
+            progress_rate <= 0.01
+            and action_moved_rate >= float(self.coverage_bidirectional_loop_moved_rate_threshold)
+            and min(
+                int(bidirectional_loop_forward_count),
+                int(bidirectional_loop_reverse_count),
+            )
+            >= int(self.coverage_bidirectional_loop_min_edge_count)
+            and int(bidirectional_loop_total_count)
+            >= int(self.coverage_bidirectional_loop_min_total_count)
+        )
         hard_skip = bool(
             hard_blocked_edge
             or hard_blocked_action
@@ -2415,6 +2518,8 @@ class ActiveInferencePolicyEvaluatorV1:
             or edge_declared_blocked
             or low_yield_translation_trap
             or repeated_no_progress_trap
+            or empirical_self_loop_no_progress_trap
+            or bidirectional_no_progress_loop_trap
         )
 
         evidence_scale = min(
@@ -2453,6 +2558,10 @@ class ActiveInferencePolicyEvaluatorV1:
             reasons.append("low_yield_translation_trap")
         if repeated_no_progress_trap:
             reasons.append("repeated_no_progress_trap")
+        if empirical_self_loop_no_progress_trap:
+            reasons.append("empirical_self_loop_no_progress_trap")
+        if bidirectional_no_progress_loop_trap:
+            reasons.append("bidirectional_no_progress_loop_trap")
 
         return {
             "hard_skip": bool(hard_skip),
@@ -2471,6 +2580,17 @@ class ActiveInferencePolicyEvaluatorV1:
             "cc_count_change_rate": float(cc_count_change_rate),
             "progress_rate": float(progress_rate),
             "edge_status": str(edge_status),
+            "current_region_key": str(current_region_key),
+            "predicted_region_key": str(predicted_region_key),
+            "empirical_transition_target_key": str(empirical_transition_target_key),
+            "empirical_transition_total": int(empirical_transition_total),
+            "empirical_transition_confidence": float(empirical_transition_confidence),
+            "predicted_region_visit_count": int(
+                max(0, predicted_stats.get("predicted_region_visit_count", 0))
+            ),
+            "bidirectional_loop_forward_count": int(bidirectional_loop_forward_count),
+            "bidirectional_loop_reverse_count": int(bidirectional_loop_reverse_count),
+            "bidirectional_loop_total_count": int(bidirectional_loop_total_count),
             "repeated_no_progress_attempt_threshold": int(
                 repeated_no_progress_attempt_threshold
             ),
@@ -2500,6 +2620,83 @@ class ActiveInferencePolicyEvaluatorV1:
             and edge_blocked_rate >= 0.5
         )
         return bool(profile_hard_skip or edge_saturated or retry_saturated)
+
+    def _high_info_recoverable_hard_skip(
+        self,
+        *,
+        profile: dict[str, Any] | None = None,
+        focus_features: dict[str, Any] | None = None,
+    ) -> bool:
+        if not bool(self.high_info_recoverable_skip_enabled):
+            return False
+        profile_dict = profile if isinstance(profile, dict) else {}
+        if not bool(profile_dict.get("hard_skip", False)):
+            return False
+        features = focus_features if isinstance(focus_features, dict) else {}
+        if not (
+            bool(features.get("active", False))
+            and str(features.get("stage", "idle")) in ("seek", "verify")
+        ):
+            return False
+        if not (
+            bool(features.get("moves_toward_target_region", False))
+            or bool(features.get("reaches_target_region", False))
+        ):
+            return False
+        current_region_key = str(features.get("current_region_key", "NA"))
+        predicted_region_key = str(features.get("predicted_region_key", "NA"))
+        if (
+            predicted_region_key == "NA"
+            or current_region_key == "NA"
+            or predicted_region_key == current_region_key
+        ):
+            return False
+        reasons = {
+            str(reason)
+            for reason in profile_dict.get("reasons", [])
+            if isinstance(reason, str)
+        }
+        if not reasons:
+            return False
+        critical_reasons = {
+            "hard_blocked_edge",
+            "hard_blocked_action",
+            "ui_side_effect_trap",
+            "terminal_failure_trap",
+        }
+        if reasons.intersection(critical_reasons):
+            return False
+        recoverable_reasons = {
+            "low_yield_translation_trap",
+            "edge_declared_blocked",
+        }
+        if not reasons.issubset(recoverable_reasons):
+            return False
+        empirical_transition_target_key = str(
+            profile_dict.get("empirical_transition_target_key", "NA")
+        )
+        empirical_transition_total = int(
+            max(0, profile_dict.get("empirical_transition_total", 0))
+        )
+        empirical_transition_confidence = self._clamp01(
+            float(profile_dict.get("empirical_transition_confidence", 0.0))
+        )
+        if (
+            empirical_transition_target_key == current_region_key
+            and empirical_transition_total >= max(3, int(self.coverage_sweep_direction_retry_limit // 2))
+            and empirical_transition_confidence >= 0.60
+        ):
+            return False
+        if "edge_declared_blocked" in reasons:
+            action_moved_rate = self._clamp01(float(profile_dict.get("action_moved_rate", 0.0)))
+            edge_blocked_rate = self._clamp01(float(profile_dict.get("edge_blocked_rate", 0.0)))
+            if (
+                action_moved_rate
+                < float(self.high_info_recover_edge_declared_blocked_moved_rate_threshold)
+                or edge_blocked_rate >= 0.85
+            ):
+                return False
+        return True
 
     def _candidate_frontier_graph_cost(self, candidate: ActionCandidateV1) -> float:
         transition_stats = self._candidate_transition_stats(candidate)
@@ -3148,6 +3345,70 @@ class ActiveInferencePolicyEvaluatorV1:
             )
             for entry in entries
         }
+        # Apply loop/block penalties to global selection scores so non-coverage paths
+        # also de-prioritize high-repeat no-progress edges.
+        for entry in entries:
+            candidate_id = str(entry.candidate.candidate_id)
+            predicted_stats = self._candidate_predicted_region_stats(entry.candidate)
+            coverage_profile = self._candidate_coverage_block_profile(
+                entry.candidate,
+                predicted_region_stats=predicted_stats,
+            )
+            hard_skip_raw = bool(
+                self._coverage_hard_skip(
+                    profile=coverage_profile,
+                    predicted_region_stats=predicted_stats,
+                )
+            )
+            hard_skip_recovered = False
+            if hard_skip_raw:
+                focus_features = self._candidate_high_info_focus_features(entry.candidate)
+                hard_skip_recovered = bool(
+                    self._high_info_recoverable_hard_skip(
+                        profile=coverage_profile,
+                        focus_features=focus_features,
+                    )
+                )
+            hard_skip_effective = bool(hard_skip_raw and (not hard_skip_recovered))
+            blocked_soft_penalty = self._clamp01(
+                float(coverage_profile.get("soft_penalty", 0.0))
+            )
+            reasons = {
+                str(reason)
+                for reason in coverage_profile.get("reasons", [])
+                if isinstance(reason, str)
+            }
+            loop_repetition_penalty = 0.0
+            if reasons.intersection(
+                {
+                    "bidirectional_no_progress_loop_trap",
+                    "repeated_no_progress_trap",
+                    "empirical_self_loop_no_progress_trap",
+                }
+            ):
+                loop_repetition_penalty = 0.28
+            adjusted_penalty = float(
+                (0.36 * blocked_soft_penalty)
+                + (0.72 if hard_skip_effective else 0.0)
+                + loop_repetition_penalty
+            )
+            selection_score_by_candidate[candidate_id] = float(
+                selection_score_by_candidate.get(candidate_id, entry.total_efe)
+                + adjusted_penalty
+            )
+        entries.sort(
+            key=lambda entry: (
+                float(
+                    selection_score_by_candidate.get(
+                        entry.candidate.candidate_id,
+                        entry.total_efe,
+                    )
+                ),
+                float(entry.total_efe),
+                int(entry.candidate.action_id),
+                str(entry.candidate.candidate_id),
+            )
+        )
         best_score = float(
             selection_score_by_candidate.get(
                 entries[0].candidate.candidate_id,
@@ -3827,10 +4088,17 @@ class ActiveInferencePolicyEvaluatorV1:
                         for entry in coverage_pool
                         if not bool(_coverage_effective_hard_skip_for_entry(entry))
                     ]
+                    coverage_all_blocked = False
                     if safe_coverage_pool:
                         coverage_pool = list(safe_coverage_pool)
                         coverage_sweep_reason = (
                             f"{coverage_sweep_reason}|blocked_edge_auto_skip"
+                        )
+                    else:
+                        coverage_all_blocked = True
+                        coverage_pool = []
+                        coverage_sweep_reason = (
+                            f"{coverage_sweep_reason}|blocked_edge_auto_skip_all_blocked_escape"
                         )
                     if not coverage_hard_prepass_active and len(coverage_pool) < 2:
                         coverage_pool = sorted(
@@ -3848,8 +4116,11 @@ class ActiveInferencePolicyEvaluatorV1:
                                 str(entry.candidate.candidate_id),
                             ),
                         )[: min(4, len(navigation_entries))]
+                    if bool(coverage_all_blocked):
+                        coverage_pool = []
                     if (
                         not coverage_hard_prepass_active
+                        and (not bool(coverage_all_blocked))
                         and
                         self.coverage_matrix_sweep_enabled
                         and str(coverage_sweep_target_direction)
@@ -3928,6 +4199,11 @@ class ActiveInferencePolicyEvaluatorV1:
                                     str(entry.candidate.candidate_id),
                                 ),
                             )
+                            escaped_pool = [
+                                entry
+                                for entry in escaped_pool
+                                if not bool(_coverage_effective_hard_skip_for_entry(entry))
+                            ]
                             if escaped_pool:
                                 escape_direction = self._navigation_action_direction(
                                     int(escaped_pool[0].candidate.action_id)
@@ -3938,8 +4214,14 @@ class ActiveInferencePolicyEvaluatorV1:
                                         f"{coverage_sweep_reason}|target_retry_exceeded_escape"
                                     )
                                 coverage_pool = list(escaped_pool[: max(2, min(6, len(escaped_pool)))])
+                            else:
+                                coverage_pool = []
+                                coverage_sweep_reason = (
+                                    f"{coverage_sweep_reason}|all_hard_skip_no_probe"
+                                )
                     if (
                         not coverage_hard_prepass_active
+                        and (not bool(coverage_all_blocked))
                         and
                         self.coverage_matrix_sweep_enabled
                         and str(coverage_sweep_target_direction)
@@ -4417,9 +4699,19 @@ class ActiveInferencePolicyEvaluatorV1:
                     entry.candidate,
                     predicted_region_stats=predicted_region_stats,
                 )
-                blocked_hard_skip = self._coverage_hard_skip(
+                blocked_hard_skip_raw = self._coverage_hard_skip(
                     profile=coverage_profile,
                     predicted_region_stats=predicted_region_stats,
+                )
+                blocked_hard_skip_recovered = bool(
+                    blocked_hard_skip_raw
+                    and self._high_info_recoverable_hard_skip(
+                        profile=coverage_profile,
+                        focus_features=focus_features,
+                    )
+                )
+                blocked_hard_skip = bool(
+                    blocked_hard_skip_raw and (not blocked_hard_skip_recovered)
                 )
                 high_info_rows.append(
                     {
@@ -4432,6 +4724,10 @@ class ActiveInferencePolicyEvaluatorV1:
                             )
                         ),
                         "blocked_hard_skip": bool(blocked_hard_skip),
+                        "blocked_hard_skip_raw": bool(blocked_hard_skip_raw),
+                        "blocked_hard_skip_recovered": bool(
+                            blocked_hard_skip_recovered
+                        ),
                         "blocked_soft_penalty": float(
                             coverage_profile.get("soft_penalty", 0.0)
                         ),
@@ -4446,8 +4742,15 @@ class ActiveInferencePolicyEvaluatorV1:
                 candidate_high_info_rows = (
                     safe_high_info_rows if safe_high_info_rows else high_info_rows
                 )
+                recovered_block_rows = [
+                    row
+                    for row in high_info_rows
+                    if bool(row.get("blocked_hard_skip_recovered", False))
+                ]
                 if len(candidate_high_info_rows) < len(high_info_rows):
                     high_info_focus_probe_reason = "active_blocked_edge_auto_skip"
+                elif recovered_block_rows:
+                    high_info_focus_probe_reason = "active_recoverable_block_override"
                 best_high_info_score = min(
                     float(row["score"]) for row in candidate_high_info_rows
                 )
@@ -4510,10 +4813,33 @@ class ActiveInferencePolicyEvaluatorV1:
                         for row in candidate_high_info_rows
                         if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
                         and float(row["features"].get("target_score", 0.0)) >= 0.32
+                        and (
+                            str(row["features"].get("stage", "idle")) != "seek"
+                            or bool(row["features"].get("moves_toward_target_region", False))
+                            or bool(row["features"].get("reaches_target_region", False))
+                            or (
+                                str(row["features"].get("predicted_region_key", "NA"))
+                                != str(row["features"].get("current_region_key", "NA"))
+                                and not bool(
+                                    row["features"].get("moves_away_target_region", False)
+                                )
+                            )
+                        )
                     ]
                     if value_pool:
                         value_pool.sort(
                             key=lambda row: (
+                                0 if bool(row["features"].get("reaches_target_region", False)) else 1,
+                                0
+                                if bool(row["features"].get("moves_toward_target_region", False))
+                                else 1,
+                                0
+                                if str(row["features"].get("predicted_region_key", "NA"))
+                                != str(row["features"].get("current_region_key", "NA"))
+                                else 1,
+                                1
+                                if bool(row["features"].get("moves_away_target_region", False))
+                                else 0,
                                 -int(row["features"].get("remaining_samples", 0)),
                                 -float(row["features"].get("target_score", 0.0)),
                                 -float(row["features"].get("bonus_hint", 0.0)),
@@ -4544,6 +4870,12 @@ class ActiveInferencePolicyEvaluatorV1:
                         "action_id": int(row["entry"].candidate.action_id),
                         "score": float(row["score"]),
                         "blocked_hard_skip": bool(row.get("blocked_hard_skip", False)),
+                        "blocked_hard_skip_raw": bool(
+                            row.get("blocked_hard_skip_raw", False)
+                        ),
+                        "blocked_hard_skip_recovered": bool(
+                            row.get("blocked_hard_skip_recovered", False)
+                        ),
                         "blocked_soft_penalty": float(row.get("blocked_soft_penalty", 0.0)),
                         "blocked_reasons": list(row.get("blocked_reasons", [])),
                         "stage": str(row["features"].get("stage", "idle")),
@@ -4595,6 +4927,17 @@ class ActiveInferencePolicyEvaluatorV1:
                     and bool(seq_features.get("active", False))
                 ):
                     continue
+                predicted_region_stats = self._candidate_predicted_region_stats(
+                    entry.candidate
+                )
+                coverage_profile = self._candidate_coverage_block_profile(
+                    entry.candidate,
+                    predicted_region_stats=predicted_region_stats,
+                )
+                blocked_hard_skip = self._coverage_hard_skip(
+                    profile=coverage_profile,
+                    predicted_region_stats=predicted_region_stats,
+                )
                 sequence_rows.append(
                     {
                         "entry": entry,
@@ -4605,74 +4948,92 @@ class ActiveInferencePolicyEvaluatorV1:
                                 entry.total_efe,
                             )
                         ),
+                        "blocked_hard_skip": bool(blocked_hard_skip),
+                        "blocked_soft_penalty": float(
+                            coverage_profile.get("soft_penalty", 0.0)
+                        ),
+                        "blocked_reasons": list(coverage_profile.get("reasons", [])),
                     }
                 )
             if sequence_rows:
                 sequence_causal_probe_reason = "active_no_override"
+                safe_sequence_rows = [
+                    row for row in sequence_rows if not bool(row.get("blocked_hard_skip", False))
+                ]
+                if not safe_sequence_rows:
+                    sequence_causal_probe_reason = "blocked_edge_auto_skip"
+                else:
+                    if len(safe_sequence_rows) < len(sequence_rows):
+                        sequence_causal_probe_reason = "active_blocked_edge_auto_skip"
+                    sequence_rows = safe_sequence_rows
                 stage = str(sequence_rows[0]["features"].get("stage", "idle"))
-                best_sequence_score = min(float(row["score"]) for row in sequence_rows)
-                if stage == "verify":
-                    verify_pool = [
-                        row
-                        for row in sequence_rows
-                        if bool(row["features"].get("verify_action_candidate", False))
-                    ]
-                    if verify_pool:
-                        verify_pool.sort(
-                            key=lambda row: (
-                                -float(row["features"].get("bonus_hint", 0.0)),
-                                float(row["score"]),
-                                int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
-                                int(row["entry"].candidate.action_id),
-                                str(row["entry"].candidate.candidate_id),
+                if sequence_rows:
+                    best_sequence_score = min(float(row["score"]) for row in sequence_rows)
+                    if stage == "verify":
+                        verify_pool = [
+                            row
+                            for row in sequence_rows
+                            if bool(row["features"].get("verify_action_candidate", False))
+                        ]
+                        if verify_pool:
+                            verify_pool.sort(
+                                key=lambda row: (
+                                    -float(row["features"].get("bonus_hint", 0.0)),
+                                    float(row["score"]),
+                                    int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                                    int(row["entry"].candidate.action_id),
+                                    str(row["entry"].candidate.candidate_id),
+                                )
                             )
-                        )
-                        best_verify = verify_pool[0]
-                        verify_margin = float(max(self.sequence_probe_score_margin, 0.55))
-                        if float(best_verify["score"]) <= (best_sequence_score + verify_margin):
-                            selected_entry = best_verify["entry"]
-                            sequence_causal_probe_applied = True
-                            sequence_causal_probe_reason = "verify_action_priority"
-                if not sequence_causal_probe_applied:
-                    seek_pool = [
-                        row
-                        for row in sequence_rows
-                        if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
-                        and (
-                            bool(row["features"].get("advances_to_target", False))
-                            or bool(row["features"].get("reaches_target", False))
-                        )
-                    ]
-                    if seek_pool:
-                        seek_pool.sort(
-                            key=lambda row: (
-                                0 if bool(row["features"].get("reaches_target", False)) else 1,
-                                int(row["features"].get("predicted_distance_to_target", 10**6)),
-                                -float(row["features"].get("bonus_hint", 0.0)),
-                                float(row["score"]),
-                                int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
-                                int(row["entry"].candidate.action_id),
-                                str(row["entry"].candidate.candidate_id),
+                            best_verify = verify_pool[0]
+                            verify_margin = float(max(self.sequence_probe_score_margin, 0.55))
+                            if float(best_verify["score"]) <= (best_sequence_score + verify_margin):
+                                selected_entry = best_verify["entry"]
+                                sequence_causal_probe_applied = True
+                                sequence_causal_probe_reason = "verify_action_priority"
+                    if not sequence_causal_probe_applied:
+                        seek_pool = [
+                            row
+                            for row in sequence_rows
+                            if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                            and (
+                                bool(row["features"].get("advances_to_target", False))
+                                or bool(row["features"].get("reaches_target", False))
                             )
-                        )
-                        best_seek = seek_pool[0]
-                        seek_margin = float(max(self.sequence_probe_score_margin, 0.45))
-                        if bool(best_seek["features"].get("reaches_target", False)) or float(
-                            best_seek["score"]
-                        ) <= (best_sequence_score + seek_margin):
-                            selected_entry = best_seek["entry"]
-                            sequence_causal_probe_applied = True
-                            sequence_causal_probe_reason = "seek_target_priority"
-                if sequence_causal_probe_applied:
-                    least_tried_probe_applied = True
-                    if selected_entry is not entries[0]:
-                        entries.remove(selected_entry)
-                        entries.insert(0, selected_entry)
+                        ]
+                        if seek_pool:
+                            seek_pool.sort(
+                                key=lambda row: (
+                                    0 if bool(row["features"].get("reaches_target", False)) else 1,
+                                    int(row["features"].get("predicted_distance_to_target", 10**6)),
+                                    -float(row["features"].get("bonus_hint", 0.0)),
+                                    float(row["score"]),
+                                    int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                                    int(row["entry"].candidate.action_id),
+                                    str(row["entry"].candidate.candidate_id),
+                                )
+                            )
+                            best_seek = seek_pool[0]
+                            seek_margin = float(max(self.sequence_probe_score_margin, 0.45))
+                            if bool(best_seek["features"].get("reaches_target", False)) or float(
+                                best_seek["score"]
+                            ) <= (best_sequence_score + seek_margin):
+                                selected_entry = best_seek["entry"]
+                                sequence_causal_probe_applied = True
+                                sequence_causal_probe_reason = "seek_target_priority"
+                    if sequence_causal_probe_applied:
+                        least_tried_probe_applied = True
+                        if selected_entry is not entries[0]:
+                            entries.remove(selected_entry)
+                            entries.insert(0, selected_entry)
                 sequence_causal_probe_candidates = [
                     {
                         "candidate_id": str(row["entry"].candidate.candidate_id),
                         "action_id": int(row["entry"].candidate.action_id),
                         "score": float(row["score"]),
+                        "blocked_hard_skip": bool(row.get("blocked_hard_skip", False)),
+                        "blocked_soft_penalty": float(row.get("blocked_soft_penalty", 0.0)),
+                        "blocked_reasons": list(row.get("blocked_reasons", [])),
                         "stage": str(row["features"].get("stage", "idle")),
                         "current_region_key": str(
                             row["features"].get("current_region_key", "NA")
@@ -5253,6 +5614,89 @@ class ActiveInferencePolicyEvaluatorV1:
                         entries.remove(selected_entry)
                         entries.insert(0, selected_entry)
 
+        selected_blocked_hard_skip_raw = False
+        selected_blocked_hard_skip_recovered = False
+        selected_blocked_hard_skip = False
+        selected_blocked_hard_skip_replacement_applied = False
+        selected_blocked_hard_skip_reasons: list[str] = []
+
+        if entries:
+            top_candidate = entries[0].candidate
+            top_predicted_stats = self._candidate_predicted_region_stats(top_candidate)
+            top_profile = self._candidate_coverage_block_profile(
+                top_candidate,
+                predicted_region_stats=top_predicted_stats,
+            )
+            selected_blocked_hard_skip_raw = bool(
+                self._coverage_hard_skip(
+                    profile=top_profile,
+                    predicted_region_stats=top_predicted_stats,
+                )
+            )
+            if selected_blocked_hard_skip_raw:
+                top_focus = self._candidate_high_info_focus_features(top_candidate)
+                selected_blocked_hard_skip_recovered = bool(
+                    self._high_info_recoverable_hard_skip(
+                        profile=top_profile,
+                        focus_features=top_focus,
+                    )
+                )
+            selected_blocked_hard_skip = bool(
+                selected_blocked_hard_skip_raw and (not selected_blocked_hard_skip_recovered)
+            )
+            if selected_blocked_hard_skip:
+                selected_blocked_hard_skip_reasons = [
+                    str(reason)
+                    for reason in top_profile.get("reasons", [])
+                    if isinstance(reason, str)
+                ]
+                safe_entries: list[FreeEnergyLedgerEntryV1] = []
+                for entry in entries[1:]:
+                    candidate = entry.candidate
+                    predicted_stats = self._candidate_predicted_region_stats(candidate)
+                    profile = self._candidate_coverage_block_profile(
+                        candidate,
+                        predicted_region_stats=predicted_stats,
+                    )
+                    hard_skip_raw = bool(
+                        self._coverage_hard_skip(
+                            profile=profile,
+                            predicted_region_stats=predicted_stats,
+                        )
+                    )
+                    if not hard_skip_raw:
+                        safe_entries.append(entry)
+                        continue
+                    focus = self._candidate_high_info_focus_features(candidate)
+                    hard_skip_recovered = bool(
+                        self._high_info_recoverable_hard_skip(
+                            profile=profile,
+                            focus_features=focus,
+                        )
+                    )
+                    if not hard_skip_recovered:
+                        safe_entries.append(entry)
+                if safe_entries:
+                    safe_entries.sort(
+                        key=lambda entry: (
+                            float(
+                                selection_score_by_candidate.get(
+                                    entry.candidate.candidate_id,
+                                    entry.total_efe,
+                                )
+                            ),
+                            int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                            int(entry.candidate.action_id),
+                            str(entry.candidate.candidate_id),
+                        )
+                    )
+                    replacement_entry = safe_entries[0]
+                    if replacement_entry is not entries[0]:
+                        entries.remove(replacement_entry)
+                        entries.insert(0, replacement_entry)
+                        selected_blocked_hard_skip_replacement_applied = True
+                    selected_blocked_hard_skip = False
+
         selected_action_usage_count = int(
             action_count_map.get(int(entries[0].candidate.action_id), 0)
         )
@@ -5470,6 +5914,17 @@ class ActiveInferencePolicyEvaluatorV1:
             ),
             "high_info_focus_probe_candidates": list(high_info_focus_probe_candidates),
             "sequence_causal_probe_candidates": list(sequence_causal_probe_candidates),
+            "selected_blocked_hard_skip_raw": bool(selected_blocked_hard_skip_raw),
+            "selected_blocked_hard_skip_recovered": bool(
+                selected_blocked_hard_skip_recovered
+            ),
+            "selected_blocked_hard_skip": bool(selected_blocked_hard_skip),
+            "selected_blocked_hard_skip_replacement_applied": bool(
+                selected_blocked_hard_skip_replacement_applied
+            ),
+            "selected_blocked_hard_skip_reasons": list(
+                selected_blocked_hard_skip_reasons
+            ),
             "selected_action_usage_count_before": int(selected_action_usage_count),
             "selected_cluster_id": selected_cluster_id,
             "selected_cluster_usage_count_before": int(selected_cluster_usage_count),
