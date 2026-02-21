@@ -49,6 +49,9 @@ class ActiveInferencePolicyEvaluatorV1:
         coverage_sweep_target_regions: int = 24,
         coverage_sweep_min_region_visits: int = 2,
         coverage_prepass_steps: int = 192,
+        coverage_prepass_relaxed_completion_ratio: float = 0.78,
+        coverage_prepass_relaxed_min_known_regions: int = 16,
+        coverage_prepass_relaxed_start_step_fraction: float = 0.55,
         coverage_sweep_score_margin: float = 0.42,
         coverage_resweep_interval: int = 96,
         coverage_resweep_span: int = 24,
@@ -61,8 +64,19 @@ class ActiveInferencePolicyEvaluatorV1:
         coverage_blocked_edge_rate_threshold: float = 0.60,
         coverage_ui_side_effect_attempt_threshold: int = 8,
         coverage_ui_side_effect_rate_threshold: float = 0.60,
+        coverage_low_yield_attempt_threshold: int = 10,
+        coverage_low_yield_moved_rate_threshold: float = 0.70,
+        coverage_low_yield_strong_change_rate_threshold: float = 0.10,
+        coverage_low_yield_palette_delta_norm_threshold: float = 0.30,
+        coverage_low_yield_cc_count_change_rate_threshold: float = 0.10,
+        coverage_repetition_no_progress_attempt_threshold: int = 18,
+        coverage_repetition_no_progress_high_info_attempt_threshold: int = 26,
+        coverage_repetition_no_progress_moved_rate_threshold: float = 0.45,
         high_info_focus_release_after_first_pass: bool = True,
         high_info_focus_release_action_counter: int = -1,
+        high_info_release_min_target_score: float = 0.62,
+        high_info_release_min_remaining_samples: int = 1,
+        high_info_release_min_queue_length: int = 1,
         navigation_confidence_gating_enabled: bool = True,
         sequence_causal_term_enabled: bool = True,
         sequence_causal_bonus_weight: float = 0.55,
@@ -109,6 +123,15 @@ class ActiveInferencePolicyEvaluatorV1:
         self.coverage_sweep_target_regions = int(max(1, coverage_sweep_target_regions))
         self.coverage_sweep_min_region_visits = int(max(1, coverage_sweep_min_region_visits))
         self.coverage_prepass_steps = int(max(0, coverage_prepass_steps))
+        self.coverage_prepass_relaxed_completion_ratio = self._clamp01(
+            float(coverage_prepass_relaxed_completion_ratio)
+        )
+        self.coverage_prepass_relaxed_min_known_regions = int(
+            max(4, coverage_prepass_relaxed_min_known_regions)
+        )
+        self.coverage_prepass_relaxed_start_step_fraction = float(
+            max(0.0, min(1.0, coverage_prepass_relaxed_start_step_fraction))
+        )
         self.coverage_sweep_score_margin = float(max(0.0, coverage_sweep_score_margin))
         self.coverage_resweep_interval = int(max(0, coverage_resweep_interval))
         self.coverage_resweep_span = int(max(0, coverage_resweep_span))
@@ -135,11 +158,47 @@ class ActiveInferencePolicyEvaluatorV1:
         self.coverage_ui_side_effect_rate_threshold = self._clamp01(
             float(coverage_ui_side_effect_rate_threshold)
         )
+        self.coverage_low_yield_attempt_threshold = int(
+            max(1, coverage_low_yield_attempt_threshold)
+        )
+        self.coverage_low_yield_moved_rate_threshold = self._clamp01(
+            float(coverage_low_yield_moved_rate_threshold)
+        )
+        self.coverage_low_yield_strong_change_rate_threshold = self._clamp01(
+            float(coverage_low_yield_strong_change_rate_threshold)
+        )
+        self.coverage_low_yield_palette_delta_norm_threshold = self._clamp01(
+            float(coverage_low_yield_palette_delta_norm_threshold)
+        )
+        self.coverage_low_yield_cc_count_change_rate_threshold = self._clamp01(
+            float(coverage_low_yield_cc_count_change_rate_threshold)
+        )
+        self.coverage_repetition_no_progress_attempt_threshold = int(
+            max(1, coverage_repetition_no_progress_attempt_threshold)
+        )
+        self.coverage_repetition_no_progress_high_info_attempt_threshold = int(
+            max(
+                int(self.coverage_repetition_no_progress_attempt_threshold),
+                coverage_repetition_no_progress_high_info_attempt_threshold,
+            )
+        )
+        self.coverage_repetition_no_progress_moved_rate_threshold = self._clamp01(
+            float(coverage_repetition_no_progress_moved_rate_threshold)
+        )
         self.high_info_focus_release_after_first_pass = bool(
             high_info_focus_release_after_first_pass
         )
         self.high_info_focus_release_action_counter = int(
             high_info_focus_release_action_counter
+        )
+        self.high_info_release_min_target_score = self._clamp01(
+            float(high_info_release_min_target_score)
+        )
+        self.high_info_release_min_remaining_samples = int(
+            max(0, high_info_release_min_remaining_samples)
+        )
+        self.high_info_release_min_queue_length = int(
+            max(0, high_info_release_min_queue_length)
         )
         self.navigation_confidence_gating_enabled = bool(
             navigation_confidence_gating_enabled
@@ -354,6 +413,12 @@ class ActiveInferencePolicyEvaluatorV1:
             "cross_visit_target": int(max(1, self.coverage_sweep_min_region_visits)),
             "prepass_complete": False,
             "candidate_pool_size": 0,
+            "relaxed_completion_ratio": 0.0,
+            "relaxed_completion_threshold": float(self.coverage_prepass_relaxed_completion_ratio),
+            "relaxed_completion_min_known_regions": int(
+                self.coverage_prepass_relaxed_min_known_regions
+            ),
+            "relaxed_completion_start_step": 0,
         }
         if int(packet.levels_completed) > 0:
             diagnostics["mode"] = "levels_progressed"
@@ -549,9 +614,20 @@ class ActiveInferencePolicyEvaluatorV1:
         regions_visited_at_least_target = int(
             sum(1 for count in normalized_region_visits.values() if int(count) >= int(visit_target))
         )
+        relaxed_completion_ratio = float(
+            regions_visited_at_least_target / float(max(1, known_region_count))
+        )
+        relaxed_completion_start_step = int(
+            round(
+                float(self.coverage_prepass_relaxed_start_step_fraction)
+                * float(max(1, int(self.coverage_prepass_steps)))
+            )
+        )
         diagnostics["known_region_count"] = int(known_region_count)
         diagnostics["min_region_visit_count"] = int(min_region_visit_count)
         diagnostics["regions_visited_at_least_target"] = int(regions_visited_at_least_target)
+        diagnostics["relaxed_completion_ratio"] = float(relaxed_completion_ratio)
+        diagnostics["relaxed_completion_start_step"] = int(relaxed_completion_start_step)
 
         under_visited_regions = sorted(
             (
@@ -571,6 +647,17 @@ class ActiveInferencePolicyEvaluatorV1:
             and self._parse_region_key(cross_region_key) is not None
             and int(cross_region_visit_count) < int(visit_target)
         )
+        if (
+            int(packet.action_counter) >= int(relaxed_completion_start_step)
+            and int(known_region_count) >= int(self.coverage_prepass_relaxed_min_known_regions)
+            and not bool(cross_under_visited)
+            and float(relaxed_completion_ratio)
+            >= float(self.coverage_prepass_relaxed_completion_ratio)
+        ):
+            diagnostics["enabled"] = True
+            diagnostics["mode"] = "prepass_relaxed_complete"
+            diagnostics["prepass_complete"] = True
+            return None, diagnostics
         if cross_under_visited:
             goal_region_key = str(cross_region_key)
         elif under_visited_regions:
@@ -2264,6 +2351,13 @@ class ActiveInferencePolicyEvaluatorV1:
         terminal_failure_rate = self._clamp01(
             float(region_semantics.get("terminal_failure_rate", 0.0))
         )
+        strong_change_rate = self._clamp01(float(region_semantics.get("strong_change_rate", 0.0)))
+        palette_delta_mean_norm = self._clamp01(
+            float(region_semantics.get("palette_delta_mean_norm", 0.0))
+        )
+        cc_count_change_rate = self._clamp01(
+            float(region_semantics.get("cc_count_change_rate", 0.0))
+        )
         progress_rate = self._clamp01(float(region_semantics.get("progress_rate", 0.0)))
         edge_status = str(region_semantics.get("edge_status", "unknown"))
 
@@ -2290,12 +2384,37 @@ class ActiveInferencePolicyEvaluatorV1:
             edge_status in ("blocked", "ui_blocked", "terminal_failure")
             and action_attempts >= max(2, int(self.coverage_blocked_action_attempt_threshold // 2))
         )
+        low_yield_translation_trap = bool(
+            region_attempts >= int(self.coverage_low_yield_attempt_threshold)
+            and action_moved_rate >= float(self.coverage_low_yield_moved_rate_threshold)
+            and progress_rate <= 0.01
+            and strong_change_rate <= float(self.coverage_low_yield_strong_change_rate_threshold)
+            and palette_delta_mean_norm
+            <= float(self.coverage_low_yield_palette_delta_norm_threshold)
+            and cc_count_change_rate
+            <= float(self.coverage_low_yield_cc_count_change_rate_threshold)
+        )
+        repeated_no_progress_attempt_threshold = int(
+            self.coverage_repetition_no_progress_attempt_threshold
+        )
+        if strong_change_rate >= 0.10 or cc_count_change_rate >= 0.10:
+            repeated_no_progress_attempt_threshold = int(
+                self.coverage_repetition_no_progress_high_info_attempt_threshold
+            )
+        repeated_no_progress_trap = bool(
+            region_attempts >= int(repeated_no_progress_attempt_threshold)
+            and action_moved_rate
+            >= float(self.coverage_repetition_no_progress_moved_rate_threshold)
+            and progress_rate <= 0.01
+        )
         hard_skip = bool(
             hard_blocked_edge
             or hard_blocked_action
             or ui_side_effect_trap
             or terminal_failure_trap
             or edge_declared_blocked
+            or low_yield_translation_trap
+            or repeated_no_progress_trap
         )
 
         evidence_scale = min(
@@ -2330,6 +2449,10 @@ class ActiveInferencePolicyEvaluatorV1:
             reasons.append("terminal_failure_trap")
         if edge_declared_blocked:
             reasons.append("edge_declared_blocked")
+        if low_yield_translation_trap:
+            reasons.append("low_yield_translation_trap")
+        if repeated_no_progress_trap:
+            reasons.append("repeated_no_progress_trap")
 
         return {
             "hard_skip": bool(hard_skip),
@@ -2343,8 +2466,14 @@ class ActiveInferencePolicyEvaluatorV1:
             "region_attempts": int(region_attempts),
             "ui_side_effect_rate": float(ui_side_effect_rate),
             "terminal_failure_rate": float(terminal_failure_rate),
+            "strong_change_rate": float(strong_change_rate),
+            "palette_delta_mean_norm": float(palette_delta_mean_norm),
+            "cc_count_change_rate": float(cc_count_change_rate),
             "progress_rate": float(progress_rate),
             "edge_status": str(edge_status),
+            "repeated_no_progress_attempt_threshold": int(
+                repeated_no_progress_attempt_threshold
+            ),
         }
 
     def _coverage_hard_skip(
@@ -3104,6 +3233,10 @@ class ActiveInferencePolicyEvaluatorV1:
         high_info_focus_probe_candidates: list[dict[str, Any]] = []
         high_info_focus_active_present = False
         high_info_focus_priority_available = False
+        high_info_focus_strong_signal_available = False
+        high_info_focus_strong_signal_target_score = 0.0
+        high_info_focus_strong_signal_remaining_samples = 0
+        high_info_focus_strong_signal_queue_length = 0
         high_info_release_action_counter = int(
             self.high_info_focus_release_action_counter
         )
@@ -3119,6 +3252,26 @@ class ActiveInferencePolicyEvaluatorV1:
             ):
                 continue
             high_info_focus_active_present = True
+            target_score = self._clamp01(float(focus_features.get("target_score", 0.0)))
+            remaining_samples = int(max(0, focus_features.get("remaining_samples", 0)))
+            queue_length = int(max(0, focus_features.get("queue_length", 0)))
+            if target_score >= float(self.high_info_release_min_target_score) and (
+                remaining_samples >= int(self.high_info_release_min_remaining_samples)
+                or queue_length >= int(self.high_info_release_min_queue_length)
+            ):
+                high_info_focus_strong_signal_available = True
+                if (
+                    target_score > float(high_info_focus_strong_signal_target_score)
+                    or (
+                        target_score
+                        >= float(high_info_focus_strong_signal_target_score) - 1.0e-9
+                        and remaining_samples
+                        > int(high_info_focus_strong_signal_remaining_samples)
+                    )
+                ):
+                    high_info_focus_strong_signal_target_score = float(target_score)
+                    high_info_focus_strong_signal_remaining_samples = int(remaining_samples)
+                    high_info_focus_strong_signal_queue_length = int(queue_length)
             if bool(focus_features.get("verify_action_candidate", False)):
                 high_info_focus_priority_available = True
                 break
@@ -3130,7 +3283,10 @@ class ActiveInferencePolicyEvaluatorV1:
                 break
         high_info_after_first_pass_gate_open = bool(
             self.high_info_focus_release_after_first_pass
-            and high_info_focus_priority_available
+            and (
+                high_info_focus_priority_available
+                or high_info_focus_strong_signal_available
+            )
             and int(packet.action_counter) >= int(high_info_release_action_counter)
         )
         fixed_two_pass_suppressed_by_high_info = False
@@ -5210,10 +5366,31 @@ class ActiveInferencePolicyEvaluatorV1:
             "high_info_focus_priority_available": bool(
                 high_info_focus_priority_available
             ),
+            "high_info_focus_strong_signal_available": bool(
+                high_info_focus_strong_signal_available
+            ),
+            "high_info_focus_strong_signal_target_score": float(
+                high_info_focus_strong_signal_target_score
+            ),
+            "high_info_focus_strong_signal_remaining_samples": int(
+                high_info_focus_strong_signal_remaining_samples
+            ),
+            "high_info_focus_strong_signal_queue_length": int(
+                high_info_focus_strong_signal_queue_length
+            ),
             "high_info_after_first_pass_gate_open": bool(
                 high_info_after_first_pass_gate_open
             ),
             "high_info_release_action_counter": int(high_info_release_action_counter),
+            "high_info_release_min_target_score": float(
+                self.high_info_release_min_target_score
+            ),
+            "high_info_release_min_remaining_samples": int(
+                self.high_info_release_min_remaining_samples
+            ),
+            "high_info_release_min_queue_length": int(
+                self.high_info_release_min_queue_length
+            ),
             "fixed_two_pass_suppressed_by_high_info": bool(
                 fixed_two_pass_suppressed_by_high_info
             ),

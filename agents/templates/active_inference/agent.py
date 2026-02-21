@@ -214,7 +214,31 @@ class ActiveInferenceEFE(Agent):
             0,
             _env_int(
                 "ACTIVE_INFERENCE_COVERAGE_PREPASS_STEPS",
-                min(300, int(self.MAX_ACTIONS)),
+                min(220, int(self.MAX_ACTIONS)),
+            ),
+        )
+        self.coverage_prepass_relaxed_completion_ratio = max(
+            0.0,
+            min(
+                1.0,
+                _env_float(
+                    "ACTIVE_INFERENCE_COVERAGE_PREPASS_RELAXED_COMPLETION_RATIO",
+                    0.78,
+                ),
+            ),
+        )
+        self.coverage_prepass_relaxed_min_known_regions = max(
+            4,
+            _env_int("ACTIVE_INFERENCE_COVERAGE_PREPASS_RELAXED_MIN_KNOWN_REGIONS", 16),
+        )
+        self.coverage_prepass_relaxed_start_step_fraction = max(
+            0.0,
+            min(
+                1.0,
+                _env_float(
+                    "ACTIVE_INFERENCE_COVERAGE_PREPASS_RELAXED_START_STEP_FRACTION",
+                    0.55,
+                ),
             ),
         )
         self.coverage_matrix_sweep_enabled = _env_bool(
@@ -232,6 +256,21 @@ class ActiveInferenceEFE(Agent):
         self.high_info_focus_release_action_counter = _env_int(
             "ACTIVE_INFERENCE_HIGH_INFO_RELEASE_ACTION_COUNTER",
             -1,
+        )
+        self.high_info_release_min_target_score = max(
+            0.0,
+            min(
+                1.0,
+                _env_float("ACTIVE_INFERENCE_HIGH_INFO_RELEASE_MIN_TARGET_SCORE", 0.62),
+            ),
+        )
+        self.high_info_release_min_remaining_samples = max(
+            0,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_RELEASE_MIN_REMAINING_SAMPLES", 1),
+        )
+        self.high_info_release_min_queue_length = max(
+            0,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_RELEASE_MIN_QUEUE_LENGTH", 1),
         )
         self.enable_navigation_confidence_gating = _env_bool(
             "ACTIVE_INFERENCE_NAV_CONFIDENCE_GATING_ENABLED",
@@ -404,6 +443,9 @@ class ActiveInferenceEFE(Agent):
             coverage_sweep_target_regions=self.coverage_sweep_target_regions,
             coverage_sweep_min_region_visits=self.coverage_sweep_min_region_visits,
             coverage_prepass_steps=self.coverage_prepass_steps,
+            coverage_prepass_relaxed_completion_ratio=self.coverage_prepass_relaxed_completion_ratio,
+            coverage_prepass_relaxed_min_known_regions=self.coverage_prepass_relaxed_min_known_regions,
+            coverage_prepass_relaxed_start_step_fraction=self.coverage_prepass_relaxed_start_step_fraction,
             coverage_sweep_score_margin=self.coverage_sweep_score_margin,
             coverage_resweep_interval=self.coverage_resweep_interval,
             coverage_resweep_span=self.coverage_resweep_span,
@@ -412,6 +454,9 @@ class ActiveInferenceEFE(Agent):
             coverage_sweep_force_in_exploit=self.coverage_sweep_force_in_exploit,
             high_info_focus_release_after_first_pass=self.high_info_focus_release_after_first_pass,
             high_info_focus_release_action_counter=self.high_info_focus_release_action_counter,
+            high_info_release_min_target_score=self.high_info_release_min_target_score,
+            high_info_release_min_remaining_samples=self.high_info_release_min_remaining_samples,
+            high_info_release_min_queue_length=self.high_info_release_min_queue_length,
             navigation_confidence_gating_enabled=self.enable_navigation_confidence_gating,
             sequence_causal_term_enabled=self.enable_sequence_causal_term,
         )
@@ -3000,6 +3045,8 @@ class ActiveInferenceEFE(Agent):
         }
         min_samples_per_target = int(max(1, self.high_info_min_samples_per_target))
         coupled_min_samples = int(max(min_samples_per_target, self.high_info_coupled_min_samples))
+        coupled_progress_locked = bool(int(current_packet.levels_completed) <= 0)
+        coupled_required_floor = int(max(coupled_min_samples, 5 if coupled_progress_locked else coupled_min_samples))
         high_value_threshold = float(
             max(0.0, min(1.0, float(self.high_info_focus_min_trigger_score)))
         )
@@ -3041,7 +3088,7 @@ class ActiveInferenceEFE(Agent):
         def _required_samples(region_key: str) -> int:
             key = str(region_key)
             if key in coupled_region_keys:
-                return int(coupled_min_samples)
+                return int(coupled_required_floor)
             return int(max(1, target_required_samples.get(key, min_samples_per_target)))
 
         obs_change_type = str(getattr(causal_signature, "obs_change_type", ""))
@@ -3103,7 +3150,13 @@ class ActiveInferenceEFE(Agent):
                 revisit_penalty = float(min(0.18, float(visit_count) / 20.0))
                 score = float(max(0.0, info_score + novelty_bonus - revisit_penalty))
                 if region_key == str(anchor_region_key) and strong_event:
-                    score = float(max(score, 0.62))
+                    anchor_floor = 0.62
+                    if (
+                        int(source_visit_count) >= int(max(4, coupled_min_samples + 1))
+                        and coupled_progress_locked
+                    ):
+                        anchor_floor = 0.48
+                    score = float(max(score, anchor_floor))
                 target_scores_local[region_key] = max(
                     float(target_scores_local.get(region_key, 0.0)),
                     float(score),
