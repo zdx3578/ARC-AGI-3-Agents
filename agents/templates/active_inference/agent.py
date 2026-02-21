@@ -185,6 +185,38 @@ class ActiveInferenceEFE(Agent):
             1,
             _env_int("ACTIVE_INFERENCE_SEQUENCE_PROBE_TRIGGER_STEPS", 20),
         )
+        self.coverage_sweep_target_regions = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_TARGET_REGIONS", 24),
+        )
+        self.coverage_sweep_score_margin = max(
+            0.0,
+            _env_float("ACTIVE_INFERENCE_COVERAGE_SWEEP_SCORE_MARGIN", 0.42),
+        )
+        self.coverage_resweep_interval = max(
+            0,
+            _env_int("ACTIVE_INFERENCE_COVERAGE_RESWEEP_INTERVAL", 96),
+        )
+        self.coverage_resweep_span = max(
+            0,
+            _env_int("ACTIVE_INFERENCE_COVERAGE_RESWEEP_SPAN", 24),
+        )
+        self.coverage_sweep_direction_retry_limit = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_DIRECTION_RETRY_LIMIT", 6),
+        )
+        self.coverage_matrix_sweep_enabled = _env_bool(
+            "ACTIVE_INFERENCE_COVERAGE_MATRIX_SWEEP_ENABLED",
+            False,
+        )
+        self.coverage_sweep_force_in_exploit = _env_bool(
+            "ACTIVE_INFERENCE_COVERAGE_SWEEP_FORCE_IN_EXPLOIT",
+            True,
+        )
+        self.enable_empirical_region_override = _env_bool(
+            "ACTIVE_INFERENCE_ENABLE_EMPIRICAL_REGION_OVERRIDE",
+            False,
+        )
         self.early_probe_budget = max(
             0,
             _env_int(
@@ -280,6 +312,13 @@ class ActiveInferenceEFE(Agent):
             sequence_rollout_direction_weight=self.sequence_rollout_direction_weight,
             sequence_probe_score_margin=self.sequence_probe_score_margin,
             sequence_probe_trigger_steps=self.sequence_probe_trigger_steps,
+            coverage_sweep_target_regions=self.coverage_sweep_target_regions,
+            coverage_sweep_score_margin=self.coverage_sweep_score_margin,
+            coverage_resweep_interval=self.coverage_resweep_interval,
+            coverage_resweep_span=self.coverage_resweep_span,
+            coverage_sweep_direction_retry_limit=self.coverage_sweep_direction_retry_limit,
+            coverage_matrix_sweep_enabled=self.coverage_matrix_sweep_enabled,
+            coverage_sweep_force_in_exploit=self.coverage_sweep_force_in_exploit,
         )
         self.hypothesis_bank = ActiveInferenceHypothesisBankV1()
 
@@ -311,6 +350,7 @@ class ActiveInferenceEFE(Agent):
         self._blocked_edge_counts: dict[str, int] = {}
         self._edge_attempt_counts: dict[str, int] = {}
         self._region_visit_counts: dict[str, int] = {}
+        self._region_action_transition_counts: dict[str, dict[str, int]] = {}
         self._click_bucket_stats: dict[str, dict[str, int]] = {}
         self._click_subcluster_stats: dict[str, dict[str, int]] = {}
         self._state_visit_count: dict[str, int] = {}
@@ -516,6 +556,24 @@ class ActiveInferenceEFE(Agent):
             return str(bucket)
         return "na"
 
+    @staticmethod
+    def _parse_delta_key_v1(delta_key: str) -> tuple[int, int]:
+        dx = 0
+        dy = 0
+        for part in str(delta_key).split("|"):
+            token = str(part).strip()
+            if token.startswith("dx="):
+                try:
+                    dx = int(token.split("=", 1)[1])
+                except Exception:
+                    dx = 0
+            elif token.startswith("dy="):
+                try:
+                    dy = int(token.split("=", 1)[1])
+                except Exception:
+                    dy = 0
+        return (int(dx), int(dy))
+
     def _current_agent_position_xy_v1(
         self,
         representation: RepresentationStateV1,
@@ -587,6 +645,26 @@ class ActiveInferenceEFE(Agent):
                     ),
                 )
             )
+            center_y_bias = float(
+                max(
+                    0.0,
+                    1.0
+                    - (
+                        abs(float(int(obj.centroid_y)) - (0.5 * float(frame_height)))
+                        / max(1.0, 0.5 * float(frame_height))
+                    ),
+                )
+            )
+            center_x_bias = float(
+                max(
+                    0.0,
+                    1.0
+                    - (
+                        abs(float(int(obj.centroid_x)) - (0.5 * float(frame_width)))
+                        / max(1.0, 0.5 * float(frame_width))
+                    ),
+                )
+            )
             interior_bonus = 0.0 if bool(obj.touches_boundary) else 1.0
             cross_like = (
                 1.0
@@ -610,6 +688,33 @@ class ActiveInferenceEFE(Agent):
                 )
                 else 0.0
             )
+            activation_cross_like = (
+                1.0
+                if (
+                    not bool(obj.touches_boundary)
+                    and area <= 24
+                    and bbox_w <= 7
+                    and bbox_h <= 7
+                    and 0.18 <= fill_ratio <= 0.85
+                    and int(obj.centroid_y)
+                    >= int(round(0.30 * float(frame_height)))
+                    and int(obj.centroid_y)
+                    <= int(round(0.74 * float(frame_height)))
+                )
+                else 0.0
+            )
+            ui_band_penalty = (
+                1.0
+                if (
+                    int(obj.centroid_y) <= int(round(0.24 * float(frame_height)))
+                    or int(obj.centroid_y) >= int(round(0.92 * float(frame_height)))
+                    or (
+                        int(obj.centroid_x) <= int(round(0.14 * float(frame_width)))
+                        and int(obj.centroid_y) >= int(round(0.74 * float(frame_height)))
+                    )
+                )
+                else 0.0
+            )
             salience = float(
                 (0.95 * cross_like)
                 + (0.82 * gate_like)
@@ -617,6 +722,13 @@ class ActiveInferenceEFE(Agent):
                 + (0.22 * smallness)
                 + (0.18 * topness)
                 + (0.16 * interior_bonus)
+            )
+            target_priority = float(
+                salience
+                + (0.88 * activation_cross_like)
+                + (0.36 * center_y_bias)
+                + (0.12 * center_x_bias)
+                - (0.48 * ui_band_penalty)
             )
             if salience < 0.35:
                 continue
@@ -644,12 +756,18 @@ class ActiveInferenceEFE(Agent):
                     "fill_ratio": float(fill_ratio),
                     "touches_boundary": bool(obj.touches_boundary),
                     "salience": float(salience),
+                    "target_priority": float(target_priority),
+                    "center_y_bias": float(center_y_bias),
+                    "center_x_bias": float(center_x_bias),
+                    "activation_cross_like": float(activation_cross_like),
+                    "ui_band_penalty": float(ui_band_penalty),
                     "distance_from_agent": int(distance_from_agent),
                 }
             )
 
         targets.sort(
             key=lambda row: (
+                -float(row.get("target_priority", row.get("salience", 0.0))),
                 -float(row.get("salience", 0.0)),
                 int(row.get("distance_from_agent", 10**9)),
                 int(row.get("area", 10**9)),
@@ -728,6 +846,7 @@ class ActiveInferenceEFE(Agent):
                     "digest": str(row.get("digest", "NA")),
                     "kind": str(row.get("kind", "salient")),
                     "salience": float(row.get("salience", 0.0)),
+                    "target_priority": float(row.get("target_priority", 0.0)),
                     "distance_from_agent": int(row.get("distance_from_agent", -1)),
                     "x": int(row.get("centroid_x", -1)),
                     "y": int(row.get("centroid_y", -1)),
@@ -1199,6 +1318,217 @@ class ActiveInferenceEFE(Agent):
             "region_revisit_count_current": int(revisit_count_current),
         }
 
+    def _predicted_region_features_v1(
+        self,
+        *,
+        action_id: int,
+        action_posterior: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "schema_name": "active_inference_predicted_region_features_v1",
+            "schema_version": 1,
+            "enabled": False,
+            "action_id": int(action_id),
+            "current_region": {"x": -1, "y": -1},
+            "predicted_region": {"x": -1, "y": -1},
+            "current_region_key": "NA",
+            "current_region_source": "unknown",
+            "predicted_region_key": "NA",
+            "predicted_region_source": "posterior_expected_delta",
+            "predicted_region_visit_count": 0,
+            "current_region_visit_count": 0,
+            "known_region_count": 0,
+            "region_visit_total": 0,
+            "max_region_visit_count": 0,
+            "empirical_transition_total": 0,
+            "empirical_transition_target_key": "NA",
+            "empirical_transition_target": {"x": -1, "y": -1},
+            "empirical_transition_confidence": 0.0,
+            "empirical_transition_override_applied": False,
+            "empirical_transition_override_enabled": bool(
+                self.enable_empirical_region_override
+            ),
+            "dominant_delta_key": "",
+            "dominant_delta_pos_xy": {"dx": 0, "dy": 0},
+            "expected_delta_pos_xy": {"dx": 0.0, "dy": 0.0},
+            "confidence": 0.0,
+            "edge_attempts": 0,
+            "edge_blocked_rate": 0.0,
+            "edge_key": "NA",
+        }
+        if int(action_id) not in (1, 2, 3, 4):
+            payload["reason"] = "non_navigation_action"
+            return payload
+        current_region: tuple[int, int] | None = None
+        latest_navigation = (
+            self._latest_navigation_state_estimate
+            if isinstance(self._latest_navigation_state_estimate, dict)
+            else {}
+        )
+        latest_region = latest_navigation.get("agent_pos_region", {})
+        if (
+            bool(latest_navigation.get("matched", False))
+            and isinstance(latest_region, dict)
+        ):
+            latest_rx = int(latest_region.get("x", -1))
+            latest_ry = int(latest_region.get("y", -1))
+            if latest_rx >= 0 and latest_ry >= 0:
+                current_region = (int(latest_rx), int(latest_ry))
+                payload["current_region_source"] = "latest_navigation_state"
+        if current_region is None and self._last_known_agent_pos_region is not None:
+            current_region = (
+                int(self._last_known_agent_pos_region[0]),
+                int(self._last_known_agent_pos_region[1]),
+            )
+            payload["current_region_source"] = "last_known_region"
+        if current_region is None:
+            payload["reason"] = "unknown_current_region"
+            return payload
+
+        posterior_raw = action_posterior if isinstance(action_posterior, dict) else {}
+        weights: list[tuple[str, float]] = []
+        total = 0.0
+        for (delta_key, value) in posterior_raw.items():
+            try:
+                p = float(value)
+            except Exception:
+                p = 0.0
+            if p <= 0.0:
+                continue
+            weights.append((str(delta_key), float(p)))
+            total += float(p)
+        if total <= 1.0e-9:
+            payload["reason"] = "no_posterior_mass"
+            return payload
+
+        current_rx, current_ry = current_region
+        payload["current_region"] = {"x": int(current_rx), "y": int(current_ry)}
+        current_region_key = f"{current_rx}:{current_ry}"
+        payload["current_region_key"] = str(current_region_key)
+        payload["current_region_visit_count"] = int(
+            self._region_visit_counts.get(current_region_key, 0)
+        )
+        payload["known_region_count"] = int(len(self._region_visit_counts))
+        payload["region_visit_total"] = int(sum(self._region_visit_counts.values()))
+        payload["max_region_visit_count"] = int(
+            max(self._region_visit_counts.values(), default=0)
+        )
+        empirical_transition_counts = self._region_action_transition_counts.get(
+            f"{current_region_key}|a{int(action_id)}",
+            {},
+        )
+        if isinstance(empirical_transition_counts, dict):
+            empirical_total = int(
+                sum(
+                    int(max(0, count))
+                    for count in empirical_transition_counts.values()
+                )
+            )
+            payload["empirical_transition_total"] = int(empirical_total)
+            if empirical_total > 0:
+                empirical_target_key, empirical_target_count = max(
+                    (
+                        (str(region_key), int(max(0, count)))
+                        for (region_key, count) in empirical_transition_counts.items()
+                    ),
+                    key=lambda item: item[1],
+                )
+                payload["empirical_transition_target_key"] = str(empirical_target_key)
+                confidence = float(
+                    float(empirical_target_count) / float(max(1, empirical_total))
+                )
+                payload["empirical_transition_confidence"] = float(
+                    max(0.0, min(1.0, confidence))
+                )
+                try:
+                    target_rx_raw, target_ry_raw = str(empirical_target_key).split(":", 1)
+                    target_rx = int(target_rx_raw)
+                    target_ry = int(target_ry_raw)
+                except Exception:
+                    target_rx = -1
+                    target_ry = -1
+                payload["empirical_transition_target"] = {
+                    "x": int(target_rx),
+                    "y": int(target_ry),
+                }
+
+        expected_dx = 0.0
+        expected_dy = 0.0
+        dominant_delta_key = ""
+        dominant_prob = -1.0
+        dominant_dx = 0
+        dominant_dy = 0
+        for (delta_key, raw_p) in weights:
+            p = float(raw_p / total)
+            dx, dy = self._parse_delta_key_v1(delta_key)
+            expected_dx += p * float(dx)
+            expected_dy += p * float(dy)
+            if p > dominant_prob:
+                dominant_prob = float(p)
+                dominant_delta_key = str(delta_key)
+                dominant_dx = int(dx)
+                dominant_dy = int(dy)
+
+        center_x = int((current_rx * 8) + 4)
+        center_y = int((current_ry * 8) + 4)
+        predicted_center_x = int(round(float(center_x) + float(expected_dx)))
+        predicted_center_y = int(round(float(center_y) + float(expected_dy)))
+        predicted_rx = int(max(0, min(7, predicted_center_x // 8)))
+        predicted_ry = int(max(0, min(7, predicted_center_y // 8)))
+        empirical_total = int(payload.get("empirical_transition_total", 0))
+        empirical_target = payload.get("empirical_transition_target", {})
+        if not isinstance(empirical_target, dict):
+            empirical_target = {}
+        empirical_target_rx = int(empirical_target.get("x", -1))
+        empirical_target_ry = int(empirical_target.get("y", -1))
+        empirical_confidence = float(
+            payload.get("empirical_transition_confidence", 0.0)
+        )
+        if (
+            bool(self.enable_empirical_region_override)
+            and empirical_total >= 2
+            and empirical_target_rx >= 0
+            and empirical_target_ry >= 0
+        ):
+            predicted_rx = int(max(0, min(7, empirical_target_rx)))
+            predicted_ry = int(max(0, min(7, empirical_target_ry)))
+            payload["predicted_region_source"] = "empirical_transition"
+            payload["empirical_transition_override_applied"] = True
+        elif (
+            empirical_total >= 2
+            and empirical_target_rx >= 0
+            and empirical_target_ry >= 0
+        ):
+            payload["predicted_region_source"] = "posterior_expected_delta"
+        predicted_region_key = f"{predicted_rx}:{predicted_ry}"
+        payload["predicted_region"] = {"x": int(predicted_rx), "y": int(predicted_ry)}
+        payload["predicted_region_key"] = str(predicted_region_key)
+        payload["predicted_region_visit_count"] = int(
+            self._region_visit_counts.get(predicted_region_key, 0)
+        )
+        payload["dominant_delta_key"] = str(dominant_delta_key)
+        payload["dominant_delta_pos_xy"] = {
+            "dx": int(dominant_dx),
+            "dy": int(dominant_dy),
+        }
+        payload["expected_delta_pos_xy"] = {
+            "dx": float(expected_dx),
+            "dy": float(expected_dy),
+        }
+        payload["confidence"] = float(
+            max(0.0, min(1.0, max(float(dominant_prob), float(empirical_confidence))))
+        )
+        edge_key = f"region={current_rx}:{current_ry}|action={int(action_id)}"
+        edge_attempts = int(self._edge_attempt_counts.get(edge_key, 0))
+        edge_blocked = int(self._blocked_edge_counts.get(edge_key, 0))
+        payload["edge_attempts"] = int(edge_attempts)
+        payload["edge_blocked_rate"] = float(
+            float(edge_blocked) / float(max(1, edge_attempts))
+        )
+        payload["edge_key"] = str(edge_key)
+        payload["enabled"] = True
+        return payload
+
     def _transition_exploration_stats_v1(
         self,
         *,
@@ -1243,16 +1573,22 @@ class ActiveInferenceEFE(Agent):
             )
             action_stats["attempts"] = int(action_stats.get("attempts", 0) + 1)
             edge_key = None
+            source_region_key = "NA"
             if self._last_known_agent_pos_region is not None:
                 rx, ry = self._last_known_agent_pos_region
+                source_region_key = f"{rx}:{ry}"
                 edge_key = f"region={rx}:{ry}|action={action_id}"
                 self._edge_attempt_counts[edge_key] = int(
                     self._edge_attempt_counts.get(edge_key, 0) + 1
                 )
-            moved = bool(
-                navigation_state_estimate.get("matched", False)
-                and obs_change_type == "CC_TRANSLATION"
-            )
+            nav_matched = bool(navigation_state_estimate.get("matched", False))
+            nav_delta = navigation_state_estimate.get("delta_pos_xy", {})
+            if not isinstance(nav_delta, dict):
+                nav_delta = {}
+            nav_dx = int(nav_delta.get("dx", 0))
+            nav_dy = int(nav_delta.get("dy", 0))
+            nav_has_motion = bool(nav_matched and (abs(nav_dx) + abs(nav_dy) > 0))
+            moved = bool(nav_has_motion)
             if moved:
                 self._navigation_moved_count += 1
                 action_stats["moved"] = int(action_stats.get("moved", 0) + 1)
@@ -1296,10 +1632,19 @@ class ActiveInferenceEFE(Agent):
                     ry = int(region.get("y", -1))
                     if rx >= 0 and ry >= 0:
                         self._last_known_agent_pos_region = (rx, ry)
-                        region_key = f"{rx}:{ry}"
-                        self._region_visit_counts[region_key] = int(
-                            self._region_visit_counts.get(region_key, 0) + 1
+                        target_region_key = f"{rx}:{ry}"
+                        self._region_visit_counts[target_region_key] = int(
+                            self._region_visit_counts.get(target_region_key, 0) + 1
                         )
+                        if source_region_key != "NA":
+                            region_action_key = f"{source_region_key}|a{action_id}"
+                            target_histogram = self._region_action_transition_counts.setdefault(
+                                region_action_key,
+                                {},
+                            )
+                            target_histogram[target_region_key] = int(
+                                target_histogram.get(target_region_key, 0) + 1
+                            )
             else:
                 self._navigation_blocked_count += 1
                 action_stats["blocked"] = int(action_stats.get("blocked", 0) + 1)
@@ -1371,6 +1716,17 @@ class ActiveInferenceEFE(Agent):
                 "blocked_rate": float(blocked / float(max(1, attempts))),
                 "moved_rate": float(moved / float(max(1, attempts))),
             }
+        region_action_transition_flat: list[tuple[str, int]] = []
+        for region_action_key, target_histogram in self._region_action_transition_counts.items():
+            if not isinstance(target_histogram, dict):
+                continue
+            for target_region_key, count in target_histogram.items():
+                transition_count = int(max(0, count))
+                if transition_count <= 0:
+                    continue
+                region_action_transition_flat.append(
+                    (f"{region_action_key}|to={target_region_key}", transition_count)
+                )
         return {
             "schema_name": "active_inference_operability_diagnostics_v1",
             "schema_version": 1,
@@ -1392,6 +1748,13 @@ class ActiveInferenceEFE(Agent):
                     self._region_visit_counts.items(),
                     key=lambda item: (-int(item[1]), item[0]),
                 )
+            },
+            "region_action_transition_histogram": {
+                str(key): int(value)
+                for (key, value) in sorted(
+                    region_action_transition_flat,
+                    key=lambda item: (-int(item[1]), item[0]),
+                )[:128]
             },
             "click_bucket_effectiveness": click_summary,
             "click_subcluster_effectiveness": click_subcluster_summary,
@@ -2047,8 +2410,9 @@ class ActiveInferenceEFE(Agent):
                         )
                         for candidate in candidates:
                             action_key = str(int(candidate.action_id))
+                            action_posterior = dict(control_schema.get(action_key, {}))
                             candidate.metadata["control_schema_observed_posterior"] = dict(
-                                control_schema.get(action_key, {})
+                                action_posterior
                             )
                             candidate.metadata["candidate_cluster_id"] = self._candidate_cluster_id(
                                 candidate
@@ -2065,6 +2429,12 @@ class ActiveInferenceEFE(Agent):
                             if int(candidate.action_id) in (1, 2, 3, 4):
                                 candidate.metadata["blocked_edge_observed_stats"] = (
                                     self._navigation_candidate_stats(int(candidate.action_id))
+                                )
+                                candidate.metadata["predicted_region_features_v1"] = (
+                                    self._predicted_region_features_v1(
+                                        action_id=int(candidate.action_id),
+                                        action_posterior=action_posterior,
+                                    )
                                 )
                                 target_payload = dict(navigation_target_features)
                                 target_payload["candidate_action_id"] = int(candidate.action_id)
