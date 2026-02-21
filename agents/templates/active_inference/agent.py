@@ -203,11 +203,22 @@ class ActiveInferenceEFE(Agent):
         )
         self.coverage_sweep_direction_retry_limit = max(
             1,
-            _env_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_DIRECTION_RETRY_LIMIT", 6),
+            _env_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_DIRECTION_RETRY_LIMIT", 8),
+        )
+        self.coverage_sweep_min_region_visits = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_MIN_REGION_VISITS", 2),
+        )
+        self.coverage_prepass_steps = max(
+            0,
+            _env_int(
+                "ACTIVE_INFERENCE_COVERAGE_PREPASS_STEPS",
+                min(192, int(self.MAX_ACTIONS)),
+            ),
         )
         self.coverage_matrix_sweep_enabled = _env_bool(
             "ACTIVE_INFERENCE_COVERAGE_MATRIX_SWEEP_ENABLED",
-            False,
+            True,
         )
         self.coverage_sweep_force_in_exploit = _env_bool(
             "ACTIVE_INFERENCE_COVERAGE_SWEEP_FORCE_IN_EXPLOIT",
@@ -215,7 +226,7 @@ class ActiveInferenceEFE(Agent):
         )
         self.enable_empirical_region_override = _env_bool(
             "ACTIVE_INFERENCE_ENABLE_EMPIRICAL_REGION_OVERRIDE",
-            False,
+            True,
         )
         self.early_probe_budget = max(
             0,
@@ -313,6 +324,8 @@ class ActiveInferenceEFE(Agent):
             sequence_probe_score_margin=self.sequence_probe_score_margin,
             sequence_probe_trigger_steps=self.sequence_probe_trigger_steps,
             coverage_sweep_target_regions=self.coverage_sweep_target_regions,
+            coverage_sweep_min_region_visits=self.coverage_sweep_min_region_visits,
+            coverage_prepass_steps=self.coverage_prepass_steps,
             coverage_sweep_score_margin=self.coverage_sweep_score_margin,
             coverage_resweep_interval=self.coverage_resweep_interval,
             coverage_resweep_span=self.coverage_resweep_span,
@@ -1338,6 +1351,8 @@ class ActiveInferenceEFE(Agent):
             "predicted_region_visit_count": 0,
             "current_region_visit_count": 0,
             "known_region_count": 0,
+            "min_region_visit_count": 0,
+            "regions_visited_at_least_twice": 0,
             "region_visit_total": 0,
             "max_region_visit_count": 0,
             "empirical_transition_total": 0,
@@ -1348,6 +1363,10 @@ class ActiveInferenceEFE(Agent):
             "empirical_transition_override_enabled": bool(
                 self.enable_empirical_region_override
             ),
+            "empirical_transition_frontier_key": "NA",
+            "empirical_transition_frontier": {"x": -1, "y": -1},
+            "empirical_transition_frontier_visit_count": 0,
+            "empirical_transition_frontier_confidence": 0.0,
             "dominant_delta_key": "",
             "dominant_delta_pos_xy": {"dx": 0, "dy": 0},
             "expected_delta_pos_xy": {"dx": 0.0, "dy": 0.0},
@@ -1409,6 +1428,12 @@ class ActiveInferenceEFE(Agent):
             self._region_visit_counts.get(current_region_key, 0)
         )
         payload["known_region_count"] = int(len(self._region_visit_counts))
+        payload["min_region_visit_count"] = int(
+            min(self._region_visit_counts.values(), default=0)
+        )
+        payload["regions_visited_at_least_twice"] = int(
+            sum(1 for count in self._region_visit_counts.values() if int(count) >= 2)
+        )
         payload["region_visit_total"] = int(sum(self._region_visit_counts.values()))
         payload["max_region_visit_count"] = int(
             max(self._region_visit_counts.values(), default=0)
@@ -1451,6 +1476,44 @@ class ActiveInferenceEFE(Agent):
                     "x": int(target_rx),
                     "y": int(target_ry),
                 }
+                frontier_key = "NA"
+                frontier_count = 0
+                frontier_visit = 10**9
+                for (candidate_region_key, candidate_count_raw) in empirical_transition_counts.items():
+                    candidate_count = int(max(0, candidate_count_raw))
+                    if candidate_count <= 0:
+                        continue
+                    candidate_key = str(candidate_region_key)
+                    candidate_visit = int(self._region_visit_counts.get(candidate_key, 0))
+                    if (
+                        candidate_visit < frontier_visit
+                        or (
+                            candidate_visit == frontier_visit
+                            and candidate_count > frontier_count
+                        )
+                    ):
+                        frontier_key = str(candidate_key)
+                        frontier_count = int(candidate_count)
+                        frontier_visit = int(candidate_visit)
+                if frontier_key != "NA":
+                    try:
+                        frontier_rx_raw, frontier_ry_raw = str(frontier_key).split(":", 1)
+                        frontier_rx = int(frontier_rx_raw)
+                        frontier_ry = int(frontier_ry_raw)
+                    except Exception:
+                        frontier_rx = -1
+                        frontier_ry = -1
+                    payload["empirical_transition_frontier_key"] = str(frontier_key)
+                    payload["empirical_transition_frontier"] = {
+                        "x": int(frontier_rx),
+                        "y": int(frontier_ry),
+                    }
+                    payload["empirical_transition_frontier_visit_count"] = int(
+                        max(0, frontier_visit if frontier_visit < 10**9 else 0)
+                    )
+                    payload["empirical_transition_frontier_confidence"] = float(
+                        float(frontier_count) / float(max(1, empirical_total))
+                    )
 
         expected_dx = 0.0
         expected_dy = 0.0
@@ -1804,6 +1867,13 @@ class ActiveInferenceEFE(Agent):
 
         best_pair: tuple[Any, Any] | None = None
         best_score = 10**9
+        action_id = int(executed_candidate.action_id)
+        expected_dir = {
+            1: (0, -1),  # up
+            2: (0, 1),   # down
+            3: (-1, 0),  # left
+            4: (1, 0),   # right
+        }.get(action_id)
         for previous in previous_nodes:
             for current in current_nodes:
                 if int(previous.color) != int(current.color):
@@ -1816,10 +1886,32 @@ class ActiveInferenceEFE(Agent):
                 shift = abs(delta_x) + abs(delta_y)
                 if shift <= 0:
                     continue
-                score = (area_gap * 10) + shift
+
+                # Navigation moves are one-tile translations; prefer displacements
+                # that are close to one-step and aligned with the commanded direction.
+                shift_error = abs(int(shift) - 5)
+                if shift < 2:
+                    shift_error += 6
+                direction_penalty = 0
+                if expected_dir is not None:
+                    expected_dx_sign, expected_dy_sign = expected_dir
+                    if expected_dx_sign < 0 and delta_x >= 0:
+                        direction_penalty += 30
+                    elif expected_dx_sign > 0 and delta_x <= 0:
+                        direction_penalty += 30
+                    if expected_dy_sign < 0 and delta_y >= 0:
+                        direction_penalty += 30
+                    elif expected_dy_sign > 0 and delta_y <= 0:
+                        direction_penalty += 30
+                    if expected_dx_sign != 0 and abs(delta_y) > abs(delta_x):
+                        direction_penalty += 12
+                    if expected_dy_sign != 0 and abs(delta_x) > abs(delta_y):
+                        direction_penalty += 12
+
+                score = (area_gap * 10) + (shift_error * 6) + direction_penalty
                 if self._tracked_agent_token_digest is not None:
                     if str(previous.digest) != self._tracked_agent_token_digest:
-                        score += 5
+                        score += 8
                 if score < best_score:
                     best_score = score
                     best_pair = (previous, current)

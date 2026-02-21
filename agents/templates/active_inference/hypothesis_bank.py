@@ -731,10 +731,12 @@ def _predicted_delta_bucket(action_id: int, parameter_id: str) -> str:
         return "dir_unknown"
     if action == 7:
         return "stay"
-    if parameter_id == "axis_shift":
-        mapping = {1: "dir_l", 2: "dir_r", 3: "dir_u", 4: "dir_d"}
-    else:
-        mapping = {1: "dir_u", 2: "dir_d", 3: "dir_l", 4: "dir_r"}
+    # Navigation controls in ARC-AGI-3 are globally fixed:
+    # 1=up, 2=down, 3=left, 4=right.
+    # Keep hypothesis parameters for other behavior factors, but do not rotate
+    # movement semantics per-parameter.
+    _ = parameter_id
+    mapping = {1: "dir_u", 2: "dir_d", 3: "dir_l", 4: "dir_r"}
     return str(mapping.get(action, "dir_unknown"))
 
 
@@ -800,14 +802,13 @@ def _predict_distribution_for_hypothesis(
         max(0.0, min(1.0, float(features.get("observed_delta_confidence", 0.0))))
     )
     predicted_delta_bucket = _predicted_delta_bucket(action_id, parameter_id)
-    if observed_delta_bucket != "dir_unknown":
+    if observed_delta_bucket in ("dir_l", "dir_r", "dir_u", "dir_d"):
         blend = 0.20 + (0.60 * observed_delta_confidence)
-        if parameter_id == "axis_shift":
-            predicted_delta_bucket = (
-                observed_delta_bucket
-                if blend >= 0.35
-                else predicted_delta_bucket
-            )
+        predicted_delta_bucket = (
+            observed_delta_bucket
+            if blend >= 0.35
+            else predicted_delta_bucket
+        )
 
     distribution: dict[str, float] = {
         _signature_key_for_features(

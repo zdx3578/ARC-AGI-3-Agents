@@ -46,11 +46,13 @@ class ActiveInferencePolicyEvaluatorV1:
         sequence_probe_score_margin: float = 0.28,
         sequence_probe_trigger_steps: int = 20,
         coverage_sweep_target_regions: int = 24,
+        coverage_sweep_min_region_visits: int = 2,
+        coverage_prepass_steps: int = 192,
         coverage_sweep_score_margin: float = 0.42,
         coverage_resweep_interval: int = 96,
         coverage_resweep_span: int = 24,
-        coverage_sweep_direction_retry_limit: int = 6,
-        coverage_matrix_sweep_enabled: bool = False,
+        coverage_sweep_direction_retry_limit: int = 8,
+        coverage_matrix_sweep_enabled: bool = True,
         coverage_sweep_force_in_exploit: bool = True,
         hierarchy_weight_overrides: dict[str, dict[str, float]] | None = None,
     ) -> None:
@@ -92,6 +94,8 @@ class ActiveInferencePolicyEvaluatorV1:
         self.sequence_probe_score_margin = float(max(0.0, sequence_probe_score_margin))
         self.sequence_probe_trigger_steps = int(max(1, sequence_probe_trigger_steps))
         self.coverage_sweep_target_regions = int(max(1, coverage_sweep_target_regions))
+        self.coverage_sweep_min_region_visits = int(max(1, coverage_sweep_min_region_visits))
+        self.coverage_prepass_steps = int(max(0, coverage_prepass_steps))
         self.coverage_sweep_score_margin = float(max(0.0, coverage_sweep_score_margin))
         self.coverage_resweep_interval = int(max(0, coverage_resweep_interval))
         self.coverage_resweep_span = int(max(0, coverage_resweep_span))
@@ -119,6 +123,16 @@ class ActiveInferencePolicyEvaluatorV1:
             "dir_d": "dir_u",
         }
         return str(mapping.get(str(direction_bucket), "dir_unknown"))
+
+    @staticmethod
+    def _navigation_action_direction(action_id: int) -> str:
+        mapping = {
+            1: "dir_u",
+            2: "dir_d",
+            3: "dir_l",
+            4: "dir_r",
+        }
+        return str(mapping.get(int(action_id), "na"))
 
     def _hierarchy_weights_for_phase(self, phase: str) -> dict[str, float]:
         # Layerwise EFE shaping terms:
@@ -874,6 +888,10 @@ class ActiveInferencePolicyEvaluatorV1:
                 max(0, raw.get("current_region_visit_count", 0))
             ),
             "known_region_count": int(max(0, raw.get("known_region_count", 0))),
+            "min_region_visit_count": int(max(0, raw.get("min_region_visit_count", 0))),
+            "regions_visited_at_least_twice": int(
+                max(0, raw.get("regions_visited_at_least_twice", 0))
+            ),
             "region_visit_total": int(max(0, raw.get("region_visit_total", 0))),
             "max_region_visit_count": int(max(0, raw.get("max_region_visit_count", 0))),
             "empirical_transition_total": int(
@@ -887,6 +905,15 @@ class ActiveInferencePolicyEvaluatorV1:
             ),
             "empirical_transition_override_applied": bool(
                 raw.get("empirical_transition_override_applied", False)
+            ),
+            "empirical_transition_frontier_key": str(
+                raw.get("empirical_transition_frontier_key", "NA")
+            ),
+            "empirical_transition_frontier_visit_count": int(
+                max(0, raw.get("empirical_transition_frontier_visit_count", 0))
+            ),
+            "empirical_transition_frontier_confidence": self._clamp01(
+                float(raw.get("empirical_transition_frontier_confidence", 0.0))
             ),
             "predicted_region_x": int(predicted_region.get("x", -1)),
             "predicted_region_y": int(predicted_region.get("y", -1)),
@@ -963,6 +990,15 @@ class ActiveInferencePolicyEvaluatorV1:
         if float(mass) <= 0.0:
             return "na"
         return str(direction)
+
+    def _entry_navigation_direction(self, entry: FreeEnergyLedgerEntryV1) -> str:
+        canonical = self._navigation_action_direction(int(entry.candidate.action_id))
+        if canonical in ("dir_l", "dir_r", "dir_u", "dir_d"):
+            return canonical
+        predicted = self._dominant_predicted_direction(entry)
+        if predicted in ("dir_l", "dir_r", "dir_u", "dir_d"):
+            return predicted
+        return "na"
 
     def _last_valid_direction(self, recent_navigation_directions: list[str] | None) -> str:
         if not recent_navigation_directions:
@@ -1288,7 +1324,7 @@ class ActiveInferencePolicyEvaluatorV1:
         if self.rollout_horizon < 2:
             for entry in entries:
                 frontier_cost = self._candidate_frontier_graph_cost(entry.candidate)
-                current_direction = self._dominant_predicted_direction(entry)
+                current_direction = self._entry_navigation_direction(entry)
                 current_sequence_key = ""
                 current_sequence_count = 0
                 if (
@@ -1324,7 +1360,7 @@ class ActiveInferencePolicyEvaluatorV1:
 
         for entry in entries:
             current_frontier_cost = self._candidate_frontier_graph_cost(entry.candidate)
-            current_direction = self._dominant_predicted_direction(entry)
+            current_direction = self._entry_navigation_direction(entry)
             current_sequence_key = ""
             current_sequence_count = 0
             if (
@@ -1369,7 +1405,7 @@ class ActiveInferencePolicyEvaluatorV1:
                             future_frontier_cost = self._candidate_frontier_graph_cost(
                                 future_entry.candidate
                             )
-                            future_direction = self._dominant_predicted_direction(future_entry)
+                            future_direction = self._entry_navigation_direction(future_entry)
                             sequence_pair_cost = 0.0
                             if (
                                 current_direction in ("dir_l", "dir_r", "dir_u", "dir_d")
@@ -1583,8 +1619,11 @@ class ActiveInferencePolicyEvaluatorV1:
         coverage_sweep_active = False
         coverage_sweep_reason = "inactive"
         coverage_known_region_count = 0
+        coverage_min_region_visit_count = 0
+        coverage_regions_visited_at_least_twice = 0
         coverage_target_region_count = int(self.coverage_sweep_target_regions)
         coverage_periodic_resweep_active = False
+        coverage_hard_prepass_active = False
         coverage_score_margin_used = 0.0
         coverage_sweep_pattern = "disabled"
         coverage_sweep_target_region = {"x": -1, "y": -1}
@@ -1719,8 +1758,40 @@ class ActiveInferencePolicyEvaluatorV1:
                         default=0,
                     )
                 )
-                coverage_goal_unmet = bool(
+                coverage_min_region_visit_count = int(
+                    min(
+                        (
+                            int(stats.get("min_region_visit_count", 0))
+                            for stats in predicted_stats_by_candidate_id.values()
+                        ),
+                        default=0,
+                    )
+                )
+                coverage_regions_visited_at_least_twice = int(
+                    max(
+                        (
+                            int(stats.get("regions_visited_at_least_twice", 0))
+                            for stats in predicted_stats_by_candidate_id.values()
+                        ),
+                        default=0,
+                    )
+                )
+                coverage_region_goal_unmet = bool(
                     coverage_known_region_count < int(self.coverage_sweep_target_regions)
+                )
+                coverage_revisit_goal_unmet = bool(
+                    int(self.coverage_sweep_min_region_visits) > 1
+                    and coverage_known_region_count > 0
+                    and coverage_regions_visited_at_least_twice < coverage_known_region_count
+                    and coverage_min_region_visit_count
+                    < int(self.coverage_sweep_min_region_visits)
+                )
+                coverage_goal_unmet = bool(
+                    coverage_region_goal_unmet or coverage_revisit_goal_unmet
+                )
+                coverage_hard_prepass_active = bool(
+                    coverage_goal_unmet
+                    and int(packet.action_counter) < int(self.coverage_prepass_steps)
                 )
                 periodic_window_active = False
                 if (
@@ -1741,16 +1812,21 @@ class ActiveInferencePolicyEvaluatorV1:
                     )
                 coverage_periodic_resweep_active = bool(periodic_window_active)
                 coverage_sweep_active = bool(coverage_goal_unmet or periodic_window_active)
-                if coverage_goal_unmet:
-                    coverage_sweep_reason = "goal_unmet"
+                if coverage_region_goal_unmet:
+                    coverage_sweep_reason = "region_goal_unmet"
+                elif coverage_revisit_goal_unmet:
+                    coverage_sweep_reason = "min_visit_goal_unmet"
                 elif periodic_window_active:
                     coverage_sweep_reason = "periodic_resweep"
                 else:
                     coverage_sweep_reason = "goal_reached"
+                if coverage_hard_prepass_active:
+                    coverage_sweep_reason = f"{coverage_sweep_reason}|hard_prepass"
                 if coverage_sweep_active:
                     target_rx = -1
                     target_ry = -1
                     target_direction = "na"
+                    current_region_visit_reference = 0
                     if self.coverage_matrix_sweep_enabled:
                         coverage_sweep_pattern = "row_serpentine_up"
                         sample_stats = predicted_stats_by_candidate_id.get(
@@ -1759,6 +1835,9 @@ class ActiveInferencePolicyEvaluatorV1:
                         )
                         current_rx = int(sample_stats.get("current_region_x", -1))
                         current_ry = int(sample_stats.get("current_region_y", -1))
+                        current_region_visit_reference = int(
+                            max(0, sample_stats.get("current_region_visit_count", 0))
+                        )
                         if current_rx >= 0 and current_ry >= 0:
                             target_rx = int(current_rx)
                             target_ry = int(current_ry)
@@ -1770,6 +1849,9 @@ class ActiveInferencePolicyEvaluatorV1:
                                 elif current_ry > 0:
                                     target_ry = int(current_ry - 1)
                                     target_direction = "dir_u"
+                                elif current_ry < 7:
+                                    target_ry = int(current_ry + 1)
+                                    target_direction = "dir_d"
                             else:
                                 if current_rx < 7:
                                     target_rx = int(current_rx + 1)
@@ -1777,6 +1859,9 @@ class ActiveInferencePolicyEvaluatorV1:
                                 elif current_ry > 0:
                                     target_ry = int(current_ry - 1)
                                     target_direction = "dir_u"
+                                elif current_ry < 7:
+                                    target_ry = int(current_ry + 1)
+                                    target_direction = "dir_d"
                     coverage_sweep_target_region = {
                         "x": int(target_rx),
                         "y": int(target_ry),
@@ -1791,28 +1876,57 @@ class ActiveInferencePolicyEvaluatorV1:
                         )
                         for entry in navigation_entries
                     )
-                    coverage_margin = float(
-                        max(
-                            self.coverage_sweep_score_margin,
-                            self.stagnation_probe_score_margin,
+                    coverage_margin = 0.0
+                    if not coverage_hard_prepass_active:
+                        coverage_margin = float(
+                            max(
+                                self.coverage_sweep_score_margin,
+                                self.stagnation_probe_score_margin,
+                            )
                         )
-                    )
                     coverage_score_margin_used = float(coverage_margin)
-                    coverage_pool = [
-                        entry
-                        for entry in navigation_entries
-                        if (
-                            float(
-                                selection_score_by_candidate.get(
-                                    entry.candidate.candidate_id,
-                                    entry.total_efe,
+                    def _coverage_frontier_visit(entry: FreeEnergyLedgerEntryV1) -> int:
+                        stats = predicted_stats_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            {},
+                        )
+                        frontier_key = str(
+                            stats.get("empirical_transition_frontier_key", "NA")
+                        )
+                        if frontier_key != "NA":
+                            return int(
+                                max(
+                                    0,
+                                    stats.get(
+                                        "empirical_transition_frontier_visit_count",
+                                        0,
+                                    ),
                                 )
                             )
-                            - best_navigation_score
-                        )
-                        <= coverage_margin
-                    ]
-                    if len(coverage_pool) < 2:
+                        return int(max(0, stats.get("predicted_region_visit_count", 0)))
+
+                    high_revisit_escape_required = bool(
+                        int(current_region_visit_reference)
+                        >= int(self.region_revisit_hard_threshold)
+                    )
+                    if coverage_hard_prepass_active:
+                        coverage_pool = list(navigation_entries)
+                    else:
+                        coverage_pool = [
+                            entry
+                            for entry in navigation_entries
+                            if (
+                                float(
+                                    selection_score_by_candidate.get(
+                                        entry.candidate.candidate_id,
+                                        entry.total_efe,
+                                    )
+                                )
+                                - best_navigation_score
+                            )
+                            <= coverage_margin
+                        ]
+                    if not coverage_hard_prepass_active and len(coverage_pool) < 2:
                         coverage_pool = sorted(
                             navigation_entries,
                             key=lambda entry: (
@@ -1826,150 +1940,305 @@ class ActiveInferencePolicyEvaluatorV1:
                                 str(entry.candidate.candidate_id),
                             ),
                         )[: min(4, len(navigation_entries))]
-                    if coverage_pool:
-                        coverage_pool.sort(
-                            key=lambda entry: (
-                                0
-                                if (
-                                    str(
-                                        predicted_stats_by_candidate_id.get(
-                                            str(entry.candidate.candidate_id),
-                                            {},
-                                        ).get("predicted_region_key", "NA")
-                                    )
-                                    != str(
-                                        predicted_stats_by_candidate_id.get(
-                                            str(entry.candidate.candidate_id),
-                                            {},
-                                        ).get("current_region_key", "NA")
-                                    )
-                                    and str(
-                                        predicted_stats_by_candidate_id.get(
-                                            str(entry.candidate.candidate_id),
-                                            {},
-                                        ).get("predicted_region_key", "NA")
-                                    )
-                                    != "NA"
+                    if (
+                        not coverage_hard_prepass_active
+                        and
+                        self.coverage_matrix_sweep_enabled
+                        and str(coverage_sweep_target_direction)
+                        in ("dir_l", "dir_r", "dir_u", "dir_d")
+                    ):
+                        directed_pool = [
+                            entry
+                            for entry in navigation_entries
+                            if (
+                                self._navigation_action_direction(int(entry.candidate.action_id))
+                                == str(coverage_sweep_target_direction)
+                                and int(
+                                    predicted_stats_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        {},
+                                    ).get("edge_attempts", 0)
                                 )
-                                else 1,
-                                0
-                                if (
-                                    str(coverage_sweep_target_direction)
-                                    in ("dir_l", "dir_r", "dir_u", "dir_d")
-                                    and self._dominant_predicted_direction(entry)
-                                    == str(coverage_sweep_target_direction)
-                                    and int(
+                                < int(self.coverage_sweep_direction_retry_limit)
+                            )
+                        ]
+                        if high_revisit_escape_required:
+                            directed_pool = [
+                                entry
+                                for entry in directed_pool
+                                if _coverage_frontier_visit(entry)
+                                < int(current_region_visit_reference)
+                            ]
+                        if directed_pool:
+                            coverage_pool = list(directed_pool)
+                            coverage_sweep_reason = (
+                                f"{coverage_sweep_reason}|matrix_direction_forced"
+                            )
+                        else:
+                            escaped_pool = sorted(
+                                navigation_entries,
+                                key=lambda entry: (
+                                    _coverage_frontier_visit(entry),
+                                    -float(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get(
+                                            "empirical_transition_frontier_confidence",
+                                            0.0,
+                                        )
+                                    ),
+                                    int(
                                         predicted_stats_by_candidate_id.get(
                                             str(entry.candidate.candidate_id),
                                             {},
                                         ).get("edge_attempts", 0)
-                                    )
-                                    < int(self.coverage_sweep_direction_retry_limit)
+                                    ),
+                                    float(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("edge_blocked_rate", 0.0)
+                                    ),
+                                    int(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("predicted_region_visit_count", 10**6)
+                                    ),
+                                    float(
+                                        selection_score_by_candidate.get(
+                                            entry.candidate.candidate_id,
+                                            entry.total_efe,
+                                        )
+                                    ),
+                                    int(entry.candidate.action_id),
+                                    str(entry.candidate.candidate_id),
+                                ),
+                            )
+                            if escaped_pool:
+                                escape_direction = self._navigation_action_direction(
+                                    int(escaped_pool[0].candidate.action_id)
                                 )
-                                else 1,
-                                int(
-                                    (
-                                        abs(
-                                            int(
+                                if escape_direction in ("dir_l", "dir_r", "dir_u", "dir_d"):
+                                    coverage_sweep_target_direction = str(escape_direction)
+                                    coverage_sweep_reason = (
+                                        f"{coverage_sweep_reason}|target_retry_exceeded_escape"
+                                    )
+                                coverage_pool = list(escaped_pool[: max(2, min(6, len(escaped_pool)))])
+                    if (
+                        not coverage_hard_prepass_active
+                        and
+                        self.coverage_matrix_sweep_enabled
+                        and str(coverage_sweep_target_direction)
+                        in ("dir_l", "dir_r", "dir_u", "dir_d")
+                        and coverage_pool
+                    ):
+                        filtered_pool = [
+                            entry
+                            for entry in coverage_pool
+                            if not (
+                                self._navigation_action_direction(
+                                    int(entry.candidate.action_id)
+                                )
+                                == str(coverage_sweep_target_direction)
+                                and int(
+                                    predicted_stats_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        {},
+                                    ).get("edge_attempts", 0)
+                                )
+                                >= int(self.coverage_sweep_direction_retry_limit)
+                                and float(
+                                    predicted_stats_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        {},
+                                    ).get("edge_blocked_rate", 0.0)
+                                )
+                                >= 0.5
+                            )
+                        ]
+                        if filtered_pool:
+                            coverage_pool = filtered_pool
+                    if coverage_pool:
+                        if coverage_hard_prepass_active:
+                            coverage_pool.sort(
+                                key=lambda entry: (
+                                    int(_coverage_frontier_visit(entry)),
+                                    int(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                        {},
+                                    ).get("predicted_region_visit_count", 10**6)
+                                    ),
+                                    int(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("edge_attempts", 10**6)
+                                    ),
+                                    float(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("edge_blocked_rate", 1.0)
+                                    ),
+                                    int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                                    int(entry.candidate.action_id),
+                                    str(entry.candidate.candidate_id),
+                                )
+                            )
+                        else:
+                            coverage_pool.sort(
+                                key=lambda entry: (
+                                    0
+                                    if (
+                                        str(
+                                            predicted_stats_by_candidate_id.get(
+                                                str(entry.candidate.candidate_id),
+                                                {},
+                                            ).get("predicted_region_key", "NA")
+                                        )
+                                        != str(
+                                            predicted_stats_by_candidate_id.get(
+                                                str(entry.candidate.candidate_id),
+                                                {},
+                                            ).get("current_region_key", "NA")
+                                        )
+                                        and str(
+                                            predicted_stats_by_candidate_id.get(
+                                                str(entry.candidate.candidate_id),
+                                                {},
+                                            ).get("predicted_region_key", "NA")
+                                        )
+                                        != "NA"
+                                    )
+                                    else 1,
+                                    0
+                                    if (
+                                        str(coverage_sweep_target_direction)
+                                        in ("dir_l", "dir_r", "dir_u", "dir_d")
+                                        and self._entry_navigation_direction(entry)
+                                        == str(coverage_sweep_target_direction)
+                                        and int(
+                                            predicted_stats_by_candidate_id.get(
+                                                str(entry.candidate.candidate_id),
+                                                {},
+                                            ).get("edge_attempts", 0)
+                                        )
+                                        < int(self.coverage_sweep_direction_retry_limit)
+                                    )
+                                    else 1,
+                                    int(_coverage_frontier_visit(entry)),
+                                    -float(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("empirical_transition_frontier_confidence", 0.0)
+                                    ),
+                                    int(
+                                        (
+                                            abs(
+                                                int(
+                                                    predicted_stats_by_candidate_id.get(
+                                                        str(entry.candidate.candidate_id),
+                                                        {},
+                                                    ).get("predicted_region_x", -1)
+                                                )
+                                                - int(target_rx)
+                                            )
+                                            + abs(
+                                                int(
+                                                    predicted_stats_by_candidate_id.get(
+                                                        str(entry.candidate.candidate_id),
+                                                        {},
+                                                    ).get("predicted_region_y", -1)
+                                                )
+                                                - int(target_ry)
+                                            )
+                                        )
+                                        if (
+                                            int(target_rx) >= 0
+                                            and int(target_ry) >= 0
+                                            and int(
                                                 predicted_stats_by_candidate_id.get(
                                                     str(entry.candidate.candidate_id),
                                                     {},
                                                 ).get("predicted_region_x", -1)
                                             )
-                                            - int(target_rx)
-                                        )
-                                        + abs(
-                                            int(
+                                            >= 0
+                                            and int(
                                                 predicted_stats_by_candidate_id.get(
                                                     str(entry.candidate.candidate_id),
                                                     {},
                                                 ).get("predicted_region_y", -1)
                                             )
-                                            - int(target_ry)
+                                            >= 0
                                         )
+                                        else 10**6
+                                    ),
+                                    int(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("predicted_region_visit_count", 10**6)
+                                    ),
+                                    int(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("current_region_visit_count", 10**6)
+                                    ),
+                                    0
+                                    if str(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("predicted_region_source", "")
                                     )
-                                    if (
-                                        int(target_rx) >= 0
-                                        and int(target_ry) >= 0
-                                        and int(
-                                            predicted_stats_by_candidate_id.get(
-                                                str(entry.candidate.candidate_id),
-                                                {},
-                                            ).get("predicted_region_x", -1)
+                                    == "empirical_transition"
+                                    else 1,
+                                    -float(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("empirical_transition_confidence", 0.0)
+                                    ),
+                                    -int(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("empirical_transition_total", 0)
+                                    ),
+                                    int(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("edge_attempts", 10**6)
+                                    ),
+                                    float(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("edge_blocked_rate", 1.0)
+                                    ),
+                                    -float(
+                                        predicted_stats_by_candidate_id.get(
+                                            str(entry.candidate.candidate_id),
+                                            {},
+                                        ).get("confidence", 0.0)
+                                    ),
+                                    int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                                    float(
+                                        selection_score_by_candidate.get(
+                                            entry.candidate.candidate_id,
+                                            entry.total_efe,
                                         )
-                                        >= 0
-                                        and int(
-                                            predicted_stats_by_candidate_id.get(
-                                                str(entry.candidate.candidate_id),
-                                                {},
-                                            ).get("predicted_region_y", -1)
-                                        )
-                                        >= 0
-                                    )
-                                    else 10**6
-                                ),
-                                int(
-                                    predicted_stats_by_candidate_id.get(
-                                        str(entry.candidate.candidate_id),
-                                        {},
-                                    ).get("predicted_region_visit_count", 10**6)
-                                ),
-                                int(
-                                    predicted_stats_by_candidate_id.get(
-                                        str(entry.candidate.candidate_id),
-                                        {},
-                                    ).get("current_region_visit_count", 10**6)
-                                ),
-                                0
-                                if str(
-                                    predicted_stats_by_candidate_id.get(
-                                        str(entry.candidate.candidate_id),
-                                        {},
-                                    ).get("predicted_region_source", "")
+                                    ),
+                                    int(entry.candidate.action_id),
+                                    str(entry.candidate.candidate_id),
                                 )
-                                == "empirical_transition"
-                                else 1,
-                                -float(
-                                    predicted_stats_by_candidate_id.get(
-                                        str(entry.candidate.candidate_id),
-                                        {},
-                                    ).get("empirical_transition_confidence", 0.0)
-                                ),
-                                -int(
-                                    predicted_stats_by_candidate_id.get(
-                                        str(entry.candidate.candidate_id),
-                                        {},
-                                    ).get("empirical_transition_total", 0)
-                                ),
-                                int(
-                                    predicted_stats_by_candidate_id.get(
-                                        str(entry.candidate.candidate_id),
-                                        {},
-                                    ).get("edge_attempts", 10**6)
-                                ),
-                                float(
-                                    predicted_stats_by_candidate_id.get(
-                                        str(entry.candidate.candidate_id),
-                                        {},
-                                    ).get("edge_blocked_rate", 1.0)
-                                ),
-                                -float(
-                                    predicted_stats_by_candidate_id.get(
-                                        str(entry.candidate.candidate_id),
-                                        {},
-                                    ).get("confidence", 0.0)
-                                ),
-                                int(action_count_map.get(int(entry.candidate.action_id), 0)),
-                                float(
-                                    selection_score_by_candidate.get(
-                                        entry.candidate.candidate_id,
-                                        entry.total_efe,
-                                    )
-                                ),
-                                int(entry.candidate.action_id),
-                                str(entry.candidate.candidate_id),
                             )
-                        )
                         selected_entry = coverage_pool[0]
                         least_tried_probe_applied = True
                         coverage_region_probe_applied = True
@@ -2013,6 +2282,24 @@ class ActiveInferencePolicyEvaluatorV1:
                                         {},
                                     ).get("predicted_region_visit_count", 0)
                                 ),
+                                "empirical_transition_frontier_key": str(
+                                    predicted_stats_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        {},
+                                    ).get("empirical_transition_frontier_key", "NA")
+                                ),
+                                "empirical_transition_frontier_visit_count": int(
+                                    predicted_stats_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        {},
+                                    ).get("empirical_transition_frontier_visit_count", 0)
+                                ),
+                                "empirical_transition_frontier_confidence": float(
+                                    predicted_stats_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        {},
+                                    ).get("empirical_transition_frontier_confidence", 0.0)
+                                ),
                                 "current_region_visit_count": int(
                                     predicted_stats_by_candidate_id.get(
                                         str(entry.candidate.candidate_id),
@@ -2024,6 +2311,18 @@ class ActiveInferencePolicyEvaluatorV1:
                                         str(entry.candidate.candidate_id),
                                         {},
                                     ).get("known_region_count", 0)
+                                ),
+                                "min_region_visit_count": int(
+                                    predicted_stats_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        {},
+                                    ).get("min_region_visit_count", 0)
+                                ),
+                                "regions_visited_at_least_twice": int(
+                                    predicted_stats_by_candidate_id.get(
+                                        str(entry.candidate.candidate_id),
+                                        {},
+                                    ).get("regions_visited_at_least_twice", 0)
                                 ),
                                 "empirical_transition_target_key": str(
                                     predicted_stats_by_candidate_id.get(
@@ -2062,12 +2361,15 @@ class ActiveInferencePolicyEvaluatorV1:
                                     ).get("confidence", 0.0)
                                 ),
                                 "predicted_direction": str(
+                                    self._entry_navigation_direction(entry)
+                                ),
+                                "predicted_direction_model_only": str(
                                     self._dominant_predicted_direction(entry)
                                 ),
                                 "target_direction_match": bool(
                                     str(coverage_sweep_target_direction)
                                     in ("dir_l", "dir_r", "dir_u", "dir_d")
-                                    and self._dominant_predicted_direction(entry)
+                                    and self._entry_navigation_direction(entry)
                                     == str(coverage_sweep_target_direction)
                                 ),
                                 "target_direction_retry_exceeded": bool(
@@ -2469,7 +2771,7 @@ class ActiveInferencePolicyEvaluatorV1:
                     )[: min(4, len(navigation_sequence_pool))]
                 scored_sequence_pool: list[dict[str, Any]] = []
                 for entry in sequence_pool:
-                    predicted_direction = self._dominant_predicted_direction(entry)
+                    predicted_direction = self._entry_navigation_direction(entry)
                     if predicted_direction not in ("dir_l", "dir_r", "dir_u", "dir_d"):
                         continue
                     transition_stats = self._candidate_transition_stats(entry.candidate)
@@ -2808,7 +3110,14 @@ class ActiveInferencePolicyEvaluatorV1:
             "coverage_sweep_active": bool(coverage_sweep_active),
             "coverage_sweep_reason": str(coverage_sweep_reason),
             "coverage_known_region_count": int(coverage_known_region_count),
+            "coverage_min_region_visit_count": int(coverage_min_region_visit_count),
+            "coverage_regions_visited_at_least_twice": int(
+                coverage_regions_visited_at_least_twice
+            ),
             "coverage_target_region_count": int(coverage_target_region_count),
+            "coverage_sweep_min_region_visits": int(self.coverage_sweep_min_region_visits),
+            "coverage_prepass_steps": int(self.coverage_prepass_steps),
+            "coverage_hard_prepass_active": bool(coverage_hard_prepass_active),
             "coverage_periodic_resweep_active": bool(
                 coverage_periodic_resweep_active
             ),
@@ -3156,6 +3465,12 @@ class ActiveInferencePolicyEvaluatorV1:
                         row.get("current_region_visit_count", 0)
                     ),
                     "known_region_count": int(row.get("known_region_count", 0)),
+                    "min_region_visit_count": int(
+                        row.get("min_region_visit_count", 0)
+                    ),
+                    "regions_visited_at_least_twice": int(
+                        row.get("regions_visited_at_least_twice", 0)
+                    ),
                     "empirical_transition_target_key": str(
                         row.get("empirical_transition_target_key", "NA")
                     ),
@@ -3173,6 +3488,9 @@ class ActiveInferencePolicyEvaluatorV1:
                     ),
                     "confidence": float(row.get("confidence", 0.0)),
                     "predicted_direction": str(row.get("predicted_direction", "na")),
+                    "predicted_direction_model_only": str(
+                        row.get("predicted_direction_model_only", "na")
+                    ),
                     "target_direction_match": bool(
                         row.get("target_direction_match", False)
                     ),
