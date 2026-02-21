@@ -1594,6 +1594,7 @@ class ActiveInferenceEFE(Agent):
             else {}
         )
         nav_region_hints: dict[str, float] = {}
+        nav_region_kind_bonus: dict[str, float] = {}
         targets = nav.get("targets", [])
         if isinstance(targets, list):
             for row in targets:
@@ -1606,10 +1607,27 @@ class ActiveInferenceEFE(Agent):
                 region_key = f"{int(max(0, min(7, x // 8)))}:{int(max(0, min(7, y // 8)))}"
                 if self._parse_region_key_v1(region_key) is None:
                     continue
-                hint = float(max(0.0, row.get("target_priority", row.get("salience", 0.0))))
+                raw_priority = float(
+                    max(0.0, row.get("target_priority", row.get("salience", 0.0)))
+                )
+                hint = float(
+                    max(0.0, min(1.0, 1.0 - math.exp(-0.60 * float(raw_priority))))
+                )
+                kind = str(row.get("kind", "unknown"))
+                kind_bonus = 0.25
+                if kind == "cross_like":
+                    kind_bonus = 1.0
+                elif kind == "gate_like":
+                    kind_bonus = 0.90
+                elif kind == "salient":
+                    kind_bonus = 0.58
                 nav_region_hints[str(region_key)] = max(
                     float(nav_region_hints.get(str(region_key), 0.0)),
-                    float(min(1.0, hint)),
+                    float(hint),
+                )
+                nav_region_kind_bonus[str(region_key)] = max(
+                    float(nav_region_kind_bonus.get(str(region_key), 0.0)),
+                    float(kind_bonus),
                 )
 
         orientation_state = nav.get("orientation_alignment_v1", {})
@@ -1693,20 +1711,30 @@ class ActiveInferenceEFE(Agent):
             visit_count = int(max(0, self._region_visit_counts.get(str(region_key), 0)))
             novelty = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 12.0)))
             nav_hint = float(max(0.0, min(1.0, nav_region_hints.get(str(region_key), 0.0))))
-            support = float(1.0 - math.exp(-float(max(0, attempts)) / 4.0))
-            base = float(
-                (0.52 * info_score)
-                + (0.18 * coupling_score)
-                + (0.11 * cc_rate)
-                + (0.08 * strong_rate)
-                + (0.07 * progress_rate)
-                + (0.04 * nav_hint)
+            nav_kind = float(
+                max(0.0, min(1.0, nav_region_kind_bonus.get(str(region_key), 0.0)))
             )
-            base = float(base * (1.0 - (0.85 * ui_suppression)))
-            base = float(base + (0.08 * novelty))
-            base = float((0.30 + (0.70 * support)) * base)
+            support = float(1.0 - math.exp(-float(max(0, attempts)) / 4.0))
+            evidence_term = float(
+                (0.56 * info_score)
+                + (0.20 * coupling_score)
+                + (0.12 * cc_rate)
+                + (0.07 * strong_rate)
+                + (0.05 * progress_rate)
+            )
+            evidence_term = float((0.28 + (0.72 * support)) * evidence_term)
+            prior_term = float((0.10 * novelty) + (0.20 * nav_hint) + (0.08 * nav_kind))
+            if attempts <= 0 and (nav_hint >= 0.40 or nav_kind >= 0.70):
+                prior_term = float(
+                    max(
+                        prior_term,
+                        0.24 + (0.10 * nav_hint) + (0.06 * nav_kind),
+                    )
+                )
+            base = float(evidence_term + prior_term)
+            base = float(base * (1.0 - (0.75 * ui_suppression)))
             if str(region_key) == str(fallback_key):
-                base = float(base + 0.05)
+                base = float(base + 0.04)
             return float(max(0.0, min(1.0, base)))
 
         primary_candidates: list[tuple[float, int, int, str]] = []
@@ -1749,11 +1777,14 @@ class ActiveInferenceEFE(Agent):
                     max(0.0, 1.0 - min(1.0, float(max(0, distance - 1)) / 6.0))
                 )
                 base = float(_region_base_score(key))
+                nav_hint = float(max(0.0, min(1.0, nav_region_hints.get(key, 0.0))))
+                nav_kind = float(max(0.0, min(1.0, nav_region_kind_bonus.get(key, 0.0))))
+                nav_prior = float(max(0.0, min(1.0, (0.70 * nav_hint) + (0.30 * nav_kind))))
                 score = float(
-                    (0.62 * base)
-                    + (0.26 * pair_affinity)
-                    + (0.08 * distance_term)
-                    + (0.04 * float(max(0.0, nav_region_hints.get(key, 0.0))))
+                    (0.48 * base)
+                    + (0.24 * pair_affinity)
+                    + (0.10 * distance_term)
+                    + (0.18 * nav_prior)
                 )
                 visit_count = int(max(0, self._region_visit_counts.get(key, 0)))
                 attempts = int(max(0, row_by_region.get(key, {}).get("attempts", 0)))
@@ -1773,7 +1804,34 @@ class ActiveInferenceEFE(Agent):
                 secondary_region_key = str(secondary_candidates[0][3])
                 secondary_region_score = float(secondary_candidates[0][0])
                 pair_affinity_score = float(secondary_candidates[0][4])
-            elif fallback_key != "NA" and str(fallback_key) != str(primary_region_key):
+            else:
+                nav_prior_candidates = sorted(
+                    (
+                        float(
+                            max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    (0.70 * nav_region_hints.get(key, 0.0))
+                                    + (0.30 * nav_region_kind_bonus.get(key, 0.0)),
+                                ),
+                            )
+                        ),
+                        str(key),
+                    )
+                    for key in candidate_region_keys
+                    if self._parse_region_key_v1(str(key)) is not None
+                    and str(key) != str(primary_region_key)
+                )
+                nav_prior_candidates.sort(key=lambda item: (-float(item[0]), str(item[1])))
+                if nav_prior_candidates and float(nav_prior_candidates[0][0]) >= 0.45:
+                    secondary_region_key = str(nav_prior_candidates[0][1])
+                    secondary_region_score = float(_region_base_score(secondary_region_key))
+            if (
+                secondary_region_key == "NA"
+                and fallback_key != "NA"
+                and str(fallback_key) != str(primary_region_key)
+            ):
                 secondary_region_key = str(fallback_key)
                 secondary_region_score = float(_region_base_score(secondary_region_key))
 
@@ -2171,6 +2229,26 @@ class ActiveInferenceEFE(Agent):
             palette_delta_mean_norm = float(
                 palette_delta_mean / (palette_delta_mean + 16.0)
             )
+            ui_suppression_raw = float(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        (0.85 * ui_side_effect_rate) + (0.65 * terminal_failure_rate),
+                    ),
+                )
+            )
+            behavioral_rescue = float(
+                max(
+                    0.0,
+                    min(
+                        0.65,
+                        (0.45 * non_no_change_rate)
+                        + (0.35 * strong_change_rate)
+                        + (0.20 * cc_rate),
+                    ),
+                )
+            )
             coupling_profile = self._coupling_signal_profile_v1(
                 cc_rate=cc_rate,
                 strong_change_rate=strong_change_rate,
@@ -2187,7 +2265,7 @@ class ActiveInferenceEFE(Agent):
                     0.0,
                     min(
                         1.0,
-                        (0.85 * ui_side_effect_rate) + (0.65 * terminal_failure_rate),
+                        ui_suppression_raw - behavioral_rescue,
                     ),
                 )
             )
@@ -2344,7 +2422,13 @@ class ActiveInferenceEFE(Agent):
         progress_rate = float(progress_count / float(max(1, attempts)))
         ui_side_effect_rate = float(ui_side_effect_count / float(max(1, attempts)))
         terminal_failure_rate = float(terminal_failure_count / float(max(1, attempts)))
-        ui_suppression = float(
+        cc_rate = float(cc_count_change_count / float(max(1, attempts)))
+        palette_change_rate = float(palette_change_count / float(max(1, attempts)))
+        palette_delta_mean = float(palette_delta_total_sum / float(max(1, attempts)))
+        palette_delta_mean_norm = float(
+            palette_delta_mean / (palette_delta_mean + 16.0)
+        )
+        ui_suppression_raw = float(
             max(
                 0.0,
                 min(
@@ -2353,11 +2437,22 @@ class ActiveInferenceEFE(Agent):
                 ),
             )
         )
-        cc_rate = float(cc_count_change_count / float(max(1, attempts)))
-        palette_change_rate = float(palette_change_count / float(max(1, attempts)))
-        palette_delta_mean = float(palette_delta_total_sum / float(max(1, attempts)))
-        palette_delta_mean_norm = float(
-            palette_delta_mean / (palette_delta_mean + 16.0)
+        behavioral_rescue = float(
+            max(
+                0.0,
+                min(
+                    0.65,
+                    (0.45 * non_no_change_rate)
+                    + (0.35 * strong_change_rate)
+                    + (0.20 * cc_rate),
+                ),
+            )
+        )
+        ui_suppression = float(
+            max(
+                0.0,
+                min(1.0, ui_suppression_raw - behavioral_rescue),
+            )
         )
         coupling_profile = self._coupling_signal_profile_v1(
             cc_rate=cc_rate,
@@ -2941,9 +3036,19 @@ class ActiveInferenceEFE(Agent):
             current_region_key=str(source_region_key),
         )
         trigger_score = float(trigger_semantics.get("info_trigger_score", 0.0))
+        source_visit_count = int(max(0, self._region_visit_counts.get(str(source_region_key), 0)))
+        coupled_probe_trigger = bool(
+            str(source_region_key) in coupled_region_keys
+            and source_visit_count >= int(max(2, coupled_min_samples - 1))
+            and (
+                str(obs_change_type) != "NO_CHANGE"
+                or int(changed_pixels) >= 2
+            )
+        )
         should_trigger = bool(
             (
                 strong_event
+                or coupled_probe_trigger
                 or (
                     str(source_region_key) in coupled_region_keys
                     and trigger_score >= 0.34
@@ -2954,6 +3059,7 @@ class ActiveInferenceEFE(Agent):
                 trigger_score >= float(self.high_info_focus_min_trigger_score)
                 or obs_change_type == "CC_COUNT_CHANGE"
                 or str(source_region_key) in coupled_region_keys
+                or coupled_probe_trigger
             )
         )
 
@@ -5157,7 +5263,7 @@ class ActiveInferenceEFE(Agent):
             "direction_alignment": float(best_metrics.get("direction_alignment", 0.0)),
             "projection_error": float(best_metrics.get("projection_error", 0.0)),
             "peripheral_ui_candidate": False,
-            "peripheral_ui_likelihood": float(peripheral_ui_likelihood),
+            "peripheral_ui_likelihood": float(peripheral_ui_score),
             "tracked_pair_source": (
                 "tracked_first_pass"
                 if tracked_previous_nodes and str(previous.digest) == tracked_digest
