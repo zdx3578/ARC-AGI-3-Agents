@@ -946,6 +946,12 @@ class ActiveInferencePolicyEvaluatorV1:
         region_progress_rate = self._clamp01(
             float(region_action_semantics.get("progress_rate", 0.0))
         )
+        region_ui_side_effect_rate = self._clamp01(
+            float(region_action_semantics.get("ui_side_effect_rate", 0.0))
+        )
+        region_terminal_failure_rate = self._clamp01(
+            float(region_action_semantics.get("terminal_failure_rate", 0.0))
+        )
         region_coupling_signal_score = self._clamp01(
             float(region_action_semantics.get("coupling_signal_score", 0.0))
         )
@@ -961,6 +967,8 @@ class ActiveInferencePolicyEvaluatorV1:
         color_coupling_signal = 0.0
         color_coupling_bonus = 0.0
         color_coupling_penalty = 0.0
+        ui_side_effect_penalty = 0.0
+        ui_suppression = 0.0
         if region_action_semantics_enabled:
             region_channel_signal = self._clamp01(
                 (0.35 * region_info_trigger_score)
@@ -987,6 +995,21 @@ class ActiveInferencePolicyEvaluatorV1:
                 )
             elif region_semantics_moved_rate <= 0.20:
                 color_coupling_penalty = float(0.12 * color_coupling_signal)
+            ui_suppression = self._clamp01(
+                (0.85 * region_ui_side_effect_rate)
+                + (0.55 * region_terminal_failure_rate)
+            )
+            if ui_suppression > 0.0:
+                color_coupling_signal = self._clamp01(
+                    color_coupling_signal * (1.0 - ui_suppression)
+                )
+                color_coupling_bonus = float(color_coupling_bonus * (1.0 - ui_suppression))
+                ui_side_effect_penalty = float(
+                    0.22 * ui_suppression * (0.55 + (0.45 * blocked_probability))
+                )
+                color_coupling_penalty = float(
+                    max(0.0, color_coupling_penalty + ui_side_effect_penalty)
+                )
         navigation_projection = candidate.metadata.get(
             "navigation_step_projection_features_v1",
             {},
@@ -1391,6 +1414,7 @@ class ActiveInferencePolicyEvaluatorV1:
         habit_risk += float(max(0.0, 0.34 * high_info_penalty_effective))
         habit_risk += float(max(0.0, 0.26 * orientation_alignment_penalty_effective))
         habit_risk += float(max(0.0, 0.22 * color_coupling_penalty_effective))
+        habit_risk += float(max(0.0, 0.24 * ui_side_effect_penalty))
         habit_risk += float(max(0.0, 0.30 * coverage_repeat_penalty))
         habit_risk += float(max(0.0, 0.24 * sequence_causal_penalty))
         habit_risk = float(max(0.0, habit_risk - (0.22 * key_target_escape_bonus_effective)))
@@ -1519,12 +1543,16 @@ class ActiveInferencePolicyEvaluatorV1:
             "region_cc_count_change_rate": float(region_cc_count_change_rate),
             "region_strong_change_rate": float(region_strong_change_rate),
             "region_progress_rate": float(region_progress_rate),
+            "region_ui_side_effect_rate": float(region_ui_side_effect_rate),
+            "region_terminal_failure_rate": float(region_terminal_failure_rate),
+            "region_ui_suppression": float(ui_suppression),
             "region_coupling_signal_score": float(region_coupling_signal_score),
             "region_coupling_signal_kind": str(region_coupling_signal_kind),
             "region_semantics_edge_status": str(region_semantics_edge_status),
             "color_coupling_signal": float(color_coupling_signal),
             "color_coupling_bonus": float(color_coupling_bonus),
             "color_coupling_penalty": float(color_coupling_penalty),
+            "ui_side_effect_penalty": float(ui_side_effect_penalty),
             "color_coupling_bonus_effective": float(color_coupling_bonus_effective),
             "color_coupling_penalty_effective": float(color_coupling_penalty_effective),
             "coverage_enabled": bool(coverage_enabled),

@@ -177,6 +177,74 @@ def _changed_pixels_and_bbox(
     return (changed, (int(min_x), int(min_y), int(max_x), int(max_y)))
 
 
+def _peripheral_change_stats(
+    previous_frame: list[list[int]],
+    current_frame: list[list[int]],
+) -> dict[str, float | int]:
+    previous_height = len(previous_frame)
+    previous_width = len(previous_frame[0]) if previous_frame else 0
+    current_height = len(current_frame)
+    current_width = len(current_frame[0]) if current_frame else 0
+    union_height = max(previous_height, current_height)
+    union_width = max(previous_width, current_width)
+    if union_height <= 0 or union_width <= 0:
+        return {
+            "changed_pixel_count": 0,
+            "peripheral_changed_pixel_count": 0,
+            "interior_changed_pixel_count": 0,
+            "peripheral_changed_ratio": 0.0,
+            "peripheral_band_margin_x": 0,
+            "peripheral_band_margin_y": 0,
+        }
+
+    # Use an image-size relative peripheral band so this remains cross-game.
+    margin_x = max(1, int(round(float(union_width) * 0.08)))
+    margin_y = max(1, int(round(float(union_height) * 0.08)))
+    x_right_threshold = max(0, int(union_width - margin_x))
+    y_bottom_threshold = max(0, int(union_height - margin_y))
+
+    changed = 0
+    peripheral_changed = 0
+    for y in range(union_height):
+        for x in range(union_width):
+            prev_value = (
+                _color_value(previous_frame[y][x])
+                if y < previous_height and x < previous_width
+                else -1
+            )
+            curr_value = (
+                _color_value(current_frame[y][x])
+                if y < current_height and x < current_width
+                else -1
+            )
+            if prev_value == curr_value:
+                continue
+            changed += 1
+            is_peripheral = bool(
+                x < margin_x
+                or x >= x_right_threshold
+                or y < margin_y
+                or y >= y_bottom_threshold
+            )
+            if is_peripheral:
+                peripheral_changed += 1
+
+    interior_changed = max(0, int(changed - peripheral_changed))
+    peripheral_ratio = (
+        float(peripheral_changed) / float(max(1, changed))
+        if changed > 0
+        else 0.0
+    )
+    return {
+        "changed_pixel_count": int(changed),
+        "peripheral_changed_pixel_count": int(peripheral_changed),
+        "interior_changed_pixel_count": int(interior_changed),
+        "peripheral_changed_ratio": float(peripheral_ratio),
+        "peripheral_band_margin_x": int(margin_x),
+        "peripheral_band_margin_y": int(margin_y),
+    }
+
+
 def _palette_delta_topk(
     previous_frame: list[list[int]],
     current_frame: list[list[int]],
@@ -356,6 +424,19 @@ def build_causal_event_signature_v1(
 
     palette_delta = _palette_delta_topk(previous_packet.frame, current_packet.frame)
     palette_delta_total = sum(abs(int(v)) for v in palette_delta.values())
+    peripheral_change = _peripheral_change_stats(
+        previous_packet.frame,
+        current_packet.frame,
+    )
+    peripheral_changed_pixel_count = int(
+        peripheral_change.get("peripheral_changed_pixel_count", 0)
+    )
+    interior_changed_pixel_count = int(
+        peripheral_change.get("interior_changed_pixel_count", 0)
+    )
+    peripheral_changed_ratio = float(
+        peripheral_change.get("peripheral_changed_ratio", 0.0)
+    )
 
     translation_summary = _component_translation_summary(
         previous_representation,
@@ -399,6 +480,25 @@ def build_causal_event_signature_v1(
         else 0
     )
     is_navigation_action = int(executed_action.action_id) in (1, 2, 3, 4)
+    peripheral_ui_side_effect = bool(
+        is_navigation_action
+        and int(level_delta) <= 0
+        and not str(state_transition).endswith("->WIN")
+        and int(changed_pixels) > 0
+        and float(changed_area_ratio) <= 0.20
+        and float(peripheral_changed_ratio) >= 0.72
+    )
+    terminal_failure = bool(str(state_transition).endswith("->GAME_OVER"))
+    terminal_resource_depletion = bool(
+        terminal_failure
+        and (
+            peripheral_ui_side_effect
+            or (
+                float(peripheral_changed_ratio) >= 0.55
+                and float(changed_area_ratio) <= 0.35
+            )
+        )
+    )
     is_navigation_blocked = bool(
         is_navigation_action
         and int(level_delta) <= 0
@@ -427,6 +527,12 @@ def build_causal_event_signature_v1(
         tags.append("navigation_blocked")
     if bounce_like_blocked:
         tags.append("navigation_bounce")
+    if peripheral_ui_side_effect:
+        tags.append("peripheral_ui_side_effect")
+    if terminal_failure:
+        tags.append("terminal_failure")
+    if terminal_resource_depletion:
+        tags.append("terminal_resource_depletion")
 
     cc_match_summary = {
         "previous_same8_count": int(
@@ -447,6 +553,18 @@ def build_causal_event_signature_v1(
             non_no_change_object_transition_count
         ),
         "frame_chain_micro_translation_count": int(micro_translation_count),
+        "peripheral_changed_pixel_count": int(peripheral_changed_pixel_count),
+        "interior_changed_pixel_count": int(interior_changed_pixel_count),
+        "peripheral_changed_ratio": float(peripheral_changed_ratio),
+        "peripheral_band_margin_x": int(
+            peripheral_change.get("peripheral_band_margin_x", 0)
+        ),
+        "peripheral_band_margin_y": int(
+            peripheral_change.get("peripheral_band_margin_y", 0)
+        ),
+        "peripheral_ui_side_effect": bool(peripheral_ui_side_effect),
+        "terminal_failure": bool(terminal_failure),
+        "terminal_resource_depletion": bool(terminal_resource_depletion),
     }
 
     signature_key_v2 = _signature_key(

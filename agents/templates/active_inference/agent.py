@@ -458,6 +458,9 @@ class ActiveInferenceEFE(Agent):
         self._region_action_progress_counts: dict[str, int] = {}
         self._region_action_palette_change_counts: dict[str, int] = {}
         self._region_action_palette_delta_total_sum: dict[str, int] = {}
+        self._region_action_ui_side_effect_counts: dict[str, int] = {}
+        self._region_action_terminal_failure_counts: dict[str, int] = {}
+        self._navigation_ui_reject_count = 0
         self._click_bucket_stats: dict[str, dict[str, int]] = {}
         self._click_subcluster_stats: dict[str, dict[str, int]] = {}
         self._state_visit_count: dict[str, int] = {}
@@ -1831,6 +1834,12 @@ class ActiveInferenceEFE(Agent):
             non_no_change = int(self._region_action_non_no_change_counts.get(region_action_key, 0))
             strong_change = int(self._region_action_strong_change_counts.get(region_action_key, 0))
             progress_count = int(self._region_action_progress_counts.get(region_action_key, 0))
+            ui_side_effect_count = int(
+                self._region_action_ui_side_effect_counts.get(region_action_key, 0)
+            )
+            terminal_failure_count = int(
+                self._region_action_terminal_failure_counts.get(region_action_key, 0)
+            )
             cc_count_change = int(histogram.get("CC_COUNT_CHANGE", 0))
             palette_change_count = int(
                 self._region_action_palette_change_counts.get(region_action_key, 0)
@@ -1848,6 +1857,8 @@ class ActiveInferenceEFE(Agent):
             non_no_change_rate = float(non_no_change / float(max(1, attempts)))
             strong_change_rate = float(strong_change / float(max(1, attempts)))
             progress_rate = float(progress_count / float(max(1, attempts)))
+            ui_side_effect_rate = float(ui_side_effect_count / float(max(1, attempts)))
+            terminal_failure_rate = float(terminal_failure_count / float(max(1, attempts)))
             cc_rate = float(cc_count_change / float(max(1, attempts)))
             palette_change_rate = float(palette_change_count / float(max(1, attempts)))
             palette_delta_mean = float(palette_delta_total_sum / float(max(1, attempts)))
@@ -1865,13 +1876,25 @@ class ActiveInferenceEFE(Agent):
             )
             visit_count = int(self._region_visit_counts.get(str(region_key), 0))
             visit_novelty = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 10.0)))
+            ui_suppression = float(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        (0.85 * ui_side_effect_rate) + (0.65 * terminal_failure_rate),
+                    ),
+                )
+            )
             info_score = float(
                 max(
                     0.0,
                     min(
                         1.0,
-                        (0.92 * float(coupling_profile.get("score", 0.0)))
-                        + (0.06 * visit_novelty),
+                        (
+                            (0.92 * float(coupling_profile.get("score", 0.0)))
+                            + (0.06 * visit_novelty)
+                        )
+                        * (1.0 - ui_suppression),
                     ),
                 )
             )
@@ -1885,6 +1908,9 @@ class ActiveInferenceEFE(Agent):
                 "non_no_change_rate": float(non_no_change_rate),
                 "strong_change_rate": float(strong_change_rate),
                 "progress_rate": float(progress_rate),
+                "ui_side_effect_rate": float(ui_side_effect_rate),
+                "terminal_failure_rate": float(terminal_failure_rate),
+                "ui_suppression": float(ui_suppression),
                 "cc_count_change_rate": float(cc_rate),
                 "palette_change_rate": float(palette_change_rate),
                 "palette_delta_mean": float(palette_delta_mean),
@@ -1937,6 +1963,9 @@ class ActiveInferenceEFE(Agent):
             "non_no_change_rate": 0.0,
             "strong_change_rate": 0.0,
             "progress_rate": 0.0,
+            "ui_side_effect_rate": 0.0,
+            "terminal_failure_rate": 0.0,
+            "ui_suppression": 0.0,
             "cc_count_change_rate": 0.0,
             "palette_change_rate": 0.0,
             "palette_delta_mean": 0.0,
@@ -1944,6 +1973,7 @@ class ActiveInferenceEFE(Agent):
             "event_entropy_norm": 0.0,
             "info_trigger_score": 0.0,
             "coupling_signal_score": 0.0,
+            "coupling_signal_score_raw": 0.0,
             "coupling_signal_kind": "unknown",
             "coupling_components": {},
             "coupling_weights": {},
@@ -1981,6 +2011,12 @@ class ActiveInferenceEFE(Agent):
         non_no_change_count = int(self._region_action_non_no_change_counts.get(region_action_key, 0))
         strong_change_count = int(self._region_action_strong_change_counts.get(region_action_key, 0))
         progress_count = int(self._region_action_progress_counts.get(region_action_key, 0))
+        ui_side_effect_count = int(
+            self._region_action_ui_side_effect_counts.get(region_action_key, 0)
+        )
+        terminal_failure_count = int(
+            self._region_action_terminal_failure_counts.get(region_action_key, 0)
+        )
         cc_count_change_count = int(histogram.get("CC_COUNT_CHANGE", 0))
         palette_change_count = int(
             self._region_action_palette_change_counts.get(region_action_key, 0)
@@ -2000,6 +2036,17 @@ class ActiveInferenceEFE(Agent):
         non_no_change_rate = float(non_no_change_count / float(max(1, attempts)))
         strong_change_rate = float(strong_change_count / float(max(1, attempts)))
         progress_rate = float(progress_count / float(max(1, attempts)))
+        ui_side_effect_rate = float(ui_side_effect_count / float(max(1, attempts)))
+        terminal_failure_rate = float(terminal_failure_count / float(max(1, attempts)))
+        ui_suppression = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (0.85 * ui_side_effect_rate) + (0.65 * terminal_failure_rate),
+                ),
+            )
+        )
         cc_rate = float(cc_count_change_count / float(max(1, attempts)))
         palette_change_rate = float(palette_change_count / float(max(1, attempts)))
         palette_delta_mean = float(palette_delta_total_sum / float(max(1, attempts)))
@@ -2015,12 +2062,14 @@ class ActiveInferenceEFE(Agent):
             palette_delta_mean_norm=palette_delta_mean_norm,
             progress_rate=progress_rate,
         )
+        coupling_score_raw = float(coupling_profile.get("score", 0.0))
+        coupling_score_effective = float(coupling_score_raw * (1.0 - ui_suppression))
         info_trigger_score = float(
             max(
                 0.0,
                 min(
                     1.0,
-                    (0.96 * float(coupling_profile.get("score", 0.0))),
+                    (0.96 * float(coupling_score_effective)),
                 ),
             )
         )
@@ -2043,13 +2092,17 @@ class ActiveInferenceEFE(Agent):
                 "non_no_change_rate": float(non_no_change_rate),
                 "strong_change_rate": float(strong_change_rate),
                 "progress_rate": float(progress_rate),
+                "ui_side_effect_rate": float(ui_side_effect_rate),
+                "terminal_failure_rate": float(terminal_failure_rate),
+                "ui_suppression": float(ui_suppression),
                 "cc_count_change_rate": float(cc_rate),
                 "palette_change_rate": float(palette_change_rate),
                 "palette_delta_mean": float(palette_delta_mean),
                 "palette_delta_mean_norm": float(palette_delta_mean_norm),
                 "event_entropy_norm": float(entropy_norm),
                 "info_trigger_score": float(info_trigger_score),
-                "coupling_signal_score": float(coupling_profile.get("score", 0.0)),
+                "coupling_signal_score": float(coupling_score_effective),
+                "coupling_signal_score_raw": float(coupling_score_raw),
                 "coupling_signal_kind": str(coupling_profile.get("kind", "unknown")),
                 "coupling_components": dict(coupling_profile.get("components", {})),
                 "coupling_weights": dict(coupling_profile.get("weights", {})),
@@ -3893,6 +3946,22 @@ class ActiveInferenceEFE(Agent):
                 if isinstance(v, int) or str(v).lstrip("-").isdigit()
             )
         )
+        event_tags_raw = getattr(causal_signature, "event_tags", [])
+        if not isinstance(event_tags_raw, list):
+            event_tags_raw = []
+        event_tags = {
+            str(tag)
+            for tag in event_tags_raw
+            if isinstance(tag, str) and str(tag).strip()
+        }
+        peripheral_ui_side_effect = bool("peripheral_ui_side_effect" in event_tags)
+        terminal_failure = bool(
+            "terminal_failure" in event_tags
+            or str(getattr(causal_signature, "state_transition", "")).endswith("->GAME_OVER")
+        )
+        terminal_resource_depletion = bool(
+            "terminal_resource_depletion" in event_tags
+        )
         palette_changed = bool(palette_delta_total > 0)
         source_region_key = self._current_region_key_v1()
         if action_id in (1, 2, 3, 4):
@@ -3917,8 +3986,16 @@ class ActiveInferenceEFE(Agent):
                 nav_delta = {}
             nav_dx = int(nav_delta.get("dx", 0))
             nav_dy = int(nav_delta.get("dy", 0))
-            nav_has_motion = bool(nav_matched and (abs(nav_dx) + abs(nav_dy) > 0))
-            if nav_matched:
+            nav_peripheral_ui = bool(
+                navigation_state_estimate.get("peripheral_ui_candidate", False)
+                or peripheral_ui_side_effect
+            )
+            if nav_peripheral_ui:
+                self._navigation_ui_reject_count += 1
+            nav_has_motion = bool(
+                nav_matched and not nav_peripheral_ui and (abs(nav_dx) + abs(nav_dy) > 0)
+            )
+            if nav_matched and not nav_peripheral_ui:
                 self._navigation_match_count += 1
             navigation_direction_bucket = self._navigation_direction_bucket_from_estimate_v1(
                 navigation_state_estimate
@@ -3997,7 +4074,7 @@ class ActiveInferenceEFE(Agent):
             region_action_key = f"{str(source_region_key)}|a{int(action_id)}"
             histogram = self._region_action_event_counts.setdefault(region_action_key, {})
             histogram[str(obs_change_type)] = int(histogram.get(str(obs_change_type), 0) + 1)
-            if str(obs_change_type) != "NO_CHANGE":
+            if str(obs_change_type) != "NO_CHANGE" and not peripheral_ui_side_effect:
                 self._region_action_non_no_change_counts[region_action_key] = int(
                     self._region_action_non_no_change_counts.get(region_action_key, 0) + 1
                 )
@@ -4005,7 +4082,7 @@ class ActiveInferenceEFE(Agent):
                 str(obs_change_type) in ("CC_COUNT_CHANGE", "GLOBAL_PATTERN_CHANGE")
                 or int(changed_pixel_count) >= int(self.high_info_strong_change_pixels)
             )
-            if strong_change:
+            if strong_change and not peripheral_ui_side_effect:
                 self._region_action_strong_change_counts[region_action_key] = int(
                     self._region_action_strong_change_counts.get(region_action_key, 0) + 1
                 )
@@ -4013,15 +4090,25 @@ class ActiveInferenceEFE(Agent):
                 self._region_action_progress_counts[region_action_key] = int(
                     self._region_action_progress_counts.get(region_action_key, 0) + 1
                 )
-            if palette_changed:
+            if palette_changed and not peripheral_ui_side_effect:
                 self._region_action_palette_change_counts[region_action_key] = int(
                     self._region_action_palette_change_counts.get(region_action_key, 0)
                     + 1
                 )
-            self._region_action_palette_delta_total_sum[region_action_key] = int(
-                self._region_action_palette_delta_total_sum.get(region_action_key, 0)
-                + int(palette_delta_total)
-            )
+            if not peripheral_ui_side_effect:
+                self._region_action_palette_delta_total_sum[region_action_key] = int(
+                    self._region_action_palette_delta_total_sum.get(region_action_key, 0)
+                    + int(palette_delta_total)
+                )
+            if peripheral_ui_side_effect:
+                self._region_action_ui_side_effect_counts[region_action_key] = int(
+                    self._region_action_ui_side_effect_counts.get(region_action_key, 0) + 1
+                )
+            if terminal_failure or terminal_resource_depletion:
+                self._region_action_terminal_failure_counts[region_action_key] = int(
+                    self._region_action_terminal_failure_counts.get(region_action_key, 0)
+                    + 1
+                )
 
         if action_id == 6:
             bucket = self._click_context_bucket_from_candidate(executed_candidate)
@@ -4050,6 +4137,7 @@ class ActiveInferenceEFE(Agent):
         nav_attempts = int(self._navigation_attempt_count)
         nav_blocked = int(self._navigation_blocked_count)
         nav_moved = int(self._navigation_moved_count)
+        nav_ui_reject = int(self._navigation_ui_reject_count)
         click_summary: dict[str, Any] = {}
         for bucket, stats in sorted(self._click_bucket_stats.items()):
             attempts = int(stats.get("attempts", 0))
@@ -4104,6 +4192,8 @@ class ActiveInferenceEFE(Agent):
             "navigation_moved_count": nav_moved,
             "navigation_blocked_count": nav_blocked,
             "navigation_blocked_rate": float(nav_blocked / float(max(1, nav_attempts))),
+            "navigation_ui_reject_count": int(nav_ui_reject),
+            "navigation_ui_reject_rate": float(nav_ui_reject / float(max(1, nav_attempts))),
             "blocked_edge_histogram": {
                 str(key): int(value)
                 for (key, value) in sorted(
@@ -4137,6 +4227,20 @@ class ActiveInferenceEFE(Agent):
                 str(key): int(max(0, value))
                 for (key, value) in sorted(
                     self._region_action_palette_delta_total_sum.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )[:128]
+            },
+            "region_action_ui_side_effect_histogram": {
+                str(key): int(max(0, value))
+                for (key, value) in sorted(
+                    self._region_action_ui_side_effect_counts.items(),
+                    key=lambda item: (-int(item[1]), item[0]),
+                )[:128]
+            },
+            "region_action_terminal_failure_histogram": {
+                str(key): int(max(0, value))
+                for (key, value) in sorted(
+                    self._region_action_terminal_failure_counts.items(),
                     key=lambda item: (-int(item[1]), item[0]),
                 )[:128]
             },
@@ -4220,6 +4324,56 @@ class ActiveInferenceEFE(Agent):
         expected_dir = self._action_direction_vector_v1(action_id)
         tracked_digest = str(self._tracked_agent_token_digest or "")
         expected_step = 5
+        frame_width = max(1, int(current_representation.frame_width))
+        frame_height = max(1, int(current_representation.frame_height))
+        peripheral_margin_x = max(1, int(round(float(frame_width) * 0.08)))
+        peripheral_margin_y = max(1, int(round(float(frame_height) * 0.08)))
+        ui_max_area = max(4, int(round(float(frame_width * frame_height) * 0.004)))
+        ui_max_side = max(2, int(round(float(min(frame_width, frame_height)) * 0.08)))
+
+        def peripheral_ui_likelihood(node: Any) -> float:
+            try:
+                area = int(getattr(node, "area", 0))
+                cx = int(getattr(node, "centroid_x", -1))
+                cy = int(getattr(node, "centroid_y", -1))
+                min_x = int(getattr(node, "bbox_min_x", cx))
+                max_x = int(getattr(node, "bbox_max_x", cx))
+                min_y = int(getattr(node, "bbox_min_y", cy))
+                max_y = int(getattr(node, "bbox_max_y", cy))
+            except Exception:
+                return 0.0
+            if cx < 0 or cy < 0:
+                return 0.0
+            width = max(1, int(max_x - min_x + 1))
+            height = max(1, int(max_y - min_y + 1))
+            near_periphery = bool(
+                cx < peripheral_margin_x
+                or cx >= max(0, frame_width - peripheral_margin_x)
+                or cy < peripheral_margin_y
+                or cy >= max(0, frame_height - peripheral_margin_y)
+            )
+            if not near_periphery:
+                return 0.0
+            area_score = 0.0
+            if area <= ui_max_area:
+                area_score = 1.0
+            else:
+                area_score = max(
+                    0.0,
+                    1.0 - (float(area - ui_max_area) / float(max(1, ui_max_area * 2))),
+                )
+            side = max(width, height)
+            side_score = 1.0 if side <= ui_max_side else 0.0
+            boundary_score = 0.25 if bool(getattr(node, "touches_boundary", False)) else 0.0
+            return float(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        (0.65 * area_score) + (0.25 * side_score) + float(boundary_score),
+                    ),
+                )
+            )
 
         def pair_metrics(previous: Any, current: Any) -> dict[str, float] | None:
             if int(previous.color) != int(current.color):
@@ -4292,6 +4446,24 @@ class ActiveInferenceEFE(Agent):
             continuity_bonus = 0
             if str(previous.object_id) == str(current.object_id):
                 continuity_bonus = 6
+            previous_ui_likelihood = float(peripheral_ui_likelihood(previous))
+            current_ui_likelihood = float(peripheral_ui_likelihood(current))
+            peripheral_ui_likelihood_pair = float(
+                max(previous_ui_likelihood, current_ui_likelihood)
+            )
+            if previous_ui_likelihood > 0.0 and current_ui_likelihood > 0.0:
+                peripheral_ui_likelihood_pair = float(
+                    max(
+                        peripheral_ui_likelihood_pair,
+                        min(
+                            1.0,
+                            (0.50 * previous_ui_likelihood)
+                            + (0.50 * current_ui_likelihood)
+                            + 0.20,
+                        ),
+                    )
+                )
+            ui_penalty = int(round(90.0 * float(peripheral_ui_likelihood_pair)))
 
             score = (
                 (int(area_gap) * 10)
@@ -4300,6 +4472,7 @@ class ActiveInferenceEFE(Agent):
                 + (int(projection_error) * 2)
                 + int(track_penalty)
                 + int(boundary_penalty)
+                + int(ui_penalty)
                 - int(continuity_bonus)
             )
             return {
@@ -4311,6 +4484,8 @@ class ActiveInferenceEFE(Agent):
                 "projection_error": float(projection_error),
                 "area_gap": float(area_gap),
                 "boundary_penalty": float(boundary_penalty),
+                "ui_penalty": float(ui_penalty),
+                "peripheral_ui_likelihood": float(peripheral_ui_likelihood_pair),
             }
 
         def search(previous_pool: list[Any]) -> tuple[tuple[Any, Any] | None, dict[str, float]]:
@@ -4363,10 +4538,31 @@ class ActiveInferenceEFE(Agent):
                 "schema_version": 1,
                 "matched": False,
                 "reason": "no_translation_match",
+                "peripheral_ui_candidate": False,
+                "peripheral_ui_likelihood": 0.0,
                 "control_schema_posterior": self._control_schema_posterior(),
             }
 
         previous, current = best_pair
+        peripheral_ui_likelihood = float(
+            max(0.0, min(1.0, best_metrics.get("peripheral_ui_likelihood", 0.0)))
+        )
+        peripheral_ui_candidate = bool(peripheral_ui_likelihood >= 0.75)
+        if peripheral_ui_candidate:
+            return {
+                "schema_name": "active_inference_navigation_state_estimate_v1",
+                "schema_version": 1,
+                "matched": False,
+                "reason": "peripheral_ui_motion",
+                "peripheral_ui_candidate": True,
+                "peripheral_ui_likelihood": float(peripheral_ui_likelihood),
+                "candidate_centroid_xy": {
+                    "x": int(getattr(current, "centroid_x", -1)),
+                    "y": int(getattr(current, "centroid_y", -1)),
+                },
+                "control_schema_posterior": self._control_schema_posterior(),
+            }
+
         delta_x = int(current.centroid_x) - int(previous.centroid_x)
         delta_y = int(current.centroid_y) - int(previous.centroid_y)
         shift = int(abs(delta_x) + abs(delta_y))
@@ -4398,6 +4594,8 @@ class ActiveInferenceEFE(Agent):
             "match_score": float(best_metrics.get("score", 0.0)),
             "direction_alignment": float(best_metrics.get("direction_alignment", 0.0)),
             "projection_error": float(best_metrics.get("projection_error", 0.0)),
+            "peripheral_ui_candidate": False,
+            "peripheral_ui_likelihood": float(peripheral_ui_likelihood),
             "tracked_pair_source": (
                 "tracked_first_pass"
                 if tracked_previous_nodes and str(previous.digest) == tracked_digest
