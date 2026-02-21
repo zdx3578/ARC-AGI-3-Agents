@@ -280,6 +280,20 @@ class ActiveInferenceEFE(Agent):
             1,
             _env_int("ACTIVE_INFERENCE_HIGH_INFO_MIN_SAMPLES_PER_TARGET", 2),
         )
+        self.high_info_coupled_min_samples = max(
+            int(self.high_info_min_samples_per_target),
+            _env_int(
+                "ACTIVE_INFERENCE_HIGH_INFO_COUPLED_MIN_SAMPLES",
+                max(3, int(self.high_info_min_samples_per_target) + 1),
+            ),
+        )
+        self.high_info_coupled_score_floor = max(
+            0.0,
+            min(
+                1.0,
+                _env_float("ACTIVE_INFERENCE_HIGH_INFO_COUPLED_SCORE_FLOOR", 0.76),
+            ),
+        )
         self.orientation_alignment_min_similarity = max(
             0.35,
             min(0.95, _env_float("ACTIVE_INFERENCE_ORIENTATION_MIN_SIMILARITY", 0.68)),
@@ -448,6 +462,17 @@ class ActiveInferenceEFE(Agent):
             "target_area": 0,
             "reason": "uninitialized",
         }
+        self._latest_navigation_target_features_v1: dict[str, Any] = {
+            "schema_name": "active_inference_navigation_target_features_v1",
+            "schema_version": 1,
+            "enabled": False,
+            "cross_like_enabled": False,
+            "cross_like_target_region": {"x": -1, "y": -1},
+            "gate_like_enabled": False,
+            "gate_like_target_region": {"x": -1, "y": -1},
+            "orientation_alignment_v1": dict(self._latest_orientation_alignment_state_v1),
+            "targets": [],
+        }
         self._blocked_edge_counts: dict[str, int] = {}
         self._edge_attempt_counts: dict[str, int] = {}
         self._region_visit_counts: dict[str, int] = {}
@@ -472,6 +497,8 @@ class ActiveInferenceEFE(Agent):
             "enabled": bool(self.enable_sequence_causal_term),
             "trigger_region_key": str(self.sequence_causal_trigger_region_key),
             "target_region_key": str(self.sequence_causal_target_region_key),
+            "trigger_region_key_effective": str(self.sequence_causal_trigger_region_key),
+            "target_region_key_effective": str(self.sequence_causal_target_region_key),
             "window_steps": int(self.sequence_causal_window_steps),
             "verify_window_steps": int(self.sequence_causal_verify_window_steps),
             "active": False,
@@ -504,8 +531,14 @@ class ActiveInferenceEFE(Agent):
             "current_target_region_key": "NA",
             "target_region_queue": [],
             "target_region_scores": {},
+            "target_required_samples": {},
             "target_sample_counts": {},
             "completed_target_regions": [],
+            "coupled_region_keys": [],
+            "primary_coupled_region_key": "NA",
+            "secondary_coupled_region_key": "NA",
+            "cross_region_key": "NA",
+            "gate_region_key": "NA",
             "verify_action_ids": [],
             "last_status": "idle",
         }
@@ -1537,6 +1570,248 @@ class ActiveInferenceEFE(Agent):
         return (int(rx), int(ry))
 
     @classmethod
+    def _region_key_from_region_payload_v1(
+        cls,
+        payload: dict[str, Any] | None,
+    ) -> str:
+        if not isinstance(payload, dict):
+            return "NA"
+        rx = int(payload.get("x", -1))
+        ry = int(payload.get("y", -1))
+        if rx < 0 or ry < 0:
+            return "NA"
+        region_key = f"{int(rx)}:{int(ry)}"
+        return str(region_key) if cls._parse_region_key_v1(region_key) is not None else "NA"
+
+    def _high_info_coupled_regions_v1(
+        self,
+        *,
+        fallback_source_region_key: str = "NA",
+    ) -> dict[str, Any]:
+        nav = (
+            self._latest_navigation_target_features_v1
+            if isinstance(self._latest_navigation_target_features_v1, dict)
+            else {}
+        )
+        nav_region_hints: dict[str, float] = {}
+        targets = nav.get("targets", [])
+        if isinstance(targets, list):
+            for row in targets:
+                if not isinstance(row, dict):
+                    continue
+                x = int(row.get("x", -1))
+                y = int(row.get("y", -1))
+                if x < 0 or y < 0:
+                    continue
+                region_key = f"{int(max(0, min(7, x // 8)))}:{int(max(0, min(7, y // 8)))}"
+                if self._parse_region_key_v1(region_key) is None:
+                    continue
+                hint = float(max(0.0, row.get("target_priority", row.get("salience", 0.0))))
+                nav_region_hints[str(region_key)] = max(
+                    float(nav_region_hints.get(str(region_key), 0.0)),
+                    float(min(1.0, hint)),
+                )
+
+        orientation_state = nav.get("orientation_alignment_v1", {})
+        if not isinstance(orientation_state, dict):
+            orientation_state = (
+                self._latest_orientation_alignment_state_v1
+                if isinstance(self._latest_orientation_alignment_state_v1, dict)
+                else {}
+            )
+        orientation_enabled = bool(orientation_state.get("enabled", False))
+        orientation_detected = bool(orientation_state.get("detected", False))
+        orientation_aligned = bool(orientation_state.get("aligned", False))
+        orientation_misaligned = bool(
+            orientation_enabled and orientation_detected and (not orientation_aligned)
+        )
+
+        scoreboard = self._high_info_region_scoreboard_v1(max_regions=64)
+        rows_raw = scoreboard.get("rows", [])
+        if not isinstance(rows_raw, list):
+            rows_raw = []
+        rows: list[dict[str, Any]] = []
+        for row in rows_raw:
+            if not isinstance(row, dict):
+                continue
+            region_key = str(row.get("region_key", "NA"))
+            if self._parse_region_key_v1(region_key) is None:
+                continue
+            rows.append(dict(row))
+        row_by_region = {
+            str(row.get("region_key", "NA")): dict(row)
+            for row in rows
+            if self._parse_region_key_v1(str(row.get("region_key", "NA"))) is not None
+        }
+
+        transition_pair_counts: dict[tuple[str, str], int] = {}
+        transition_source_totals: dict[str, int] = {}
+        for region_action_key, target_histogram in self._region_action_transition_counts.items():
+            if not isinstance(target_histogram, dict):
+                continue
+            try:
+                source_region_key, _ = str(region_action_key).split("|a", 1)
+            except Exception:
+                continue
+            if self._parse_region_key_v1(source_region_key) is None:
+                continue
+            total = 0
+            for target_region_key, count_raw in target_histogram.items():
+                target_key = str(target_region_key)
+                if self._parse_region_key_v1(target_key) is None:
+                    continue
+                count = int(max(0, count_raw))
+                if count <= 0:
+                    continue
+                total += int(count)
+                pair_key = (str(source_region_key), str(target_key))
+                transition_pair_counts[pair_key] = int(
+                    transition_pair_counts.get(pair_key, 0) + int(count)
+                )
+            if total > 0:
+                transition_source_totals[str(source_region_key)] = int(
+                    transition_source_totals.get(str(source_region_key), 0) + int(total)
+                )
+
+        fallback_key = str(fallback_source_region_key)
+        if self._parse_region_key_v1(fallback_key) is None:
+            fallback_key = "NA"
+        candidate_region_keys: set[str] = set(row_by_region.keys())
+        candidate_region_keys.update(str(k) for k in nav_region_hints.keys())
+        if fallback_key != "NA":
+            candidate_region_keys.add(str(fallback_key))
+
+        def _region_base_score(region_key: str) -> float:
+            row = row_by_region.get(str(region_key), {})
+            info_score = float(max(0.0, row.get("info_score", 0.0)))
+            coupling_score = float(max(0.0, row.get("coupling_signal_score", 0.0)))
+            cc_rate = float(max(0.0, row.get("cc_count_change_rate", 0.0)))
+            strong_rate = float(max(0.0, row.get("strong_change_rate", 0.0)))
+            progress_rate = float(max(0.0, row.get("progress_rate", 0.0)))
+            ui_suppression = float(max(0.0, min(1.0, row.get("ui_suppression", 0.0))))
+            attempts = int(max(0, row.get("attempts", 0)))
+            visit_count = int(max(0, self._region_visit_counts.get(str(region_key), 0)))
+            novelty = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 12.0)))
+            nav_hint = float(max(0.0, min(1.0, nav_region_hints.get(str(region_key), 0.0))))
+            support = float(1.0 - math.exp(-float(max(0, attempts)) / 4.0))
+            base = float(
+                (0.52 * info_score)
+                + (0.18 * coupling_score)
+                + (0.11 * cc_rate)
+                + (0.08 * strong_rate)
+                + (0.07 * progress_rate)
+                + (0.04 * nav_hint)
+            )
+            base = float(base * (1.0 - (0.85 * ui_suppression)))
+            base = float(base + (0.08 * novelty))
+            base = float((0.30 + (0.70 * support)) * base)
+            if str(region_key) == str(fallback_key):
+                base = float(base + 0.05)
+            return float(max(0.0, min(1.0, base)))
+
+        primary_candidates: list[tuple[float, int, int, str]] = []
+        for region_key in candidate_region_keys:
+            if self._parse_region_key_v1(str(region_key)) is None:
+                continue
+            score = float(_region_base_score(str(region_key)))
+            visit_count = int(max(0, self._region_visit_counts.get(str(region_key), 0)))
+            attempts = int(max(0, row_by_region.get(str(region_key), {}).get("attempts", 0)))
+            primary_candidates.append((float(score), -int(attempts), int(visit_count), str(region_key)))
+        primary_candidates.sort(key=lambda item: (-float(item[0]), int(item[1]), int(item[2]), str(item[3])))
+
+        primary_region_key = "NA"
+        primary_region_score = 0.0
+        if primary_candidates and float(primary_candidates[0][0]) >= 0.12:
+            primary_region_key = str(primary_candidates[0][3])
+            primary_region_score = float(primary_candidates[0][0])
+        elif fallback_key != "NA":
+            primary_region_key = str(fallback_key)
+            primary_region_score = float(_region_base_score(primary_region_key))
+
+        secondary_region_key = "NA"
+        secondary_region_score = 0.0
+        pair_affinity_score = 0.0
+        if self._parse_region_key_v1(primary_region_key) is not None:
+            secondary_candidates: list[tuple[float, int, int, str, float]] = []
+            for region_key in candidate_region_keys:
+                key = str(region_key)
+                if self._parse_region_key_v1(key) is None or key == str(primary_region_key):
+                    continue
+                forward = float(
+                    transition_pair_counts.get((str(primary_region_key), key), 0)
+                ) / float(max(1, transition_source_totals.get(str(primary_region_key), 0)))
+                backward = float(
+                    transition_pair_counts.get((key, str(primary_region_key)), 0)
+                ) / float(max(1, transition_source_totals.get(key, 0)))
+                pair_affinity = float(max(0.0, min(1.0, max(forward, backward))))
+                distance = int(self._region_distance_v1(str(primary_region_key), key))
+                distance_term = float(
+                    max(0.0, 1.0 - min(1.0, float(max(0, distance - 1)) / 6.0))
+                )
+                base = float(_region_base_score(key))
+                score = float(
+                    (0.62 * base)
+                    + (0.26 * pair_affinity)
+                    + (0.08 * distance_term)
+                    + (0.04 * float(max(0.0, nav_region_hints.get(key, 0.0))))
+                )
+                visit_count = int(max(0, self._region_visit_counts.get(key, 0)))
+                attempts = int(max(0, row_by_region.get(key, {}).get("attempts", 0)))
+                secondary_candidates.append(
+                    (
+                        float(score),
+                        -int(attempts),
+                        int(visit_count),
+                        str(key),
+                        float(pair_affinity),
+                    )
+                )
+            secondary_candidates.sort(
+                key=lambda item: (-float(item[0]), int(item[1]), int(item[2]), str(item[3]))
+            )
+            if secondary_candidates and float(secondary_candidates[0][0]) >= 0.10:
+                secondary_region_key = str(secondary_candidates[0][3])
+                secondary_region_score = float(secondary_candidates[0][0])
+                pair_affinity_score = float(secondary_candidates[0][4])
+            elif fallback_key != "NA" and str(fallback_key) != str(primary_region_key):
+                secondary_region_key = str(fallback_key)
+                secondary_region_score = float(_region_base_score(secondary_region_key))
+
+        coupled_region_keys: list[str] = []
+        if (
+            self._parse_region_key_v1(primary_region_key) is not None
+            and str(primary_region_key) not in coupled_region_keys
+        ):
+            coupled_region_keys.append(str(primary_region_key))
+        if (
+            self._parse_region_key_v1(secondary_region_key) is not None
+            and str(secondary_region_key) not in coupled_region_keys
+        ):
+            coupled_region_keys.append(str(secondary_region_key))
+        if (
+            fallback_key != "NA"
+            and self._parse_region_key_v1(fallback_key) is not None
+            and fallback_key not in coupled_region_keys
+            and len(coupled_region_keys) < 2
+        ):
+            coupled_region_keys.append(str(fallback_key))
+
+        return {
+            "selection_method": "dynamic_online_pair_v1",
+            "primary_region_key": str(primary_region_key),
+            "secondary_region_key": str(secondary_region_key),
+            "primary_region_score": float(primary_region_score),
+            "secondary_region_score": float(secondary_region_score),
+            "pair_affinity_score": float(pair_affinity_score),
+            "coupled_region_keys": list(coupled_region_keys),
+            "fallback_source_region_key": str(fallback_key),
+            "cross_region_key": str(primary_region_key),
+            "gate_region_key": str(secondary_region_key),
+            "orientation_aligned": bool(orientation_aligned),
+            "orientation_misaligned": bool(orientation_misaligned),
+        }
+
+    @classmethod
     def _region_distance_v1(
         cls,
         source_region_key: str,
@@ -1660,6 +1935,18 @@ class ActiveInferenceEFE(Agent):
             "enabled": bool(state.get("enabled", False)),
             "trigger_region_key": str(state.get("trigger_region_key", "2:4")),
             "target_region_key": str(state.get("target_region_key", "4:1")),
+            "trigger_region_key_effective": str(
+                state.get(
+                    "trigger_region_key_effective",
+                    state.get("trigger_region_key", "2:4"),
+                )
+            ),
+            "target_region_key_effective": str(
+                state.get(
+                    "target_region_key_effective",
+                    state.get("target_region_key", "4:1"),
+                )
+            ),
             "window_steps": int(state.get("window_steps", 0)),
             "verify_window_steps": int(state.get("verify_window_steps", 0)),
             "active": bool(state.get("active", False)),
@@ -1704,6 +1991,12 @@ class ActiveInferenceEFE(Agent):
         sample_counts = state.get("target_sample_counts", {})
         if not isinstance(sample_counts, dict):
             sample_counts = {}
+        required_samples = state.get("target_required_samples", {})
+        if not isinstance(required_samples, dict):
+            required_samples = {}
+        coupled_regions = state.get("coupled_region_keys", [])
+        if not isinstance(coupled_regions, list):
+            coupled_regions = []
         return {
             "schema_name": "active_inference_high_info_focus_state_v1",
             "schema_version": 1,
@@ -1725,11 +2018,24 @@ class ActiveInferenceEFE(Agent):
                 str(k): float(v)
                 for (k, v) in sorted(scores.items(), key=lambda item: str(item[0]))[:16]
             },
+            "target_required_samples": {
+                str(k): int(max(1, v))
+                for (k, v) in sorted(required_samples.items(), key=lambda item: str(item[0]))[
+                    :16
+                ]
+            },
             "target_sample_counts": {
                 str(k): int(max(0, v))
                 for (k, v) in sorted(sample_counts.items(), key=lambda item: str(item[0]))[:32]
             },
             "completed_target_regions": [str(v) for v in completed[-8:]],
+            "coupled_region_keys": [str(v) for v in coupled_regions[:8]],
+            "primary_coupled_region_key": str(state.get("primary_coupled_region_key", "NA")),
+            "secondary_coupled_region_key": str(
+                state.get("secondary_coupled_region_key", "NA")
+            ),
+            "cross_region_key": str(state.get("cross_region_key", "NA")),
+            "gate_region_key": str(state.get("gate_region_key", "NA")),
             "verify_action_ids": [int(v) for v in verify_action_ids],
             "last_status": str(state.get("last_status", "idle")),
         }
@@ -2157,9 +2463,25 @@ class ActiveInferenceEFE(Agent):
         sample_counts = state.get("target_sample_counts", {})
         if not isinstance(sample_counts, dict):
             sample_counts = {}
+        required_samples_map = state.get("target_required_samples", {})
+        if not isinstance(required_samples_map, dict):
+            required_samples_map = {}
+        coupled_regions = state.get("coupled_region_keys", [])
+        if not isinstance(coupled_regions, list):
+            coupled_regions = []
+        coupled_region_set = {str(v) for v in coupled_regions}
         target_sample_count = int(max(0, sample_counts.get(target_region_key, 0)))
+        required_samples = int(
+            max(
+                1,
+                required_samples_map.get(
+                    target_region_key,
+                    int(self.high_info_min_samples_per_target),
+                ),
+            )
+        )
         remaining_samples = int(
-            max(0, int(self.high_info_min_samples_per_target) - int(target_sample_count))
+            max(0, int(required_samples) - int(target_sample_count))
         )
         bonus_hint = 0.0
         penalty_hint = 0.0
@@ -2177,6 +2499,8 @@ class ActiveInferenceEFE(Agent):
                 penalty_hint += 0.20
             if remaining_samples > 0:
                 bonus_hint += float(min(0.45, 0.15 * float(remaining_samples)))
+                if str(target_region_key) in coupled_region_set:
+                    bonus_hint += float(min(0.48, 0.18 * float(remaining_samples)))
         urgency = float(
             min(
                 1.0,
@@ -2204,6 +2528,7 @@ class ActiveInferenceEFE(Agent):
             "steps_remaining": int(max(0, state.get("steps_remaining", 0))),
             "target_score": float(target_score),
             "target_sample_count": int(target_sample_count),
+            "required_samples": int(required_samples),
             "remaining_samples": int(remaining_samples),
             "distance_before": int(distance_before),
             "distance_after": int(distance_after),
@@ -2224,8 +2549,18 @@ class ActiveInferenceEFE(Agent):
         predicted_region_features: dict[str, Any] | None,
     ) -> dict[str, Any]:
         state = self._sequence_causal_state_snapshot_v1()
-        trigger_region_key = str(state.get("trigger_region_key", "2:4"))
-        target_region_key = str(state.get("target_region_key", "4:1"))
+        trigger_region_key = str(
+            state.get(
+                "trigger_region_key_effective",
+                state.get("trigger_region_key", "2:4"),
+            )
+        )
+        target_region_key = str(
+            state.get(
+                "target_region_key_effective",
+                state.get("target_region_key", "4:1"),
+            )
+        )
         current_region_key = self._current_region_key_v1()
         steps_remaining = int(max(0, state.get("steps_remaining", 0)))
         action_id = int(candidate.action_id)
@@ -2335,6 +2670,7 @@ class ActiveInferenceEFE(Agent):
             state["active"] = False
             state["stage"] = "idle"
             state["steps_remaining"] = 0
+            state["target_required_samples"] = {}
             state["last_status"] = "disabled"
             return
         verify_action_ids = sorted(
@@ -2377,12 +2713,41 @@ class ActiveInferenceEFE(Agent):
             if nav_rx >= 0 and nav_ry >= 0:
                 nav_region_key = f"{nav_rx}:{nav_ry}"
 
+        coupled_info = self._high_info_coupled_regions_v1(
+            fallback_source_region_key=str(source_region_key),
+        )
+        effective_trigger_region_key = str(trigger_region_key)
+        effective_target_region_key = str(target_region_key)
+        primary_region_key = str(
+            coupled_info.get("primary_region_key", coupled_info.get("cross_region_key", "NA"))
+        )
+        secondary_region_key = str(
+            coupled_info.get("secondary_region_key", coupled_info.get("gate_region_key", "NA"))
+        )
+        if self._parse_region_key_v1(primary_region_key) is not None:
+            effective_trigger_region_key = str(primary_region_key)
+        if self._parse_region_key_v1(secondary_region_key) is not None:
+            effective_target_region_key = str(secondary_region_key)
+        if str(effective_trigger_region_key) == str(effective_target_region_key):
+            effective_trigger_region_key = str(trigger_region_key)
+            effective_target_region_key = str(target_region_key)
+        state["trigger_region_key_effective"] = str(effective_trigger_region_key)
+        state["target_region_key_effective"] = str(effective_target_region_key)
+
         obs_change_type = str(getattr(causal_signature, "obs_change_type", ""))
+        in_trigger_region = bool(
+            str(source_region_key) == str(effective_trigger_region_key)
+            or str(nav_region_key) == str(effective_trigger_region_key)
+        )
+        orientation_aligned = bool(coupled_info.get("orientation_aligned", False))
         trigger_match = bool(
-            obs_change_type == "CC_COUNT_CHANGE"
+            in_trigger_region
             and (
-                str(source_region_key) == str(trigger_region_key)
-                or str(nav_region_key) == str(trigger_region_key)
+                obs_change_type == "CC_COUNT_CHANGE"
+                or (
+                    orientation_aligned
+                    and str(obs_change_type) not in ("", "NO_CHANGE")
+                )
             )
         )
         if trigger_match:
@@ -2404,8 +2769,8 @@ class ActiveInferenceEFE(Agent):
         state["steps_remaining"] = int(max(0, remaining))
         stage = str(state.get("stage", "idle"))
         in_target_region = bool(
-            str(nav_region_key) == str(target_region_key)
-            or str(source_region_key) == str(target_region_key)
+            str(nav_region_key) == str(effective_target_region_key)
+            or str(source_region_key) == str(effective_target_region_key)
         )
         if stage == "seek_target" and in_target_region:
             state["stage"] = "verify"
@@ -2454,6 +2819,12 @@ class ActiveInferenceEFE(Agent):
             state["active"] = False
             state["stage"] = "idle"
             state["steps_remaining"] = 0
+            state["trigger_region_key_effective"] = str(
+                state.get("trigger_region_key", self.sequence_causal_trigger_region_key)
+            )
+            state["target_region_key_effective"] = str(
+                state.get("target_region_key", self.sequence_causal_target_region_key)
+            )
             state["last_status"] = "disabled"
             return
 
@@ -2474,6 +2845,7 @@ class ActiveInferenceEFE(Agent):
             state["target_region_queue"] = []
             state["current_target_region_key"] = "NA"
             state["target_region_scores"] = {}
+            state["target_required_samples"] = {}
             state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
             state["last_status"] = "timeout"
 
@@ -2499,7 +2871,16 @@ class ActiveInferenceEFE(Agent):
             for (k, v) in target_sample_counts.items()
             if self._parse_region_key_v1(str(k)) is not None
         }
+        target_required_samples = state.get("target_required_samples", {})
+        if not isinstance(target_required_samples, dict):
+            target_required_samples = {}
+        target_required_samples = {
+            str(k): int(max(1, v))
+            for (k, v) in target_required_samples.items()
+            if self._parse_region_key_v1(str(k)) is not None
+        }
         min_samples_per_target = int(max(1, self.high_info_min_samples_per_target))
+        coupled_min_samples = int(max(min_samples_per_target, self.high_info_coupled_min_samples))
         high_value_threshold = float(
             max(0.0, min(1.0, float(self.high_info_focus_min_trigger_score)))
         )
@@ -2512,6 +2893,37 @@ class ActiveInferenceEFE(Agent):
         nav_region_key = self._current_region_key_v1()
         if self._parse_region_key_v1(source_region_key) is None:
             source_region_key = str(nav_region_key)
+        coupled_info = self._high_info_coupled_regions_v1(
+            fallback_source_region_key=str(source_region_key),
+        )
+        coupled_region_keys = {
+            str(v)
+            for v in coupled_info.get("coupled_region_keys", [])
+            if self._parse_region_key_v1(str(v)) is not None
+        }
+        primary_coupled_region_key = str(
+            coupled_info.get("primary_region_key", coupled_info.get("cross_region_key", "NA"))
+        )
+        secondary_coupled_region_key = str(
+            coupled_info.get("secondary_region_key", coupled_info.get("gate_region_key", "NA"))
+        )
+        if self._parse_region_key_v1(primary_coupled_region_key) is not None:
+            coupled_region_keys.add(str(primary_coupled_region_key))
+        if self._parse_region_key_v1(secondary_coupled_region_key) is not None:
+            coupled_region_keys.add(str(secondary_coupled_region_key))
+        orientation_misaligned = bool(coupled_info.get("orientation_misaligned", False))
+        coupled_floor = float(
+            max(
+                self.high_info_coupled_score_floor,
+                self.high_info_focus_min_trigger_score,
+            )
+        )
+
+        def _required_samples(region_key: str) -> int:
+            key = str(region_key)
+            if key in coupled_region_keys:
+                return int(coupled_min_samples)
+            return int(max(1, target_required_samples.get(key, min_samples_per_target)))
 
         obs_change_type = str(getattr(causal_signature, "obs_change_type", ""))
         changed_pixels = int(max(0, getattr(causal_signature, "changed_pixel_count", 0)))
@@ -2526,11 +2938,18 @@ class ActiveInferenceEFE(Agent):
         )
         trigger_score = float(trigger_semantics.get("info_trigger_score", 0.0))
         should_trigger = bool(
-            strong_event
+            (
+                strong_event
+                or (
+                    str(source_region_key) in coupled_region_keys
+                    and trigger_score >= 0.34
+                )
+            )
             and self._parse_region_key_v1(str(source_region_key)) is not None
             and (
                 trigger_score >= float(self.high_info_focus_min_trigger_score)
                 or obs_change_type == "CC_COUNT_CHANGE"
+                or str(source_region_key) in coupled_region_keys
             )
         )
 
@@ -2588,6 +3007,24 @@ class ActiveInferenceEFE(Agent):
                                 float(target_scores_local.get(key, 0.0)),
                                 float(0.52 + bbox_bonus + row_bias),
                             )
+            for region_key in coupled_region_keys:
+                base_floor = float(coupled_floor)
+                if region_key == str(primary_coupled_region_key):
+                    if orientation_misaligned:
+                        base_floor = float(min(1.0, base_floor + 0.14))
+                    if strong_event and str(source_region_key) == str(primary_coupled_region_key):
+                        base_floor = float(min(1.0, base_floor + 0.10))
+                elif region_key == str(secondary_coupled_region_key):
+                    if strong_event and str(source_region_key) == str(primary_coupled_region_key):
+                        base_floor = float(min(1.0, base_floor + 0.16))
+                    else:
+                        base_floor = float(min(1.0, base_floor + 0.06))
+                elif strong_event and str(source_region_key) == str(primary_coupled_region_key):
+                    base_floor = float(min(1.0, base_floor + 0.05))
+                target_scores_local[str(region_key)] = max(
+                    float(target_scores_local.get(str(region_key), 0.0)),
+                    float(base_floor),
+                )
             return target_scores_local
 
         def _rank_queue(
@@ -2596,10 +3033,9 @@ class ActiveInferenceEFE(Agent):
             anchor_region_key: str,
             completed_recent: set[str],
             sample_counts: dict[str, int],
-            min_samples: int,
         ) -> list[str]:
             current_target = str(state.get("current_target_region_key", "NA"))
-            rows: list[tuple[int, int, int, int, float, int, int, str]] = []
+            rows: list[tuple[int, int, int, int, int, float, int, int, str]] = []
             for region_key, score in target_scores_raw.items():
                 region_key = str(region_key)
                 if self._parse_region_key_v1(region_key) is None:
@@ -2608,7 +3044,11 @@ class ActiveInferenceEFE(Agent):
                 if score_value <= 0.0:
                     continue
                 sample_count = int(max(0, sample_counts.get(region_key, 0)))
-                remaining_samples = int(max(0, int(min_samples) - sample_count))
+                required_samples = int(_required_samples(region_key))
+                remaining_samples = int(max(0, int(required_samples) - sample_count))
+                if remaining_samples <= 0 and region_key in completed_recent:
+                    continue
+                coupled_priority = 0 if region_key in coupled_region_keys else 1
                 carry_priority = 0 if region_key == current_target else 1
                 completed_priority = 1 if region_key in completed_recent else 0
                 remaining_priority = 0 if remaining_samples > 0 else 1
@@ -2619,6 +3059,7 @@ class ActiveInferenceEFE(Agent):
                 adjusted_score = float(score_value + unsampled_bonus)
                 rows.append(
                     (
+                        int(coupled_priority),
                         int(remaining_priority),
                         int(high_value_priority),
                         int(carry_priority),
@@ -2630,7 +3071,16 @@ class ActiveInferenceEFE(Agent):
                     )
                 )
             rows.sort()
-            return [str(row[-1]) for row in rows]
+            queue = [str(row[-1]) for row in rows]
+            if not queue:
+                return []
+            coupled_head = [key for key in queue if key in coupled_region_keys]
+            non_coupled = [key for key in queue if key not in coupled_region_keys]
+            queue = coupled_head + non_coupled
+            max_targets = int(max(self.high_info_focus_max_targets, len(coupled_head)))
+            if max_targets > 0:
+                queue = queue[:max_targets]
+            return list(queue)
 
         if should_trigger:
             was_active_before_trigger = bool(state.get("active", False))
@@ -2638,8 +3088,9 @@ class ActiveInferenceEFE(Agent):
             merged_scores: dict[str, float] = {}
             for region_key, old_score in score_memory.items():
                 sample_count = int(max(0, target_sample_counts.get(str(region_key), 0)))
+                required_samples = int(_required_samples(str(region_key)))
                 retention_floor = (
-                    0.22 if sample_count < int(min_samples_per_target) else 0.0
+                    0.22 if sample_count < int(required_samples) else 0.0
                 )
                 merged_scores[str(region_key)] = float(max(0.0, 0.86 * float(old_score)))
                 if retention_floor > 0.0:
@@ -2656,7 +3107,7 @@ class ActiveInferenceEFE(Agent):
                 str(region_key)
                 for (region_key, sample_count) in target_sample_counts.items()
                 if self._parse_region_key_v1(str(region_key)) is not None
-                and int(sample_count) < int(min_samples_per_target)
+                and int(sample_count) < int(_required_samples(str(region_key)))
             }
             merged_scores = {
                 str(region_key): float(score)
@@ -2669,6 +3120,9 @@ class ActiveInferenceEFE(Agent):
             }
             for region_key in merged_scores.keys():
                 target_sample_counts.setdefault(str(region_key), 0)
+                target_required_samples[str(region_key)] = int(
+                    _required_samples(str(region_key))
+                )
             score_memory = dict(merged_scores)
             state["active"] = bool(score_memory)
             state["stage"] = "seek"
@@ -2684,6 +3138,13 @@ class ActiveInferenceEFE(Agent):
                     int(current_counter + int(self.high_info_focus_window_steps)),
                 )
             )
+            state["primary_coupled_region_key"] = str(primary_coupled_region_key)
+            state["secondary_coupled_region_key"] = str(secondary_coupled_region_key)
+            state["cross_region_key"] = str(primary_coupled_region_key)
+            state["gate_region_key"] = str(secondary_coupled_region_key)
+            state["coupled_region_keys"] = [
+                str(v) for v in sorted(coupled_region_keys)
+            ]
             state["last_status"] = (
                 "retriggered_chain" if was_active_before_trigger else "triggered"
             )
@@ -2692,6 +3153,12 @@ class ActiveInferenceEFE(Agent):
             state["target_region_scores"] = dict(score_memory)
             state["completed_target_regions"] = list(completed_regions[-16:])
             state["target_sample_counts"] = dict(target_sample_counts)
+            state["target_required_samples"] = dict(target_required_samples)
+            state["primary_coupled_region_key"] = str(primary_coupled_region_key)
+            state["secondary_coupled_region_key"] = str(secondary_coupled_region_key)
+            state["cross_region_key"] = str(primary_coupled_region_key)
+            state["gate_region_key"] = str(secondary_coupled_region_key)
+            state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
             return
 
         if not score_memory:
@@ -2705,7 +3172,6 @@ class ActiveInferenceEFE(Agent):
             anchor_region_key=str(anchor_key),
             completed_recent=completed_recent,
             sample_counts=target_sample_counts,
-            min_samples=int(min_samples_per_target),
         )
         if not queue:
             state["active"] = False
@@ -2718,6 +3184,12 @@ class ActiveInferenceEFE(Agent):
             state["last_status"] = "completed"
             state["completed_target_regions"] = list(completed_regions[-16:])
             state["target_sample_counts"] = dict(target_sample_counts)
+            state["target_required_samples"] = dict(target_required_samples)
+            state["primary_coupled_region_key"] = str(primary_coupled_region_key)
+            state["secondary_coupled_region_key"] = str(secondary_coupled_region_key)
+            state["cross_region_key"] = str(primary_coupled_region_key)
+            state["gate_region_key"] = str(secondary_coupled_region_key)
+            state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
             return
 
         deadline = int(state.get("deadline_action_counter", current_counter))
@@ -2728,15 +3200,36 @@ class ActiveInferenceEFE(Agent):
         state["target_region_scores"] = dict(score_memory)
         state["completed_target_regions"] = list(completed_regions[-16:])
         state["target_sample_counts"] = dict(target_sample_counts)
+        state["target_required_samples"] = {
+            str(region_key): int(_required_samples(str(region_key)))
+            for region_key in score_memory.keys()
+        }
+        target_required_samples = dict(state["target_required_samples"])
+        state["primary_coupled_region_key"] = str(primary_coupled_region_key)
+        state["secondary_coupled_region_key"] = str(secondary_coupled_region_key)
+        state["cross_region_key"] = str(primary_coupled_region_key)
+        state["gate_region_key"] = str(secondary_coupled_region_key)
+        state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
         state["stage"] = "seek"
         in_target_region = bool(str(nav_region_key) == str(target_region_key))
         if in_target_region:
-            sample_delta = 1 if (str(obs_change_type) != "NO_CHANGE" or int(changed_pixels) >= 2) else 0
+            coupled_target = bool(str(target_region_key) in coupled_region_keys)
+            sample_delta = (
+                1
+                if (
+                    coupled_target
+                    or str(obs_change_type) != "NO_CHANGE"
+                    or int(changed_pixels) >= 2
+                )
+                else 0
+            )
             target_sample_counts[str(target_region_key)] = int(
                 max(0, target_sample_counts.get(str(target_region_key), 0)) + int(sample_delta)
             )
             sample_count = int(max(0, target_sample_counts.get(str(target_region_key), 0)))
-            remaining_samples = int(max(0, int(min_samples_per_target) - sample_count))
+            required_samples = int(_required_samples(str(target_region_key)))
+            target_required_samples[str(target_region_key)] = int(required_samples)
+            remaining_samples = int(max(0, int(required_samples) - sample_count))
             if remaining_samples <= 0:
                 if not completed_regions or str(completed_regions[-1]) != str(target_region_key):
                     completed_regions.append(str(target_region_key))
@@ -2756,7 +3249,6 @@ class ActiveInferenceEFE(Agent):
                 anchor_region_key=str(nav_region_key),
                 completed_recent=set(str(v) for v in completed_regions[-8:]),
                 sample_counts=target_sample_counts,
-                min_samples=int(min_samples_per_target),
             )
             if remaining_samples <= 0:
                 refreshed_queue = [str(v) for v in refreshed_queue if str(v) != str(target_region_key)]
@@ -2765,6 +3257,7 @@ class ActiveInferenceEFE(Agent):
                 state["current_target_region_key"] = str(refreshed_queue[0])
                 state["target_region_scores"] = dict(score_memory)
                 state["target_sample_counts"] = dict(target_sample_counts)
+                state["target_required_samples"] = dict(target_required_samples)
                 state["last_status"] = (
                     "target_sampled"
                     if remaining_samples <= 0
@@ -2778,6 +3271,7 @@ class ActiveInferenceEFE(Agent):
                 state["target_region_queue"] = []
                 state["target_region_scores"] = {}
                 state["target_sample_counts"] = dict(target_sample_counts)
+                state["target_required_samples"] = dict(target_required_samples)
                 state["completion_count"] = int(state.get("completion_count", 0) + 1)
                 state["last_status"] = "completed"
 
@@ -3029,6 +3523,9 @@ class ActiveInferenceEFE(Agent):
                 "cross_like_enabled": False,
                 "cross_like_target_region": {"x": -1, "y": -1},
                 "cross_like_target_region_visit_count": 0,
+                "gate_like_enabled": False,
+                "gate_like_target_region": {"x": -1, "y": -1},
+                "gate_like_target_region_visit_count": 0,
                 "orientation_alignment_enabled": bool(orientation_alignment.get("enabled", False)),
                 "orientation_alignment_detected": bool(
                     orientation_alignment.get("detected", False)
@@ -3087,6 +3584,23 @@ class ActiveInferenceEFE(Agent):
             cross_like_enabled = False
             cross_like_target_region = {"x": -1, "y": -1}
             cross_like_target_region_visit_count = 0
+        gate_target = next(
+            (row for row in targets if str(row.get("kind", "")) == "gate_like"),
+            None,
+        )
+        if isinstance(gate_target, dict):
+            gate_rx = int(max(0, min(7, int(gate_target.get("centroid_x", -1)) // 8)))
+            gate_ry = int(max(0, min(7, int(gate_target.get("centroid_y", -1)) // 8)))
+            gate_region_key = f"{gate_rx}:{gate_ry}"
+            gate_like_enabled = True
+            gate_like_target_region = {"x": int(gate_rx), "y": int(gate_ry)}
+            gate_like_target_region_visit_count = int(
+                self._region_visit_counts.get(gate_region_key, 0)
+            )
+        else:
+            gate_like_enabled = False
+            gate_like_target_region = {"x": -1, "y": -1}
+            gate_like_target_region_visit_count = 0
 
         return {
             "schema_name": "active_inference_navigation_target_features_v1",
@@ -3111,6 +3625,9 @@ class ActiveInferenceEFE(Agent):
             "cross_like_enabled": bool(cross_like_enabled),
             "cross_like_target_region": dict(cross_like_target_region),
             "cross_like_target_region_visit_count": int(cross_like_target_region_visit_count),
+            "gate_like_enabled": bool(gate_like_enabled),
+            "gate_like_target_region": dict(gate_like_target_region),
+            "gate_like_target_region_visit_count": int(gate_like_target_region_visit_count),
             "orientation_alignment_enabled": bool(orientation_alignment.get("enabled", False)),
             "orientation_alignment_detected": bool(
                 orientation_alignment.get("detected", False)
@@ -4579,10 +5096,10 @@ class ActiveInferenceEFE(Agent):
             }
 
         previous, current = best_pair
-        peripheral_ui_likelihood = float(
+        peripheral_ui_score = float(
             max(0.0, min(1.0, best_metrics.get("peripheral_ui_likelihood", 0.0)))
         )
-        peripheral_ui_candidate = bool(peripheral_ui_likelihood >= 0.75)
+        peripheral_ui_candidate = bool(peripheral_ui_score >= 0.75)
         if peripheral_ui_candidate:
             return {
                 "schema_name": "active_inference_navigation_state_estimate_v1",
@@ -4590,7 +5107,7 @@ class ActiveInferenceEFE(Agent):
                 "matched": False,
                 "reason": "peripheral_ui_motion",
                 "peripheral_ui_candidate": True,
-                "peripheral_ui_likelihood": float(peripheral_ui_likelihood),
+                "peripheral_ui_likelihood": float(peripheral_ui_score),
                 "candidate_centroid_xy": {
                     "x": int(getattr(current, "centroid_x", -1)),
                     "y": int(getattr(current, "centroid_y", -1)),
@@ -4939,6 +5456,12 @@ class ActiveInferenceEFE(Agent):
                 self._latest_orientation_alignment_state_v1 = dict(
                     current_orientation_alignment
                 )
+                self._latest_navigation_target_features_v1 = dict(
+                    self._navigation_target_features_v1(
+                        packet,
+                        representation,
+                    )
+                )
                 self._update_operability_stats_v1(
                     executed_candidate=self._previous_action_candidate,
                     causal_signature=causal_signature,
@@ -5234,6 +5757,9 @@ class ActiveInferenceEFE(Agent):
                         navigation_target_features = self._navigation_target_features_v1(
                             packet,
                             representation,
+                        )
+                        self._latest_navigation_target_features_v1 = dict(
+                            navigation_target_features
                         )
                         if isinstance(
                             navigation_target_features.get("orientation_alignment_v1"),
