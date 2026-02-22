@@ -299,6 +299,40 @@ class ActiveInferenceEFE(Agent):
             0,
             _env_int("ACTIVE_INFERENCE_HIGH_INFO_RETRIGGER_COOLDOWN_STEPS", 10),
         )
+        self.high_info_simultaneous_focus_enabled = _env_bool(
+            "ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_FOCUS_ENABLED",
+            True,
+        )
+        self.high_info_simultaneous_min_region_pixels = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_MIN_REGION_PIXELS", 12),
+        )
+        self.high_info_simultaneous_top_region_ratio = max(
+            0.0,
+            min(
+                1.0,
+                _env_float("ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_TOP_REGION_RATIO", 0.30),
+            ),
+        )
+        self.high_info_simultaneous_max_targets = max(
+            1,
+            _env_int(
+                "ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_MAX_TARGETS",
+                max(3, int(self.high_info_focus_max_targets) + 1),
+            ),
+        )
+        self.high_info_simultaneous_min_total_pixels = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_MIN_TOTAL_PIXELS", 24),
+        )
+        self.high_info_reachability_graph_min_edges = max(
+            0,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_REACHABILITY_GRAPH_MIN_EDGES", 14),
+        )
+        self.high_info_reachability_graph_min_regions = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_REACHABILITY_GRAPH_MIN_REGIONS", 6),
+        )
         self.orientation_alignment_min_similarity = max(
             0.35,
             min(0.95, _env_float("ACTIVE_INFERENCE_ORIENTATION_MIN_SIMILARITY", 0.68)),
@@ -544,6 +578,12 @@ class ActiveInferenceEFE(Agent):
             "coupled_region_keys": [],
             "primary_coupled_region_key": "NA",
             "secondary_coupled_region_key": "NA",
+            "simultaneous_changed_region_keys": [],
+            "simultaneous_reachable_region_keys": [],
+            "simultaneous_unknown_region_keys": [],
+            "simultaneous_unreachable_region_keys": [],
+            "simultaneous_anchor_region_key": "NA",
+            "simultaneous_changed_total_pixels": 0,
             "cross_region_key": "NA",
             "gate_region_key": "NA",
             "verify_action_ids": [],
@@ -552,6 +592,8 @@ class ActiveInferenceEFE(Agent):
             "interaction_target_chain": [],
             "interaction_target_index": 0,
             "interaction_last_status": "idle",
+            "priority_subqueue_active": False,
+            "priority_subqueue_keys": [],
             "last_status": "idle",
         }
 
@@ -1977,6 +2019,287 @@ class ActiveInferenceEFE(Agent):
         dy = abs(int(sy) - int(ty))
         return bool(dx <= limit and dy <= limit)
 
+    def _region_graph_adjacency_v1(
+        self,
+        *,
+        min_edge_count: int = 1,
+    ) -> dict[str, dict[str, int]]:
+        threshold = int(max(1, min_edge_count))
+        adjacency: dict[str, dict[str, int]] = {}
+        for region_action_key, target_histogram in self._region_action_transition_counts.items():
+            if not isinstance(target_histogram, dict):
+                continue
+            try:
+                source_region_key, _ = str(region_action_key).split("|a", 1)
+            except Exception:
+                continue
+            if self._parse_region_key_v1(str(source_region_key)) is None:
+                continue
+            for target_region_key, count_raw in target_histogram.items():
+                target_key = str(target_region_key)
+                if self._parse_region_key_v1(target_key) is None:
+                    continue
+                count = int(max(0, count_raw))
+                if count < threshold:
+                    continue
+                if not self._region_step_plausible_v1(
+                    str(source_region_key),
+                    str(target_key),
+                    max_axis_step=1,
+                ):
+                    continue
+                if str(source_region_key) == str(target_key):
+                    continue
+                source_hist = adjacency.setdefault(str(source_region_key), {})
+                source_hist[str(target_key)] = max(
+                    int(source_hist.get(str(target_key), 0)),
+                    int(count),
+                )
+                adjacency.setdefault(str(target_key), {})
+        return adjacency
+
+    def _region_reachable_set_v1(
+        self,
+        adjacency: dict[str, dict[str, int]],
+        *,
+        start_region_key: str,
+    ) -> set[str]:
+        start_key = str(start_region_key)
+        if self._parse_region_key_v1(start_key) is None:
+            return set()
+        if not adjacency:
+            return {str(start_key)}
+        queue: list[str] = [str(start_key)]
+        visited: set[str] = {str(start_key)}
+        cursor = 0
+        while cursor < len(queue):
+            node = str(queue[cursor])
+            cursor += 1
+            neighbors = adjacency.get(str(node), {})
+            if not isinstance(neighbors, dict):
+                continue
+            for neighbor_key in neighbors.keys():
+                neighbor = str(neighbor_key)
+                if self._parse_region_key_v1(neighbor) is None:
+                    continue
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                queue.append(neighbor)
+        return visited
+
+    def _region_route_distance_v1(
+        self,
+        adjacency: dict[str, dict[str, int]],
+        *,
+        start_region_key: str,
+        goal_region_key: str,
+    ) -> int:
+        start_key = str(start_region_key)
+        goal_key = str(goal_region_key)
+        if self._parse_region_key_v1(start_key) is None:
+            return 10**6
+        if self._parse_region_key_v1(goal_key) is None:
+            return 10**6
+        if str(start_key) == str(goal_key):
+            return 0
+        if not adjacency:
+            return 10**6
+        if str(start_key) not in adjacency:
+            return 10**6
+        queue: list[tuple[str, int]] = [(str(start_key), 0)]
+        visited: set[str] = {str(start_key)}
+        cursor = 0
+        while cursor < len(queue):
+            node, distance = queue[cursor]
+            cursor += 1
+            neighbors = adjacency.get(str(node), {})
+            if not isinstance(neighbors, dict):
+                continue
+            for neighbor_key in neighbors.keys():
+                neighbor = str(neighbor_key)
+                if neighbor in visited:
+                    continue
+                if self._parse_region_key_v1(neighbor) is None:
+                    continue
+                next_distance = int(distance + 1)
+                if str(neighbor) == str(goal_key):
+                    return int(next_distance)
+                visited.add(neighbor)
+                queue.append((str(neighbor), int(next_distance)))
+        return 10**6
+
+    def _changed_region_diff_map_v1(
+        self,
+        *,
+        frame_before: list[list[int]],
+        frame_after: list[list[int]],
+        max_regions: int = 64,
+    ) -> dict[str, int]:
+        if not frame_before or not frame_after:
+            return {}
+        usable_height = int(min(len(frame_before), len(frame_after)))
+        if usable_height <= 0:
+            return {}
+        diff_counts: dict[str, int] = {}
+        for y in range(usable_height):
+            row_before = frame_before[y]
+            row_after = frame_after[y]
+            if not isinstance(row_before, list) or not isinstance(row_after, list):
+                continue
+            usable_width = int(min(len(row_before), len(row_after)))
+            for x in range(usable_width):
+                if int(row_before[x]) == int(row_after[x]):
+                    continue
+                rx = int(max(0, min(7, int(x) // 8)))
+                ry = int(max(0, min(7, int(y) // 8)))
+                region_key = f"{int(rx)}:{int(ry)}"
+                diff_counts[str(region_key)] = int(diff_counts.get(str(region_key), 0) + 1)
+        rows = sorted(diff_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))
+        if int(max_regions) > 0:
+            rows = rows[: int(max_regions)]
+        return {str(k): int(v) for (k, v) in rows if int(v) > 0}
+
+    def _simultaneous_changed_region_info_v1(
+        self,
+        *,
+        transition_record: TransitionRecordV1 | None,
+        source_region_key: str,
+        anchor_region_key: str,
+        region_adjacency: dict[str, dict[str, int]],
+        reachable_region_set: set[str],
+        reachability_graph_ready: bool,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "changed_region_keys": [],
+            "reachable_region_keys": [],
+            "unknown_region_keys": [],
+            "unreachable_region_keys": [],
+            "anchor_region_key": str(anchor_region_key),
+            "changed_total_pixels": 0,
+            "changed_region_diff_map": {},
+        }
+        if not bool(self.high_info_simultaneous_focus_enabled):
+            return result
+        if transition_record is None:
+            return result
+        effect_summary = transition_record.effect_summary
+        if not isinstance(effect_summary, dict):
+            return result
+        diff_map_raw = effect_summary.get("changed_region_diff_map_v1", {})
+        if not isinstance(diff_map_raw, dict):
+            return result
+        diff_map: dict[str, int] = {}
+        for region_key_raw, count_raw in diff_map_raw.items():
+            region_key = str(region_key_raw)
+            if self._parse_region_key_v1(region_key) is None:
+                continue
+            count = int(max(0, count_raw))
+            if count <= 0:
+                continue
+            diff_map[str(region_key)] = int(count)
+        if not diff_map:
+            return result
+        changed_total_pixels = int(sum(int(v) for v in diff_map.values()))
+        if int(changed_total_pixels) < int(self.high_info_simultaneous_min_total_pixels):
+            return result
+        result["changed_total_pixels"] = int(changed_total_pixels)
+        result["changed_region_diff_map"] = {
+            str(k): int(v)
+            for (k, v) in sorted(diff_map.items(), key=lambda item: (-int(item[1]), str(item[0])))
+        }
+        top_count = int(max(diff_map.values()))
+        min_pixels = int(max(1, int(self.high_info_simultaneous_min_region_pixels)))
+        top_ratio_floor = float(
+            max(0.0, min(1.0, float(self.high_info_simultaneous_top_region_ratio)))
+        )
+        sorted_regions = sorted(
+            diff_map.items(),
+            key=lambda item: (
+                -int(item[1]),
+                int(
+                    self._region_distance_v1(
+                        str(anchor_region_key),
+                        str(item[0]),
+                    )
+                ),
+                str(item[0]),
+            ),
+        )
+        selected: list[str] = []
+        for region_key, count in sorted_regions:
+            if int(count) < int(min_pixels):
+                continue
+            ratio_to_top = float(count) / float(max(1, top_count))
+            if ratio_to_top < float(top_ratio_floor):
+                continue
+            selected.append(str(region_key))
+        if len(selected) < 2:
+            for region_key, count in sorted_regions:
+                if int(count) < int(min_pixels):
+                    continue
+                key = str(region_key)
+                if key in selected:
+                    continue
+                selected.append(key)
+                if len(selected) >= 2:
+                    break
+        source_key = str(source_region_key)
+        if self._parse_region_key_v1(source_key) is not None and source_key not in selected:
+            selected.insert(0, str(source_key))
+        deduped_selected: list[str] = []
+        for region_key in selected:
+            key = str(region_key)
+            if self._parse_region_key_v1(key) is None:
+                continue
+            if key in deduped_selected:
+                continue
+            deduped_selected.append(key)
+        if len(deduped_selected) < 2:
+            return result
+        max_targets = int(max(1, self.high_info_simultaneous_max_targets))
+        if max_targets > 0:
+            deduped_selected = deduped_selected[:max_targets]
+        reachable_sorted: list[tuple[int, int, str]] = []
+        unknown_sorted: list[tuple[int, int, str]] = []
+        unreachable_sorted: list[tuple[int, int, str]] = []
+        reachable_set = {str(v) for v in reachable_region_set if self._parse_region_key_v1(str(v))}
+        for region_key in deduped_selected:
+            key = str(region_key)
+            count = int(max(0, diff_map.get(key, 0)))
+            route_distance = int(
+                self._region_route_distance_v1(
+                    region_adjacency,
+                    start_region_key=str(anchor_region_key),
+                    goal_region_key=str(key),
+                )
+            )
+            if route_distance >= 10**6:
+                route_distance = int(
+                    self._region_distance_v1(
+                        str(anchor_region_key),
+                        str(key),
+                    )
+                )
+            row = (int(route_distance), -int(count), str(key))
+            if key in reachable_set or str(key) == str(anchor_region_key):
+                reachable_sorted.append(row)
+            elif bool(reachability_graph_ready):
+                unreachable_sorted.append(row)
+            else:
+                unknown_sorted.append(row)
+        reachable_sorted.sort()
+        unknown_sorted.sort()
+        unreachable_sorted.sort()
+        changed_region_keys = [
+            str(row[2]) for row in (reachable_sorted + unknown_sorted + unreachable_sorted)
+        ]
+        result["changed_region_keys"] = list(changed_region_keys)
+        result["reachable_region_keys"] = [str(row[2]) for row in reachable_sorted]
+        result["unknown_region_keys"] = [str(row[2]) for row in unknown_sorted]
+        result["unreachable_region_keys"] = [str(row[2]) for row in unreachable_sorted]
+        return result
+
     def _current_region_key_v1(self) -> str:
         latest = (
             self._latest_navigation_state_estimate
@@ -2168,9 +2491,24 @@ class ActiveInferenceEFE(Agent):
         coupled_regions = state.get("coupled_region_keys", [])
         if not isinstance(coupled_regions, list):
             coupled_regions = []
+        simultaneous_regions = state.get("simultaneous_changed_region_keys", [])
+        if not isinstance(simultaneous_regions, list):
+            simultaneous_regions = []
+        simultaneous_reachable_regions = state.get("simultaneous_reachable_region_keys", [])
+        if not isinstance(simultaneous_reachable_regions, list):
+            simultaneous_reachable_regions = []
+        simultaneous_unknown_regions = state.get("simultaneous_unknown_region_keys", [])
+        if not isinstance(simultaneous_unknown_regions, list):
+            simultaneous_unknown_regions = []
+        simultaneous_unreachable_regions = state.get("simultaneous_unreachable_region_keys", [])
+        if not isinstance(simultaneous_unreachable_regions, list):
+            simultaneous_unreachable_regions = []
         interaction_chain = state.get("interaction_target_chain", [])
         if not isinstance(interaction_chain, list):
             interaction_chain = []
+        priority_subqueue = state.get("priority_subqueue_keys", [])
+        if not isinstance(priority_subqueue, list):
+            priority_subqueue = []
         return {
             "schema_name": "active_inference_high_info_focus_state_v1",
             "schema_version": 1,
@@ -2209,6 +2547,20 @@ class ActiveInferenceEFE(Agent):
             "secondary_coupled_region_key": str(
                 state.get("secondary_coupled_region_key", "NA")
             ),
+            "simultaneous_changed_region_keys": [str(v) for v in simultaneous_regions[:8]],
+            "simultaneous_reachable_region_keys": [
+                str(v) for v in simultaneous_reachable_regions[:8]
+            ],
+            "simultaneous_unknown_region_keys": [str(v) for v in simultaneous_unknown_regions[:8]],
+            "simultaneous_unreachable_region_keys": [
+                str(v) for v in simultaneous_unreachable_regions[:8]
+            ],
+            "simultaneous_anchor_region_key": str(
+                state.get("simultaneous_anchor_region_key", "NA")
+            ),
+            "simultaneous_changed_total_pixels": int(
+                max(0, state.get("simultaneous_changed_total_pixels", 0))
+            ),
             "cross_region_key": str(state.get("cross_region_key", "NA")),
             "gate_region_key": str(state.get("gate_region_key", "NA")),
             "verify_action_ids": [int(v) for v in verify_action_ids],
@@ -2219,6 +2571,8 @@ class ActiveInferenceEFE(Agent):
             "interaction_target_chain": [str(v) for v in interaction_chain[:16]],
             "interaction_target_index": int(max(0, state.get("interaction_target_index", 0))),
             "interaction_last_status": str(state.get("interaction_last_status", "idle")),
+            "priority_subqueue_active": bool(state.get("priority_subqueue_active", False)),
+            "priority_subqueue_keys": [str(v) for v in priority_subqueue[:16]],
             "last_status": str(state.get("last_status", "idle")),
         }
 
@@ -2629,6 +2983,30 @@ class ActiveInferenceEFE(Agent):
         current_region_key = str(raw_current_region_key)
         predicted_current_region_key = "NA"
         target_region_key = str(state.get("current_target_region_key", "NA"))
+        simultaneous_region_keys = state.get("simultaneous_changed_region_keys", [])
+        if not isinstance(simultaneous_region_keys, list):
+            simultaneous_region_keys = []
+        simultaneous_reachable_keys = state.get("simultaneous_reachable_region_keys", [])
+        if not isinstance(simultaneous_reachable_keys, list):
+            simultaneous_reachable_keys = []
+        simultaneous_unreachable_keys = state.get("simultaneous_unreachable_region_keys", [])
+        if not isinstance(simultaneous_unreachable_keys, list):
+            simultaneous_unreachable_keys = []
+        simultaneous_region_set = {
+            str(v)
+            for v in simultaneous_region_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        }
+        simultaneous_reachable_set = {
+            str(v)
+            for v in simultaneous_reachable_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        }
+        simultaneous_unreachable_set = {
+            str(v)
+            for v in simultaneous_unreachable_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        }
         predicted_region_key = str(current_region_key)
         predicted_region_visit_count = 0
         predicted_edge_attempts = 0
@@ -2662,8 +3040,37 @@ class ActiveInferenceEFE(Agent):
             and predicted_current_region_tuple is not None
             and str(raw_current_region_key) != str(predicted_current_region_key)
         )
-        distance_before = int(self._region_distance_v1(current_region_key, target_region_key))
-        distance_after = int(self._region_distance_v1(predicted_region_key, target_region_key))
+        region_adjacency = self._region_graph_adjacency_v1(min_edge_count=1)
+        route_distance_before = int(
+            self._region_route_distance_v1(
+                region_adjacency,
+                start_region_key=str(current_region_key),
+                goal_region_key=str(target_region_key),
+            )
+        )
+        route_distance_after = int(
+            self._region_route_distance_v1(
+                region_adjacency,
+                start_region_key=str(predicted_region_key),
+                goal_region_key=str(target_region_key),
+            )
+        )
+        distance_before = int(route_distance_before)
+        if distance_before >= 10**6:
+            distance_before = int(
+                self._region_distance_v1(
+                    str(current_region_key),
+                    str(target_region_key),
+                )
+            )
+        distance_after = int(route_distance_after)
+        if distance_after >= 10**6:
+            distance_after = int(
+                self._region_distance_v1(
+                    str(predicted_region_key),
+                    str(target_region_key),
+                )
+            )
         distance_delta = int(distance_after - distance_before)
         verify_action_ids = state.get("verify_action_ids", [])
         if not isinstance(verify_action_ids, list):
@@ -2745,6 +3152,13 @@ class ActiveInferenceEFE(Agent):
         high_block_loop_risk = bool(
             hard_block_loop_risk or persistent_self_loop_risk
         )
+        target_is_simultaneous = bool(str(target_region_key) in simultaneous_region_set)
+        target_is_reachable_simultaneous = bool(
+            str(target_region_key) in simultaneous_reachable_set
+        )
+        target_is_unreachable_simultaneous = bool(
+            str(target_region_key) in simultaneous_unreachable_set
+        )
         bonus_hint = 0.0
         penalty_hint = 0.0
         interaction_chain_active = bool(state.get("interaction_chain_active", False))
@@ -2771,6 +3185,8 @@ class ActiveInferenceEFE(Agent):
                     bonus_hint += float(sample_bonus + coupled_sample_bonus)
                     if interaction_chain_active:
                         bonus_hint += 0.12
+                    if target_is_reachable_simultaneous:
+                        bonus_hint += 0.28
                 elif moves_away_target:
                     penalty_hint += float(
                         min(0.42, 0.14 * float(max(0, remaining_samples)))
@@ -2781,10 +3197,14 @@ class ActiveInferenceEFE(Agent):
                         )
                     if interaction_chain_active:
                         penalty_hint += 0.36
+                    if target_is_reachable_simultaneous:
+                        penalty_hint += 0.54
                 else:
                     bonus_hint += float(0.10 * sample_bonus)
             elif verify_action_candidate:
                 bonus_hint += float(0.18 * sample_bonus)
+            if target_is_unreachable_simultaneous and action_id in (1, 2, 3, 4):
+                penalty_hint += 1.40
         urgency = float(
             min(
                 1.0,
@@ -2844,11 +3264,16 @@ class ActiveInferenceEFE(Agent):
             "distance_before": int(distance_before),
             "distance_after": int(distance_after),
             "distance_delta": int(distance_delta),
+            "target_route_distance_before": int(route_distance_before),
+            "target_route_distance_after": int(route_distance_after),
             "alternate_coupled_distance": int(alternate_coupled_distance),
             "moves_toward_target_region": bool(moves_toward_target),
             "moves_away_target_region": bool(moves_away_target),
             "reaches_target_region": bool(reaches_target),
             "stays_in_current_region": bool(stays_in_current_region),
+            "target_is_simultaneous_region": bool(target_is_simultaneous),
+            "target_is_reachable_simultaneous": bool(target_is_reachable_simultaneous),
+            "target_is_unreachable_simultaneous": bool(target_is_unreachable_simultaneous),
             "high_block_loop_risk": bool(high_block_loop_risk),
             "verify_action_ids": [int(v) for v in sorted(verify_action_set)],
             "verify_action_candidate": bool(verify_action_candidate),
@@ -3147,6 +3572,12 @@ class ActiveInferenceEFE(Agent):
             state["stage"] = "idle"
             state["steps_remaining"] = 0
             state["target_miss_streak"] = 0
+            state["simultaneous_changed_region_keys"] = []
+            state["simultaneous_reachable_region_keys"] = []
+            state["simultaneous_unknown_region_keys"] = []
+            state["simultaneous_unreachable_region_keys"] = []
+            state["simultaneous_anchor_region_key"] = "NA"
+            state["simultaneous_changed_total_pixels"] = 0
             state["interaction_chain_active"] = False
             state["interaction_target_chain"] = []
             state["interaction_target_index"] = 0
@@ -3179,10 +3610,18 @@ class ActiveInferenceEFE(Agent):
             state["current_target_region_key"] = "NA"
             state["target_region_scores"] = {}
             state["target_required_samples"] = {}
+            state["simultaneous_changed_region_keys"] = []
+            state["simultaneous_reachable_region_keys"] = []
+            state["simultaneous_unknown_region_keys"] = []
+            state["simultaneous_unreachable_region_keys"] = []
+            state["simultaneous_anchor_region_key"] = "NA"
+            state["simultaneous_changed_total_pixels"] = 0
             state["interaction_chain_active"] = False
             state["interaction_target_chain"] = []
             state["interaction_target_index"] = 0
             state["interaction_last_status"] = "timeout"
+            state["priority_subqueue_active"] = False
+            state["priority_subqueue_keys"] = []
             state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
             state["last_status"] = "timeout"
 
@@ -3216,6 +3655,42 @@ class ActiveInferenceEFE(Agent):
             for (k, v) in target_required_samples.items()
             if self._parse_region_key_v1(str(k)) is not None
         }
+        simultaneous_changed_region_keys = state.get("simultaneous_changed_region_keys", [])
+        if not isinstance(simultaneous_changed_region_keys, list):
+            simultaneous_changed_region_keys = []
+        simultaneous_changed_region_keys = [
+            str(v)
+            for v in simultaneous_changed_region_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        ]
+        simultaneous_reachable_region_keys = state.get("simultaneous_reachable_region_keys", [])
+        if not isinstance(simultaneous_reachable_region_keys, list):
+            simultaneous_reachable_region_keys = []
+        simultaneous_reachable_region_keys = [
+            str(v)
+            for v in simultaneous_reachable_region_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        ]
+        simultaneous_unknown_region_keys = state.get("simultaneous_unknown_region_keys", [])
+        if not isinstance(simultaneous_unknown_region_keys, list):
+            simultaneous_unknown_region_keys = []
+        simultaneous_unknown_region_keys = [
+            str(v)
+            for v in simultaneous_unknown_region_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        ]
+        simultaneous_unreachable_region_keys = state.get("simultaneous_unreachable_region_keys", [])
+        if not isinstance(simultaneous_unreachable_region_keys, list):
+            simultaneous_unreachable_region_keys = []
+        simultaneous_unreachable_region_keys = [
+            str(v)
+            for v in simultaneous_unreachable_region_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        ]
+        simultaneous_changed_total_pixels = int(
+            max(0, state.get("simultaneous_changed_total_pixels", 0))
+        )
+        simultaneous_anchor_region_key = str(state.get("simultaneous_anchor_region_key", "NA"))
         interaction_target_chain = state.get("interaction_target_chain", [])
         if not isinstance(interaction_target_chain, list):
             interaction_target_chain = []
@@ -3226,6 +3701,22 @@ class ActiveInferenceEFE(Agent):
         ]
         interaction_target_index = int(max(0, state.get("interaction_target_index", 0)))
         interaction_chain_active = bool(state.get("interaction_chain_active", False))
+        priority_subqueue_keys = state.get("priority_subqueue_keys", [])
+        if not isinstance(priority_subqueue_keys, list):
+            priority_subqueue_keys = []
+        deduped_priority_subqueue: list[str] = []
+        for region_key in priority_subqueue_keys:
+            key = str(region_key)
+            if self._parse_region_key_v1(key) is None:
+                continue
+            if key in deduped_priority_subqueue:
+                continue
+            deduped_priority_subqueue.append(key)
+        priority_subqueue_keys = list(deduped_priority_subqueue)
+        priority_subqueue_active = bool(
+            state.get("priority_subqueue_active", False)
+            and bool(priority_subqueue_keys)
+        )
         min_samples_per_target = int(max(1, self.high_info_min_samples_per_target))
         coupled_min_samples = int(max(min_samples_per_target, self.high_info_coupled_min_samples))
         coupled_progress_locked = bool(int(current_packet.levels_completed) <= 0)
@@ -3241,6 +3732,28 @@ class ActiveInferenceEFE(Agent):
         nav_region_key = self._current_region_key_v1()
         if self._parse_region_key_v1(source_region_key) is None:
             source_region_key = str(nav_region_key)
+        region_adjacency = self._region_graph_adjacency_v1(min_edge_count=1)
+        graph_edge_count = int(
+            sum(len(hist) for hist in region_adjacency.values() if isinstance(hist, dict))
+        )
+        known_region_count = int(len(self._region_visit_counts))
+        reachability_graph_ready = bool(
+            graph_edge_count >= int(self.high_info_reachability_graph_min_edges)
+            and known_region_count >= int(self.high_info_reachability_graph_min_regions)
+        )
+        reachability_anchor_key = str(nav_region_key)
+        if self._parse_region_key_v1(reachability_anchor_key) is None:
+            reachability_anchor_key = str(source_region_key)
+        reachable_region_set = self._region_reachable_set_v1(
+            region_adjacency,
+            start_region_key=str(reachability_anchor_key),
+        )
+        if self._parse_region_key_v1(str(reachability_anchor_key)) is not None:
+            reachable_region_set.add(str(reachability_anchor_key))
+        simultaneous_changed_set = set(simultaneous_changed_region_keys)
+        simultaneous_reachable_set = set(simultaneous_reachable_region_keys)
+        simultaneous_unknown_set = set(simultaneous_unknown_region_keys)
+        simultaneous_unreachable_set = set(simultaneous_unreachable_region_keys)
         coupled_info = self._high_info_coupled_regions_v1(
             fallback_source_region_key=str(source_region_key),
         )
@@ -3271,6 +3784,8 @@ class ActiveInferenceEFE(Agent):
             key = str(region_key)
             if key in coupled_region_keys:
                 return int(coupled_min_samples)
+            if key in simultaneous_reachable_set:
+                return int(max(min_samples_per_target + 1, coupled_min_samples))
             return int(max(1, target_required_samples.get(key, min_samples_per_target)))
 
         obs_change_type = str(getattr(causal_signature, "obs_change_type", ""))
@@ -3378,6 +3893,116 @@ class ActiveInferenceEFE(Agent):
                 and level_delta_now <= 0
             ):
                 should_trigger = False
+            elif (
+                (not strong_event)
+                and level_delta_now <= 0
+                and int(changed_pixels) < int(self.high_info_simultaneous_min_total_pixels)
+            ):
+                should_trigger = False
+
+        simultaneous_info = self._simultaneous_changed_region_info_v1(
+            transition_record=transition_record,
+            source_region_key=str(source_region_key),
+            anchor_region_key=str(reachability_anchor_key),
+            region_adjacency=region_adjacency,
+            reachable_region_set=reachable_region_set,
+            reachability_graph_ready=reachability_graph_ready,
+        )
+        simultaneous_changed_now = [
+            str(v) for v in simultaneous_info.get("changed_region_keys", [])
+        ]
+        simultaneous_reachable_now = [
+            str(v) for v in simultaneous_info.get("reachable_region_keys", [])
+        ]
+        simultaneous_unknown_now = [
+            str(v) for v in simultaneous_info.get("unknown_region_keys", [])
+        ]
+        simultaneous_unreachable_now = [
+            str(v) for v in simultaneous_info.get("unreachable_region_keys", [])
+        ]
+        simultaneous_anchor_now = str(
+            simultaneous_info.get("anchor_region_key", reachability_anchor_key)
+        )
+        simultaneous_pixels_now = int(
+            max(0, simultaneous_info.get("changed_total_pixels", 0))
+        )
+        simultaneous_refresh = bool(
+            should_trigger
+            and simultaneous_changed_now
+            and int(simultaneous_pixels_now) >= int(self.high_info_simultaneous_min_total_pixels)
+            and (
+                len(simultaneous_changed_now) >= 2
+                or level_delta_now > 0
+            )
+        )
+        if simultaneous_refresh:
+            simultaneous_changed_region_keys = list(simultaneous_changed_now)
+            simultaneous_reachable_region_keys = list(simultaneous_reachable_now)
+            simultaneous_unknown_region_keys = list(simultaneous_unknown_now)
+            simultaneous_unreachable_region_keys = list(simultaneous_unreachable_now)
+            simultaneous_anchor_region_key = str(simultaneous_anchor_now)
+            simultaneous_changed_total_pixels = int(simultaneous_pixels_now)
+            simultaneous_changed_set = set(simultaneous_changed_region_keys)
+            simultaneous_reachable_set = set(simultaneous_reachable_region_keys)
+            simultaneous_unknown_set = set(simultaneous_unknown_region_keys)
+            simultaneous_unreachable_set = set(simultaneous_unreachable_region_keys)
+        simultaneous_focus_candidates = [
+            str(v)
+            for v in simultaneous_changed_region_keys
+            if self._parse_region_key_v1(str(v)) is not None
+            and not (
+                str(v) in simultaneous_unreachable_set
+                and bool(reachability_graph_ready)
+            )
+        ]
+        simultaneous_focus_candidate_set = set(simultaneous_focus_candidates)
+        simultaneous_priority_set = set(simultaneous_reachable_region_keys) | set(
+            simultaneous_unknown_region_keys
+        )
+        if not simultaneous_priority_set:
+            simultaneous_priority_set = set(simultaneous_focus_candidate_set)
+        simultaneous_touches_coupled = bool(
+            bool(simultaneous_focus_candidate_set & set(coupled_region_keys))
+            or str(source_region_key) in set(coupled_region_keys)
+            or level_delta_now > 0
+        )
+        simultaneous_focus_reset = bool(
+            simultaneous_refresh
+            and len(simultaneous_focus_candidates) >= 2
+            and simultaneous_touches_coupled
+        )
+        if simultaneous_focus_reset:
+            ordered_priority_rows: list[tuple[int, int, str]] = []
+            for region_key in simultaneous_focus_candidates:
+                route_distance = int(
+                    self._region_route_distance_v1(
+                        region_adjacency,
+                        start_region_key=str(source_region_key),
+                        goal_region_key=str(region_key),
+                    )
+                )
+                if route_distance >= 10**6:
+                    route_distance = int(
+                        self._region_distance_v1(
+                            str(source_region_key),
+                            str(region_key),
+                        )
+                    )
+                region_diff = int(
+                    max(
+                        0,
+                        (simultaneous_info.get("changed_region_diff_map", {}) or {}).get(
+                            str(region_key),
+                            0,
+                        ),
+                    )
+                )
+                ordered_priority_rows.append(
+                    (int(route_distance), -int(region_diff), str(region_key))
+                )
+            ordered_priority_rows.sort()
+            priority_subqueue_keys = [str(row[2]) for row in ordered_priority_rows]
+            priority_subqueue_active = bool(len(priority_subqueue_keys) >= 2)
 
         def _collect_hot_targets(anchor_region_key: str) -> dict[str, float]:
             target_scores_local: dict[str, float] = {}
@@ -3448,21 +4073,72 @@ class ActiveInferenceEFE(Agent):
                     float(target_scores_local.get(region_key, 0.0)),
                     float(score),
                 )
+            if simultaneous_changed_set:
+                max_targets = int(max(1, self.high_info_simultaneous_max_targets))
+                ordered_changed = [
+                    str(v)
+                    for v in simultaneous_changed_region_keys
+                    if self._parse_region_key_v1(str(v)) is not None
+                ][:max_targets]
+                for idx, region_key in enumerate(ordered_changed):
+                    if (
+                        str(region_key) in simultaneous_unreachable_set
+                        and bool(reachability_graph_ready)
+                    ):
+                        continue
+                    route_distance = int(
+                        self._region_route_distance_v1(
+                            region_adjacency,
+                            start_region_key=str(anchor_region_key),
+                            goal_region_key=str(region_key),
+                        )
+                    )
+                    if route_distance >= 10**6:
+                        route_distance = int(
+                            self._region_distance_v1(
+                                str(anchor_region_key),
+                                str(region_key),
+                            )
+                        )
+                    route_bonus = float(max(0.0, 0.18 - (0.04 * float(route_distance))))
+                    rank_penalty = float(0.05 * float(idx))
+                    base_score = float(0.74 + route_bonus - rank_penalty)
+                    if str(region_key) in simultaneous_reachable_set:
+                        base_score = float(base_score + 0.16)
+                    elif str(region_key) in simultaneous_unknown_set:
+                        base_score = float(base_score + 0.08)
+                    if str(region_key) == str(anchor_region_key):
+                        base_score = float(base_score + 0.06)
+                    target_scores_local[str(region_key)] = max(
+                        float(target_scores_local.get(str(region_key), 0.0)),
+                        float(max(0.0, min(1.0, base_score))),
+                    )
 
             changed_bbox = getattr(causal_signature, "changed_bbox", None)
             frame_height = int(len(current_packet.frame))
             frame_width = int(len(current_packet.frame[0])) if frame_height > 0 else 0
             frame_area = int(max(1, frame_height * frame_width))
-            if (
-                isinstance(changed_bbox, dict)
-                and frame_height > 0
-                and frame_width > 0
-                and int(changed_pixels) < int(0.65 * float(frame_area))
-            ):
+            bbox_values: tuple[int, int, int, int] | None = None
+            if isinstance(changed_bbox, dict):
                 min_x = int(changed_bbox.get("min_x", -1))
                 max_x = int(changed_bbox.get("max_x", -1))
                 min_y = int(changed_bbox.get("min_y", -1))
                 max_y = int(changed_bbox.get("max_y", -1))
+                bbox_values = (int(min_x), int(min_y), int(max_x), int(max_y))
+            elif isinstance(changed_bbox, (tuple, list)) and len(changed_bbox) >= 4:
+                bbox_values = (
+                    int(changed_bbox[0]),
+                    int(changed_bbox[1]),
+                    int(changed_bbox[2]),
+                    int(changed_bbox[3]),
+                )
+            if (
+                bbox_values is not None
+                and frame_height > 0
+                and frame_width > 0
+                and int(changed_pixels) < int(0.65 * float(frame_area))
+            ):
+                min_x, min_y, max_x, max_y = bbox_values
                 if min_x >= 0 and max_x >= min_x and min_y >= 0 and max_y >= min_y:
                     min_rx = int(max(0, min(7, min_x // 8)))
                     max_rx = int(max(0, min(7, max_x // 8)))
@@ -3519,10 +4195,15 @@ class ActiveInferenceEFE(Agent):
             sample_counts: dict[str, int],
         ) -> list[str]:
             current_target = str(state.get("current_target_region_key", "NA"))
-            rows: list[tuple[int, int, int, int, int, float, int, int, str]] = []
+            rows: list[tuple[int, int, int, int, int, int, float, int, int, str]] = []
             for region_key, score in target_scores_raw.items():
                 region_key = str(region_key)
                 if self._parse_region_key_v1(region_key) is None:
+                    continue
+                if (
+                    region_key in simultaneous_unreachable_set
+                    and bool(reachability_graph_ready)
+                ):
                     continue
                 score_value = float(score)
                 if score_value <= 0.0:
@@ -3536,20 +4217,40 @@ class ActiveInferenceEFE(Agent):
                 carry_priority = 0 if region_key == current_target else 1
                 completed_priority = 1 if region_key in completed_recent else 0
                 remaining_priority = 0 if remaining_samples > 0 else 1
+                simultaneous_priority = 2
+                if region_key in simultaneous_reachable_set:
+                    simultaneous_priority = 0
+                elif region_key in simultaneous_unknown_set:
+                    simultaneous_priority = 1
                 high_value_priority = (
                     0 if score_value >= float(high_value_threshold) else 1
                 )
                 unsampled_bonus = 0.12 if sample_count <= 0 else 0.0
                 adjusted_score = float(score_value + unsampled_bonus)
+                route_distance = int(
+                    self._region_route_distance_v1(
+                        region_adjacency,
+                        start_region_key=str(anchor_region_key),
+                        goal_region_key=str(region_key),
+                    )
+                )
+                if route_distance >= 10**6:
+                    route_distance = int(
+                        self._region_distance_v1(
+                            str(anchor_region_key),
+                            str(region_key),
+                        )
+                    )
                 rows.append(
                     (
+                        int(simultaneous_priority),
                         int(coupled_priority),
                         int(remaining_priority),
                         int(high_value_priority),
                         int(carry_priority),
                         int(completed_priority),
                         float(-adjusted_score),
-                        int(self._region_distance_v1(str(anchor_region_key), region_key)),
+                        int(route_distance),
                         int(self._region_visit_counts.get(region_key, 0)),
                         region_key,
                     )
@@ -3558,9 +4259,20 @@ class ActiveInferenceEFE(Agent):
             queue = [str(row[-1]) for row in rows]
             if not queue:
                 return []
-            coupled_head = [key for key in queue if key in coupled_region_keys]
-            non_coupled = [key for key in queue if key not in coupled_region_keys]
-            if coupled_progress_locked and coupled_head and non_coupled:
+            simultaneous_head = [
+                key
+                for key in queue
+                if key in simultaneous_reachable_set or key in simultaneous_unknown_set
+            ]
+            coupled_head = [key for key in queue if key in coupled_region_keys and key not in simultaneous_head]
+            non_coupled = [
+                key
+                for key in queue
+                if key not in coupled_region_keys and key not in simultaneous_head
+            ]
+            if simultaneous_head:
+                queue = simultaneous_head + coupled_head + non_coupled
+            elif coupled_progress_locked and coupled_head and non_coupled:
                 high_non_coupled = [
                     str(key)
                     for key in non_coupled
@@ -3648,12 +4360,78 @@ class ActiveInferenceEFE(Agent):
                     float(merged_scores.get(str(region_key), 0.0)),
                     float(new_score),
                 )
+            focus_lock_active = bool(
+                simultaneous_focus_reset
+                or (
+                    was_active_before_trigger
+                    and len(coupled_region_keys) >= 2
+                    and int(changed_pixels) >= int(self.high_info_simultaneous_min_total_pixels)
+                )
+            )
+            focus_lock_keys: set[str] = set()
+            if simultaneous_changed_set:
+                ordered_simultaneous = [
+                    str(v)
+                    for v in simultaneous_changed_region_keys
+                    if self._parse_region_key_v1(str(v)) is not None
+                ]
+                for idx, region_key in enumerate(ordered_simultaneous):
+                    if (
+                        str(region_key) in simultaneous_unreachable_set
+                        and bool(reachability_graph_ready)
+                    ):
+                        continue
+                    base_score = float(max(0.64, 0.94 - (0.08 * float(idx))))
+                    if str(region_key) in simultaneous_reachable_set:
+                        base_score = float(min(1.0, base_score + 0.08))
+                    merged_scores[str(region_key)] = max(
+                        float(merged_scores.get(str(region_key), 0.0)),
+                        float(base_score),
+                    )
+            if focus_lock_active:
+                if simultaneous_focus_reset and simultaneous_focus_candidate_set:
+                    focus_lock_keys = set(simultaneous_focus_candidate_set)
+                    if self._parse_region_key_v1(str(source_region_key)) is not None:
+                        focus_lock_keys.add(str(source_region_key))
+                    for idx, region_key in enumerate(simultaneous_focus_candidates):
+                        focus_boost = float(max(0.74, 0.98 - (0.08 * float(idx))))
+                        merged_scores[str(region_key)] = max(
+                            float(merged_scores.get(str(region_key), 0.0)),
+                            float(focus_boost),
+                        )
+                else:
+                    focus_lock_keys = {
+                        str(v)
+                        for v in simultaneous_changed_region_keys
+                        if self._parse_region_key_v1(str(v)) is not None
+                    }
+                    for idx, region_key in enumerate(sorted(coupled_region_keys)):
+                        if self._parse_region_key_v1(str(region_key)) is None:
+                            continue
+                        focus_lock_keys.add(str(region_key))
+                        coupled_floor_boost = float(max(0.72, 0.94 - (0.10 * float(idx))))
+                        merged_scores[str(region_key)] = max(
+                            float(merged_scores.get(str(region_key), 0.0)),
+                            float(coupled_floor_boost),
+                        )
+                    if self._parse_region_key_v1(str(source_region_key)) is not None:
+                        focus_lock_keys.add(str(source_region_key))
+                if focus_lock_keys and (not simultaneous_focus_reset):
+                    merged_scores = {
+                        str(region_key): float(score)
+                        for (region_key, score) in merged_scores.items()
+                        if str(region_key) in focus_lock_keys
+                    }
             min_keep = float(max(0.08, 0.35 * float(self.high_info_focus_min_trigger_score)))
             mandatory_keep = {
                 str(region_key)
                 for (region_key, sample_count) in target_sample_counts.items()
                 if self._parse_region_key_v1(str(region_key)) is not None
                 and int(sample_count) < int(_required_samples(str(region_key)))
+                and (
+                    (not focus_lock_active)
+                    or str(region_key) in focus_lock_keys
+                )
             }
             merged_scores = {
                 str(region_key): float(score)
@@ -3663,12 +4441,29 @@ class ActiveInferenceEFE(Agent):
                     float(score) >= min_keep
                     or str(region_key) in mandatory_keep
                 )
+                and not (
+                    str(region_key) in simultaneous_unreachable_set
+                    and bool(reachability_graph_ready)
+                )
             }
             for region_key in merged_scores.keys():
                 target_sample_counts.setdefault(str(region_key), 0)
                 target_required_samples[str(region_key)] = int(
-                    _required_samples(str(region_key))
+                    max(
+                        _required_samples(str(region_key)),
+                        target_required_samples.get(str(region_key), 0),
+                    )
                 )
+            if simultaneous_focus_reset and priority_subqueue_keys:
+                for region_key in priority_subqueue_keys:
+                    target_sample_counts.setdefault(str(region_key), 0)
+                    target_required_samples[str(region_key)] = int(
+                        max(
+                            target_required_samples.get(str(region_key), 0),
+                            _required_samples(str(region_key)),
+                            2,
+                        )
+                    )
             score_memory = dict(merged_scores)
             state["active"] = bool(score_memory)
             state["stage"] = "seek"
@@ -3686,6 +4481,22 @@ class ActiveInferenceEFE(Agent):
             )
             state["primary_coupled_region_key"] = str(primary_coupled_region_key)
             state["secondary_coupled_region_key"] = str(secondary_coupled_region_key)
+            state["simultaneous_changed_region_keys"] = [
+                str(v) for v in simultaneous_changed_region_keys[:16]
+            ]
+            state["simultaneous_reachable_region_keys"] = [
+                str(v) for v in simultaneous_reachable_region_keys[:16]
+            ]
+            state["simultaneous_unknown_region_keys"] = [
+                str(v) for v in simultaneous_unknown_region_keys[:16]
+            ]
+            state["simultaneous_unreachable_region_keys"] = [
+                str(v) for v in simultaneous_unreachable_region_keys[:16]
+            ]
+            state["simultaneous_anchor_region_key"] = str(simultaneous_anchor_region_key)
+            state["simultaneous_changed_total_pixels"] = int(
+                max(0, simultaneous_changed_total_pixels)
+            )
             state["cross_region_key"] = str(primary_coupled_region_key)
             state["gate_region_key"] = str(secondary_coupled_region_key)
             state["coupled_region_keys"] = [
@@ -3697,10 +4508,28 @@ class ActiveInferenceEFE(Agent):
                 completed_recent=set(),
                 sample_counts=target_sample_counts,
             )
-            interaction_chain = _build_interaction_chain(
-                list(seed_queue),
-                source_key=str(source_region_key),
-            )
+            if priority_subqueue_active and priority_subqueue_keys:
+                priority_seed_queue = [
+                    str(v) for v in seed_queue if str(v) in set(priority_subqueue_keys)
+                ]
+                if len(priority_seed_queue) >= 2:
+                    interaction_chain = _build_interaction_chain(
+                        list(priority_seed_queue),
+                        source_key=str(source_region_key),
+                    )
+                    priority_subqueue_keys = list(priority_seed_queue)
+                else:
+                    priority_subqueue_active = False
+                    priority_subqueue_keys = []
+                    interaction_chain = _build_interaction_chain(
+                        list(seed_queue),
+                        source_key=str(source_region_key),
+                    )
+            else:
+                interaction_chain = _build_interaction_chain(
+                    list(seed_queue),
+                    source_key=str(source_region_key),
+                )
             interaction_chain_active = bool(len(interaction_chain) >= 2)
             interaction_target_chain = list(interaction_chain)
             interaction_target_index = 0
@@ -3716,8 +4545,12 @@ class ActiveInferenceEFE(Agent):
                 state["interaction_target_chain"] = []
                 state["interaction_target_index"] = 0
                 state["interaction_last_status"] = "insufficient_chain"
+            state["priority_subqueue_active"] = bool(priority_subqueue_active)
+            state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
             state["last_status"] = (
-                "retriggered_chain" if was_active_before_trigger else "triggered"
+                "retriggered_chain_focus_reset"
+                if simultaneous_focus_reset
+                else ("retriggered_chain" if was_active_before_trigger else "triggered")
             )
 
         if not bool(state.get("active", False)):
@@ -3779,6 +4612,24 @@ class ActiveInferenceEFE(Agent):
                         state["completed_target_regions"] = list(completed_regions[-16:])
                         state["primary_coupled_region_key"] = str(primary_coupled_region_key)
                         state["secondary_coupled_region_key"] = str(secondary_coupled_region_key)
+                        state["simultaneous_changed_region_keys"] = [
+                            str(v) for v in simultaneous_changed_region_keys[:16]
+                        ]
+                        state["simultaneous_reachable_region_keys"] = [
+                            str(v) for v in simultaneous_reachable_region_keys[:16]
+                        ]
+                        state["simultaneous_unknown_region_keys"] = [
+                            str(v) for v in simultaneous_unknown_region_keys[:16]
+                        ]
+                        state["simultaneous_unreachable_region_keys"] = [
+                            str(v) for v in simultaneous_unreachable_region_keys[:16]
+                        ]
+                        state["simultaneous_anchor_region_key"] = str(
+                            simultaneous_anchor_region_key
+                        )
+                        state["simultaneous_changed_total_pixels"] = int(
+                            max(0, simultaneous_changed_total_pixels)
+                        )
                         state["cross_region_key"] = str(primary_coupled_region_key)
                         state["gate_region_key"] = str(secondary_coupled_region_key)
                         state["coupled_region_keys"] = [
@@ -3792,6 +4643,8 @@ class ActiveInferenceEFE(Agent):
                             if interaction_chain_active
                             else "rearm_single"
                         )
+                        state["priority_subqueue_active"] = False
+                        state["priority_subqueue_keys"] = []
                         state["last_status"] = "idle_rearm"
                         return
             state["target_region_scores"] = dict(score_memory)
@@ -3801,12 +4654,30 @@ class ActiveInferenceEFE(Agent):
             state["target_required_samples"] = dict(target_required_samples)
             state["primary_coupled_region_key"] = str(primary_coupled_region_key)
             state["secondary_coupled_region_key"] = str(secondary_coupled_region_key)
+            state["simultaneous_changed_region_keys"] = [
+                str(v) for v in simultaneous_changed_region_keys[:16]
+            ]
+            state["simultaneous_reachable_region_keys"] = [
+                str(v) for v in simultaneous_reachable_region_keys[:16]
+            ]
+            state["simultaneous_unknown_region_keys"] = [
+                str(v) for v in simultaneous_unknown_region_keys[:16]
+            ]
+            state["simultaneous_unreachable_region_keys"] = [
+                str(v) for v in simultaneous_unreachable_region_keys[:16]
+            ]
+            state["simultaneous_anchor_region_key"] = str(simultaneous_anchor_region_key)
+            state["simultaneous_changed_total_pixels"] = int(
+                max(0, simultaneous_changed_total_pixels)
+            )
             state["cross_region_key"] = str(primary_coupled_region_key)
             state["gate_region_key"] = str(secondary_coupled_region_key)
             state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
             state["interaction_chain_active"] = bool(interaction_chain_active)
             state["interaction_target_chain"] = list(interaction_target_chain[:16])
             state["interaction_target_index"] = int(max(0, interaction_target_index))
+            state["priority_subqueue_active"] = bool(priority_subqueue_active)
+            state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
             return
 
         if not score_memory:
@@ -3829,10 +4700,18 @@ class ActiveInferenceEFE(Agent):
             state["current_target_region_key"] = "NA"
             state["target_region_queue"] = []
             state["target_region_scores"] = {}
+            state["simultaneous_changed_region_keys"] = []
+            state["simultaneous_reachable_region_keys"] = []
+            state["simultaneous_unknown_region_keys"] = []
+            state["simultaneous_unreachable_region_keys"] = []
+            state["simultaneous_anchor_region_key"] = "NA"
+            state["simultaneous_changed_total_pixels"] = 0
             state["interaction_chain_active"] = False
             state["interaction_target_chain"] = []
             state["interaction_target_index"] = 0
             state["interaction_last_status"] = "completed"
+            state["priority_subqueue_active"] = False
+            state["priority_subqueue_keys"] = []
             state["completion_count"] = int(state.get("completion_count", 0) + 1)
             state["last_status"] = "completed"
             state["completed_target_regions"] = list(completed_regions[-16:])
@@ -3859,6 +4738,35 @@ class ActiveInferenceEFE(Agent):
                 state["interaction_target_index"] = int(interaction_target_index)
                 state["interaction_last_status"] = "tracking"
 
+        if priority_subqueue_active and priority_subqueue_keys:
+            refreshed_priority_subqueue: list[str] = []
+            for region_key in priority_subqueue_keys:
+                key = str(region_key)
+                if self._parse_region_key_v1(key) is None:
+                    continue
+                if key in refreshed_priority_subqueue:
+                    continue
+                required_samples = int(
+                    max(
+                        target_required_samples.get(str(key), 0),
+                        _required_samples(str(key)),
+                        2,
+                    )
+                )
+                target_required_samples[str(key)] = int(required_samples)
+                sample_count = int(max(0, target_sample_counts.get(str(key), 0)))
+                if sample_count < required_samples:
+                    refreshed_priority_subqueue.append(str(key))
+            priority_subqueue_keys = list(refreshed_priority_subqueue)
+            priority_subqueue_active = bool(priority_subqueue_keys)
+            if priority_subqueue_active:
+                queue = [str(v) for v in priority_subqueue_keys] + [
+                    str(v) for v in queue if str(v) not in set(priority_subqueue_keys)
+                ]
+                state["last_status"] = "priority_subqueue_tracking"
+            else:
+                state["last_status"] = "priority_subqueue_completed"
+
         previous_target_region_key = str(state.get("current_target_region_key", "NA"))
         target_region_key = str(queue[0])
         target_miss_streak = int(max(0, state.get("target_miss_streak", 0)))
@@ -3879,10 +4787,19 @@ class ActiveInferenceEFE(Agent):
                 for v in queue[1:]
                 if self._parse_region_key_v1(str(v)) is not None
             ]
+            simultaneous_alternate_queue = [
+                str(v) for v in alternate_queue if str(v) in simultaneous_priority_set
+            ]
             coupled_alternate_queue = [
                 str(v) for v in alternate_queue if str(v) in coupled_region_keys
             ]
-            if coupled_alternate_queue:
+            if simultaneous_alternate_queue:
+                alternate_queue = list(simultaneous_alternate_queue) + [
+                    str(v)
+                    for v in alternate_queue
+                    if str(v) not in simultaneous_alternate_queue
+                ]
+            elif coupled_alternate_queue:
                 alternate_queue = list(coupled_alternate_queue) + [
                     str(v) for v in alternate_queue if str(v) not in coupled_alternate_queue
                 ]
@@ -3909,24 +4826,44 @@ class ActiveInferenceEFE(Agent):
         state["target_region_scores"] = dict(score_memory)
         state["completed_target_regions"] = list(completed_regions[-16:])
         state["target_sample_counts"] = dict(target_sample_counts)
-        state["target_required_samples"] = {
-            str(region_key): int(_required_samples(str(region_key)))
-            for region_key in score_memory.keys()
-        }
+        state["target_required_samples"] = dict(target_required_samples)
         target_required_samples = dict(state["target_required_samples"])
         state["primary_coupled_region_key"] = str(primary_coupled_region_key)
         state["secondary_coupled_region_key"] = str(secondary_coupled_region_key)
+        state["simultaneous_changed_region_keys"] = [
+            str(v) for v in simultaneous_changed_region_keys[:16]
+        ]
+        state["simultaneous_reachable_region_keys"] = [
+            str(v) for v in simultaneous_reachable_region_keys[:16]
+        ]
+        state["simultaneous_unknown_region_keys"] = [
+            str(v) for v in simultaneous_unknown_region_keys[:16]
+        ]
+        state["simultaneous_unreachable_region_keys"] = [
+            str(v) for v in simultaneous_unreachable_region_keys[:16]
+        ]
+        state["simultaneous_anchor_region_key"] = str(simultaneous_anchor_region_key)
+        state["simultaneous_changed_total_pixels"] = int(
+            max(0, simultaneous_changed_total_pixels)
+        )
         state["cross_region_key"] = str(primary_coupled_region_key)
         state["gate_region_key"] = str(secondary_coupled_region_key)
         state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
         state["interaction_chain_active"] = bool(interaction_chain_active)
         state["interaction_target_chain"] = list(interaction_target_chain[:16])
         state["interaction_target_index"] = int(max(0, interaction_target_index))
+        state["priority_subqueue_active"] = bool(priority_subqueue_active)
+        state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
         state["stage"] = "seek"
         opportunistic_target_key = "NA"
         nav_region_valid = self._parse_region_key_v1(str(nav_region_key)) is not None
         nav_in_coupled = bool(nav_region_valid and str(nav_region_key) in coupled_region_keys)
-        if nav_in_coupled and str(nav_region_key) != str(target_region_key):
+        simultaneous_subcycle_active = bool(priority_subqueue_active and priority_subqueue_keys)
+        if (
+            nav_in_coupled
+            and str(nav_region_key) != str(target_region_key)
+            and (not simultaneous_subcycle_active)
+        ):
             nav_required_samples = int(_required_samples(str(nav_region_key)))
             nav_sample_count = int(max(0, target_sample_counts.get(str(nav_region_key), 0)))
             if (
@@ -3971,6 +4908,8 @@ class ActiveInferenceEFE(Agent):
             )
             sample_count = int(max(0, target_sample_counts.get(str(target_region_key), 0)))
             required_samples = int(_required_samples(str(target_region_key)))
+            if str(target_region_key) in set(priority_subqueue_keys):
+                required_samples = int(max(required_samples, 2))
             target_required_samples[str(target_region_key)] = int(required_samples)
             remaining_samples = int(max(0, int(required_samples) - sample_count))
             if remaining_samples <= 0:
@@ -4029,6 +4968,30 @@ class ActiveInferenceEFE(Agent):
                     for v in refreshed_queue
                     if str(v) != str(next_interaction_target_key)
                 ]
+            if priority_subqueue_active and priority_subqueue_keys:
+                active_priority_queue: list[str] = []
+                for region_key in priority_subqueue_keys:
+                    key = str(region_key)
+                    if self._parse_region_key_v1(key) is None:
+                        continue
+                    req = int(
+                        max(
+                            target_required_samples.get(str(key), 0),
+                            _required_samples(str(key)),
+                            2,
+                        )
+                    )
+                    target_required_samples[str(key)] = int(req)
+                    if int(max(0, target_sample_counts.get(str(key), 0))) < int(req):
+                        active_priority_queue.append(str(key))
+                priority_subqueue_keys = list(active_priority_queue)
+                priority_subqueue_active = bool(priority_subqueue_keys)
+                if priority_subqueue_active:
+                    refreshed_queue = [str(v) for v in priority_subqueue_keys] + [
+                        str(v)
+                        for v in refreshed_queue
+                        if str(v) not in set(priority_subqueue_keys)
+                    ]
             if refreshed_queue:
                 state["target_region_queue"] = list(refreshed_queue)
                 state["current_target_region_key"] = str(refreshed_queue[0])
@@ -4038,6 +5001,8 @@ class ActiveInferenceEFE(Agent):
                 state["interaction_chain_active"] = bool(interaction_chain_active)
                 state["interaction_target_chain"] = list(interaction_target_chain[:16])
                 state["interaction_target_index"] = int(max(0, interaction_target_index))
+                state["priority_subqueue_active"] = bool(priority_subqueue_active)
+                state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
                 if not bool(state.get("interaction_chain_active", False)):
                     state["interaction_last_status"] = "inactive"
                 state["last_status"] = (
@@ -4055,10 +5020,18 @@ class ActiveInferenceEFE(Agent):
                 state["target_region_scores"] = {}
                 state["target_sample_counts"] = dict(target_sample_counts)
                 state["target_required_samples"] = dict(target_required_samples)
+                state["simultaneous_changed_region_keys"] = []
+                state["simultaneous_reachable_region_keys"] = []
+                state["simultaneous_unknown_region_keys"] = []
+                state["simultaneous_unreachable_region_keys"] = []
+                state["simultaneous_anchor_region_key"] = "NA"
+                state["simultaneous_changed_total_pixels"] = 0
                 state["interaction_chain_active"] = False
                 state["interaction_target_chain"] = []
                 state["interaction_target_index"] = 0
                 state["interaction_last_status"] = "completed"
+                state["priority_subqueue_active"] = False
+                state["priority_subqueue_keys"] = []
                 state["completion_count"] = int(state.get("completion_count", 0) + 1)
                 state["last_status"] = "completed"
 
@@ -4632,6 +5605,27 @@ class ActiveInferenceEFE(Agent):
                 effect_translation_delta_bucket = str(navigation_direction_bucket)
         state_action_key = f"{state_before_digest}|{action_token}"
         transition_edge_key = f"{state_before_digest}|{action_token}|{state_after_digest}"
+        changed_region_diff_map = self._changed_region_diff_map_v1(
+            frame_before=previous_packet.frame,
+            frame_after=current_packet.frame,
+            max_regions=64,
+        )
+        changed_region_total_pixels = int(
+            sum(int(v) for v in changed_region_diff_map.values())
+        )
+        changed_region_topk = [
+            {
+                "region_key": str(region_key),
+                "changed_pixels": int(count),
+                "changed_ratio": float(
+                    float(count) / float(max(1, changed_region_total_pixels))
+                ),
+            }
+            for (region_key, count) in sorted(
+                changed_region_diff_map.items(),
+                key=lambda item: (-int(item[1]), str(item[0])),
+            )[:8]
+        ]
         env_delta = {
             "state_transition": str(
                 f"{previous_packet.state}->{current_packet.state}"
@@ -4679,6 +5673,11 @@ class ActiveInferenceEFE(Agent):
                 )
             ),
             "navigation_state_estimate_v1": dict(navigation_state_estimate),
+            "changed_region_diff_map_v1": {
+                str(k): int(v) for (k, v) in changed_region_diff_map.items()
+            },
+            "changed_region_total_pixels_v1": int(changed_region_total_pixels),
+            "changed_region_topk_v1": list(changed_region_topk),
         }
         return TransitionRecordV1(
             schema_name="active_inference_transition_record_v1",
