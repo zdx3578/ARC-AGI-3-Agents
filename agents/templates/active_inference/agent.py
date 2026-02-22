@@ -5460,9 +5460,160 @@ class ActiveInferenceEFE(Agent):
         if len(edges) > int(max_edges):
             edges = edges[: int(max_edges)]
 
+        known_region_keys: set[str] = set()
+        for region_key in self._region_visit_counts.keys():
+            parsed = self._parse_region_key_v1(str(region_key))
+            if parsed is None:
+                continue
+            known_region_keys.add(f"{int(parsed[0])}:{int(parsed[1])}")
+        parsed_current_region = self._parse_region_key_v1(str(current_region_key))
+        if parsed_current_region is not None:
+            known_region_keys.add(
+                f"{int(parsed_current_region[0])}:{int(parsed_current_region[1])}"
+            )
+        for region_action_key in self._region_action_transition_counts.keys():
+            try:
+                source_region_key, _ = str(region_action_key).split("|a", 1)
+            except Exception:
+                continue
+            parsed = self._parse_region_key_v1(str(source_region_key))
+            if parsed is None:
+                continue
+            known_region_keys.add(f"{int(parsed[0])}:{int(parsed[1])}")
+        for edge_key in self._edge_attempt_counts.keys():
+            edge_token = str(edge_key)
+            if not edge_token.startswith("region=") or "|action=" not in edge_token:
+                continue
+            region_token = edge_token.split("|action=", 1)[0]
+            region_key = str(region_token).replace("region=", "", 1)
+            parsed = self._parse_region_key_v1(str(region_key))
+            if parsed is None:
+                continue
+            known_region_keys.add(f"{int(parsed[0])}:{int(parsed[1])}")
+
+        activity_edges: list[dict[str, Any]] = []
+        activity_status_histogram: dict[str, int] = {}
+        for source_region_key in sorted(
+            known_region_keys,
+            key=lambda key: (
+                int(self._parse_region_key_v1(str(key))[1]),
+                int(self._parse_region_key_v1(str(key))[0]),
+                str(key),
+            ),
+        ):
+            for action_id in (1, 2, 3, 4):
+                region_action_key = f"{str(source_region_key)}|a{int(action_id)}"
+                edge_key = f"region={str(source_region_key)}|action={int(action_id)}"
+                target_histogram_raw = self._region_action_transition_counts.get(
+                    region_action_key,
+                    {},
+                )
+                if not isinstance(target_histogram_raw, dict):
+                    target_histogram_raw = {}
+                plausible_target_histogram: dict[str, int] = {}
+                for target_region_key_raw, count_raw in target_histogram_raw.items():
+                    target_region_key = str(target_region_key_raw)
+                    if self._parse_region_key_v1(target_region_key) is None:
+                        continue
+                    if not self._region_step_plausible_v1(
+                        str(source_region_key),
+                        str(target_region_key),
+                        max_axis_step=1,
+                    ):
+                        continue
+                    count = int(max(0, count_raw))
+                    if count <= 0:
+                        continue
+                    plausible_target_histogram[target_region_key] = int(count)
+                moved_count = int(
+                    sum(
+                        int(max(0, count))
+                        for target_region_key, count in plausible_target_histogram.items()
+                        if str(target_region_key) != str(source_region_key)
+                    )
+                )
+                transition_total = int(
+                    sum(int(max(0, count)) for count in plausible_target_histogram.values())
+                )
+                event_histogram = self._region_action_event_counts.get(region_action_key, {})
+                if not isinstance(event_histogram, dict):
+                    event_histogram = {}
+                event_attempts = int(
+                    sum(int(max(0, count)) for count in event_histogram.values())
+                )
+                edge_attempts = int(max(0, self._edge_attempt_counts.get(edge_key, 0)))
+                blocked_count = int(max(0, self._blocked_edge_counts.get(edge_key, 0)))
+                attempts = int(max(edge_attempts, event_attempts, moved_count + blocked_count))
+                blocked_rate = float(blocked_count / float(max(1, attempts)))
+                moved_rate = float(moved_count / float(max(1, attempts)))
+
+                dominant_target_region_key = "NA"
+                dominant_target_count = 0
+                for target_region_key, count_raw in sorted(
+                    plausible_target_histogram.items(),
+                    key=lambda item: (
+                        -int(max(0, item[1])),
+                        str(item[0]),
+                    ),
+                ):
+                    count = int(max(0, count_raw))
+                    if count <= 0:
+                        continue
+                    if str(target_region_key) == str(source_region_key):
+                        continue
+                    dominant_target_region_key = str(target_region_key)
+                    dominant_target_count = int(count)
+                    break
+                if dominant_target_region_key == "NA" and plausible_target_histogram:
+                    fallback_target_key, fallback_target_count = max(
+                        plausible_target_histogram.items(),
+                        key=lambda item: (
+                            int(max(0, item[1])),
+                            str(item[0]),
+                        ),
+                    )
+                    dominant_target_region_key = str(fallback_target_key)
+                    dominant_target_count = int(max(0, fallback_target_count))
+
+                status = "unknown"
+                if attempts >= 2 and blocked_count >= 2 and blocked_rate >= 0.75:
+                    status = "blocked"
+                if moved_count >= 1 and moved_rate >= 0.20:
+                    status = "walkable"
+                if moved_count <= 0 and attempts >= 2 and blocked_rate >= 0.75:
+                    status = "blocked"
+
+                activity_edges.append(
+                    {
+                        "source_region_key": str(source_region_key),
+                        "action_id": int(action_id),
+                        "status": str(status),
+                        "attempts": int(attempts),
+                        "blocked_count": int(blocked_count),
+                        "blocked_rate": float(blocked_rate),
+                        "moved_count": int(moved_count),
+                        "moved_rate": float(moved_rate),
+                        "transition_total_count": int(transition_total),
+                        "dominant_target_region_key": str(dominant_target_region_key),
+                        "dominant_target_count": int(dominant_target_count),
+                    }
+                )
+                activity_status_histogram[str(status)] = int(
+                    activity_status_histogram.get(str(status), 0) + 1
+                )
+        activity_edges.sort(
+            key=lambda row: (
+                str(row.get("source_region_key", "")),
+                int(row.get("action_id", 0)),
+            )
+        )
+        max_activity_edges = int(max(max_edges, 256))
+        if len(activity_edges) > max_activity_edges:
+            activity_edges = activity_edges[:max_activity_edges]
+
         return {
             "schema_name": "active_inference_region_graph_snapshot_v1",
-            "schema_version": 1,
+            "schema_version": 2,
             "current_region_key": str(current_region_key),
             "region_visit_histogram": {
                 str(key): int(value)
@@ -5473,6 +5624,12 @@ class ActiveInferenceEFE(Agent):
             },
             "edge_count": int(len(edges)),
             "edges": list(edges),
+            "activity_edge_count": int(len(activity_edges)),
+            "activity_edge_status_histogram": {
+                str(key): int(value)
+                for (key, value) in sorted(activity_status_histogram.items())
+            },
+            "activity_edges": list(activity_edges),
         }
 
     def _action_context_payload_v1(

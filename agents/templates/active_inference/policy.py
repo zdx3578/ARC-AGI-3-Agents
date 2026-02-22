@@ -223,6 +223,177 @@ class ActiveInferencePolicyEvaluatorV1:
             and abs(int(sy) - int(ty)) <= limit
         )
 
+    @staticmethod
+    def _normalize_activity_edge_status(status_value: Any) -> str:
+        token = str(status_value).strip().lower()
+        if token in ("walkable", "passable", "open"):
+            return "walkable"
+        if token in ("blocked", "ui_blocked", "terminal_failure", "closed"):
+            return "blocked"
+        return "unknown"
+
+    def _region_graph_activity_edge_index(
+        self,
+        snapshot: dict[str, Any] | None,
+    ) -> dict[tuple[str, int], dict[str, Any]]:
+        index: dict[tuple[str, int], dict[str, Any]] = {}
+        if not isinstance(snapshot, dict):
+            return index
+        rows = snapshot.get("activity_edges", [])
+        if not isinstance(rows, list):
+            return index
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            source_region_key = str(row.get("source_region_key", "NA"))
+            if self._parse_region_key(source_region_key) is None:
+                continue
+            try:
+                action_id = int(row.get("action_id", 0))
+            except Exception:
+                action_id = 0
+            if action_id not in (1, 2, 3, 4):
+                continue
+            status = self._normalize_activity_edge_status(row.get("status", "unknown"))
+            attempts = int(max(0, row.get("attempts", 0)))
+            blocked_count = int(max(0, row.get("blocked_count", 0)))
+            blocked_rate = self._clamp01(float(row.get("blocked_rate", 0.0)))
+            moved_count = int(max(0, row.get("moved_count", 0)))
+            moved_rate = self._clamp01(float(row.get("moved_rate", 0.0)))
+            dominant_target_region_key = str(
+                row.get("dominant_target_region_key", row.get("target_region_key", "NA"))
+            )
+            dominant_target_count = int(
+                max(
+                    0,
+                    row.get(
+                        "dominant_target_count",
+                        row.get("transition_total_count", moved_count),
+                    ),
+                )
+            )
+            key = (str(source_region_key), int(action_id))
+            existing = index.get(key)
+            entry = {
+                "source_region_key": str(source_region_key),
+                "action_id": int(action_id),
+                "status": str(status),
+                "attempts": int(attempts),
+                "blocked_count": int(blocked_count),
+                "blocked_rate": float(blocked_rate),
+                "moved_count": int(moved_count),
+                "moved_rate": float(moved_rate),
+                "dominant_target_region_key": str(dominant_target_region_key),
+                "dominant_target_count": int(dominant_target_count),
+            }
+            if existing is None:
+                index[key] = entry
+                continue
+            should_replace = bool(
+                int(entry.get("attempts", 0)) > int(existing.get("attempts", 0))
+                or (
+                    int(entry.get("attempts", 0)) == int(existing.get("attempts", 0))
+                    and int(entry.get("moved_count", 0))
+                    > int(existing.get("moved_count", 0))
+                )
+            )
+            if should_replace:
+                index[key] = entry
+        return index
+
+    def _candidate_activity_edge_profile(
+        self,
+        candidate: ActionCandidateV1,
+        *,
+        predicted_region_stats: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        action_id = int(candidate.action_id)
+        profile: dict[str, Any] = {
+            "enabled": False,
+            "action_id": int(action_id),
+            "current_region_key": "NA",
+            "status": "unknown",
+            "attempts": 0,
+            "blocked_rate": 0.0,
+            "moved_count": 0,
+            "moved_rate": 0.0,
+            "dominant_target_region_key": "NA",
+            "hard_blocked": False,
+            "source": "none",
+        }
+        if action_id not in (1, 2, 3, 4):
+            profile["source"] = "non_navigation_action"
+            return profile
+        stats = (
+            predicted_region_stats
+            if isinstance(predicted_region_stats, dict)
+            else self._candidate_predicted_region_stats(candidate)
+        )
+        current_region_key = str(stats.get("current_region_key", "NA"))
+        semantics = self._candidate_region_action_semantics(candidate)
+        semantics_status = self._normalize_activity_edge_status(
+            semantics.get("edge_status", "unknown")
+        )
+        semantics_attempts = int(max(0, semantics.get("attempts", 0)))
+        semantics_blocked_rate = self._clamp01(float(semantics.get("blocked_rate", 0.0)))
+        semantics_moved_rate = self._clamp01(float(semantics.get("moved_rate", 0.0)))
+        semantics_moved_count = int(max(0, semantics.get("moved_count", 0)))
+        if self._parse_region_key(current_region_key) is None:
+            current_region_key = str(semantics.get("current_region_key", "NA"))
+        profile["current_region_key"] = str(current_region_key)
+
+        snapshot = candidate.metadata.get("region_graph_snapshot_v1", {})
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        activity_index = self._region_graph_activity_edge_index(snapshot)
+        activity_row = (
+            activity_index.get((str(current_region_key), int(action_id)))
+            if self._parse_region_key(str(current_region_key)) is not None
+            else None
+        )
+        if isinstance(activity_row, dict):
+            status = self._normalize_activity_edge_status(activity_row.get("status", "unknown"))
+            attempts = int(max(0, activity_row.get("attempts", 0)))
+            blocked_rate = self._clamp01(float(activity_row.get("blocked_rate", 0.0)))
+            moved_count = int(max(0, activity_row.get("moved_count", 0)))
+            moved_rate = self._clamp01(float(activity_row.get("moved_rate", 0.0)))
+            dominant_target_region_key = str(
+                activity_row.get("dominant_target_region_key", "NA")
+            )
+            profile.update(
+                {
+                    "enabled": True,
+                    "status": str(status),
+                    "attempts": int(attempts),
+                    "blocked_rate": float(blocked_rate),
+                    "moved_count": int(moved_count),
+                    "moved_rate": float(moved_rate),
+                    "dominant_target_region_key": str(dominant_target_region_key),
+                    "source": "activity_edges",
+                }
+            )
+        else:
+            profile.update(
+                {
+                    "enabled": bool(semantics.get("enabled", False)),
+                    "status": str(semantics_status),
+                    "attempts": int(semantics_attempts),
+                    "blocked_rate": float(semantics_blocked_rate),
+                    "moved_count": int(semantics_moved_count),
+                    "moved_rate": float(semantics_moved_rate),
+                    "dominant_target_region_key": str(
+                        stats.get("predicted_region_key", "NA")
+                    ),
+                    "source": "region_action_semantics",
+                }
+            )
+        profile["hard_blocked"] = bool(
+            str(profile.get("status", "unknown")) == "blocked"
+            and int(profile.get("attempts", 0))
+            >= max(2, int(self.coverage_blocked_edge_attempt_threshold // 2))
+        )
+        return profile
+
     def _region_graph_adjacency(
         self,
         snapshot: dict[str, Any] | None,
@@ -230,6 +401,38 @@ class ActiveInferencePolicyEvaluatorV1:
         adjacency: dict[str, dict[str, int]] = {}
         if not isinstance(snapshot, dict):
             return adjacency
+        activity_index = self._region_graph_activity_edge_index(snapshot)
+        if activity_index:
+            for row in activity_index.values():
+                source = str(row.get("source_region_key", "NA"))
+                target = str(row.get("dominant_target_region_key", "NA"))
+                status = self._normalize_activity_edge_status(row.get("status", "unknown"))
+                if status != "walkable":
+                    continue
+                if self._parse_region_key(source) is None:
+                    continue
+                if self._parse_region_key(target) is None:
+                    continue
+                if not self._region_step_plausible(
+                    str(source),
+                    str(target),
+                    max_axis_step=1,
+                ):
+                    continue
+                if str(source) == str(target):
+                    continue
+                count = int(
+                    max(
+                        0,
+                        row.get("dominant_target_count", row.get("moved_count", 0)),
+                    )
+                )
+                if count <= 0:
+                    continue
+                source_hist = adjacency.setdefault(source, {})
+                source_hist[target] = max(int(source_hist.get(target, 0)), int(count))
+            if adjacency:
+                return adjacency
         edges = snapshot.get("edges", [])
         if not isinstance(edges, list):
             return adjacency
@@ -426,48 +629,96 @@ class ActiveInferencePolicyEvaluatorV1:
             )
             for entry in navigation_entries
         }
+        activity_profile_by_candidate_id: dict[str, dict[str, Any]] = {
+            str(entry.candidate.candidate_id): self._candidate_activity_edge_profile(
+                entry.candidate,
+                predicted_region_stats=predicted_stats_by_candidate_id.get(
+                    str(entry.candidate.candidate_id),
+                    {},
+                ),
+            )
+            for entry in navigation_entries
+        }
+
+        def _activity_status_rank(candidate_id: str) -> int:
+            status = self._normalize_activity_edge_status(
+                activity_profile_by_candidate_id.get(str(candidate_id), {}).get(
+                    "status",
+                    "unknown",
+                )
+            )
+            if status == "walkable":
+                return 0
+            if status == "unknown":
+                return 1
+            return 2
+
         blocked_hard_skip_count = int(
             sum(
                 1
                 for entry in navigation_entries
-                if self._coverage_hard_skip(
-                    profile=coverage_block_profile_by_candidate_id.get(
-                        str(entry.candidate.candidate_id),
-                        {},
-                    ),
-                    predicted_region_stats=predicted_stats_by_candidate_id.get(
-                        str(entry.candidate.candidate_id),
-                        {},
-                    ),
+                if (
+                    self._coverage_hard_skip(
+                        profile=coverage_block_profile_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            {},
+                        ),
+                        predicted_region_stats=predicted_stats_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            {},
+                        ),
+                    )
+                    or bool(
+                        activity_profile_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            {},
+                        ).get("hard_blocked", False)
+                    )
                 )
             )
         )
+        activity_hard_blocked_count = int(
+            sum(
+                1
+                for profile in activity_profile_by_candidate_id.values()
+                if bool(profile.get("hard_blocked", False))
+            )
+        )
         diagnostics["blocked_hard_skip_count"] = int(blocked_hard_skip_count)
+        diagnostics["activity_hard_blocked_count"] = int(activity_hard_blocked_count)
         diagnostics["blocked_hard_skip_applied"] = False
         scripted_action_id = self._two_pass_serpentine_action_id(int(traversal_step_counter))
         if scripted_action_id is not None:
             scripted_direction = self._navigation_action_direction(int(scripted_action_id))
 
             def _script_sort_key(entry: FreeEnergyLedgerEntryV1) -> tuple[Any, ...]:
+                candidate_id = str(entry.candidate.candidate_id)
                 stats = predicted_stats_by_candidate_id.get(
-                    str(entry.candidate.candidate_id),
+                    candidate_id,
                     {},
                 )
                 profile = coverage_block_profile_by_candidate_id.get(
-                    str(entry.candidate.candidate_id),
+                    candidate_id,
                     {},
                 )
+                activity_profile = activity_profile_by_candidate_id.get(candidate_id, {})
                 edge_attempts = int(stats.get("edge_attempts", 0))
                 edge_blocked_rate = float(stats.get("edge_blocked_rate", 0.0))
                 retry_saturated = bool(
                     edge_attempts >= int(self.coverage_sweep_direction_retry_limit)
                     and edge_blocked_rate >= 0.5
                 )
-                hard_skip = self._coverage_hard_skip(
-                    profile=profile,
-                    predicted_region_stats=stats,
+                hard_skip = bool(
+                    self._coverage_hard_skip(
+                        profile=profile,
+                        predicted_region_stats=stats,
+                    )
+                    or bool(activity_profile.get("hard_blocked", False))
                 )
                 soft_penalty = float(profile.get("soft_penalty", 0.0))
+                activity_blocked_rate = self._clamp01(
+                    float(activity_profile.get("blocked_rate", 0.0))
+                )
                 predicted_region_key = str(stats.get("predicted_region_key", "NA"))
                 current_region_key = str(stats.get("current_region_key", "NA"))
                 predicted_stays = bool(
@@ -482,9 +733,10 @@ class ActiveInferencePolicyEvaluatorV1:
                         and not hard_skip
                     )
                     else 1,
+                    int(_activity_status_rank(candidate_id)),
                     1 if retry_saturated else 0,
                     1 if predicted_stays else 0,
-                    float(soft_penalty),
+                    float(soft_penalty + (0.10 * activity_blocked_rate)),
                     int(action_count_map.get(int(entry.candidate.action_id), 0)),
                     int(entry.candidate.action_id),
                     str(entry.candidate.candidate_id),
@@ -504,6 +756,12 @@ class ActiveInferencePolicyEvaluatorV1:
                             str(entry.candidate.candidate_id),
                             {},
                         ),
+                    )
+                    or bool(
+                        activity_profile_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            {},
+                        ).get("hard_blocked", False)
                     )
                 )
             ]
@@ -656,6 +914,7 @@ class ActiveInferencePolicyEvaluatorV1:
                 navigation_entries,
                 key=lambda entry: (
                     0 if int(entry.candidate.action_id) == int(desired_action) else 1,
+                    int(_activity_status_rank(str(entry.candidate.candidate_id))),
                     int(action_count_map.get(int(entry.candidate.action_id), 0)),
                     int(entry.candidate.action_id),
                     str(entry.candidate.candidate_id),
@@ -666,14 +925,16 @@ class ActiveInferencePolicyEvaluatorV1:
             return ordered[0], diagnostics
 
         def _hard_sort_key(entry: FreeEnergyLedgerEntryV1) -> tuple[Any, ...]:
+            candidate_id = str(entry.candidate.candidate_id)
             stats = predicted_stats_by_candidate_id.get(
-                str(entry.candidate.candidate_id),
+                candidate_id,
                 {},
             )
             profile = coverage_block_profile_by_candidate_id.get(
-                str(entry.candidate.candidate_id),
+                candidate_id,
                 {},
             )
+            activity_profile = activity_profile_by_candidate_id.get(candidate_id, {})
             entry_direction = self._entry_navigation_direction(entry)
             edge_attempts = int(stats.get("edge_attempts", 0))
             edge_blocked_rate = float(stats.get("edge_blocked_rate", 0.0))
@@ -683,17 +944,24 @@ class ActiveInferencePolicyEvaluatorV1:
             )
             predicted_region_key = str(stats.get("predicted_region_key", "NA"))
             current_key = str(stats.get("current_region_key", "NA"))
-            hard_skip = self._coverage_hard_skip(
-                profile=profile,
-                predicted_region_stats=stats,
+            hard_skip = bool(
+                self._coverage_hard_skip(
+                    profile=profile,
+                    predicted_region_stats=stats,
+                )
+                or bool(activity_profile.get("hard_blocked", False))
             )
             soft_penalty = float(profile.get("soft_penalty", 0.0))
+            activity_blocked_rate = self._clamp01(
+                float(activity_profile.get("blocked_rate", 0.0))
+            )
             predicted_stays = bool(
                 predicted_region_key == "NA"
                 or predicted_region_key == str(current_key)
             )
             return (
                 1 if hard_skip else 0,
+                int(_activity_status_rank(candidate_id)),
                 0
                 if (
                     desired_direction in ("dir_l", "dir_r", "dir_u", "dir_d")
@@ -709,7 +977,7 @@ class ActiveInferencePolicyEvaluatorV1:
                 )
                 else 1,
                 1 if predicted_stays else 0,
-                float(soft_penalty),
+                float(soft_penalty + (0.10 * activity_blocked_rate)),
                 int(
                     self._region_distance_from_keys(
                         str(predicted_region_key),
@@ -738,6 +1006,12 @@ class ActiveInferencePolicyEvaluatorV1:
                         str(entry.candidate.candidate_id),
                         {},
                     ),
+                )
+                or bool(
+                    activity_profile_by_candidate_id.get(
+                        str(entry.candidate.candidate_id),
+                        {},
+                    ).get("hard_blocked", False)
                 )
             )
         ]
@@ -3423,31 +3697,91 @@ class ActiveInferencePolicyEvaluatorV1:
                     )
                     for entry in navigation_entries
                 }
+                activity_profile_by_candidate_id: dict[str, dict[str, Any]] = {
+                    str(entry.candidate.candidate_id): self._candidate_activity_edge_profile(
+                        entry.candidate,
+                        predicted_region_stats=predicted_stats_by_candidate_id.get(
+                            str(entry.candidate.candidate_id),
+                            {},
+                        ),
+                    )
+                    for entry in navigation_entries
+                }
+
+                def _coverage_activity_profile_for_entry(
+                    entry: FreeEnergyLedgerEntryV1,
+                ) -> dict[str, Any]:
+                    return activity_profile_by_candidate_id.get(
+                        str(entry.candidate.candidate_id),
+                        {},
+                    )
+
+                def _coverage_activity_status_rank_for_entry(
+                    entry: FreeEnergyLedgerEntryV1,
+                ) -> int:
+                    status = self._normalize_activity_edge_status(
+                        _coverage_activity_profile_for_entry(entry).get(
+                            "status",
+                            "unknown",
+                        )
+                    )
+                    if status == "walkable":
+                        return 0
+                    if status == "unknown":
+                        return 1
+                    return 2
+
+                def _coverage_activity_hard_blocked_for_entry(
+                    entry: FreeEnergyLedgerEntryV1,
+                ) -> bool:
+                    return bool(
+                        _coverage_activity_profile_for_entry(entry).get(
+                            "hard_blocked",
+                            False,
+                        )
+                    )
+
                 def _coverage_hard_skip_for_entry(
                     entry: FreeEnergyLedgerEntryV1,
                 ) -> bool:
                     candidate_id = str(entry.candidate.candidate_id)
-                    return self._coverage_hard_skip(
-                        profile=coverage_block_profile_by_candidate_id.get(
-                            candidate_id,
-                            {},
-                        ),
-                        predicted_region_stats=predicted_stats_by_candidate_id.get(
-                            candidate_id,
-                            {},
-                        ),
+                    return bool(
+                        self._coverage_hard_skip(
+                            profile=coverage_block_profile_by_candidate_id.get(
+                                candidate_id,
+                                {},
+                            ),
+                            predicted_region_stats=predicted_stats_by_candidate_id.get(
+                                candidate_id,
+                                {},
+                            ),
+                        )
+                        or _coverage_activity_hard_blocked_for_entry(entry)
                     )
 
                 def _coverage_soft_penalty_for_entry(
                     entry: FreeEnergyLedgerEntryV1,
                 ) -> float:
                     candidate_id = str(entry.candidate.candidate_id)
-                    return float(
+                    base = float(
                         coverage_block_profile_by_candidate_id.get(
                             candidate_id,
                             {},
                         ).get("soft_penalty", 0.0)
                     )
+                    activity_profile = _coverage_activity_profile_for_entry(entry)
+                    activity_blocked_rate = self._clamp01(
+                        float(activity_profile.get("blocked_rate", 0.0))
+                    )
+                    status = self._normalize_activity_edge_status(
+                        activity_profile.get("status", "unknown")
+                    )
+                    status_penalty = 0.0
+                    if status == "blocked":
+                        status_penalty = 0.35
+                    elif status == "unknown":
+                        status_penalty = 0.08
+                    return float(base + status_penalty + (0.10 * activity_blocked_rate))
 
                 def _coverage_effective_hard_skip_for_entry(
                     entry: FreeEnergyLedgerEntryV1,
@@ -3775,6 +4109,7 @@ class ActiveInferencePolicyEvaluatorV1:
                             navigation_entries,
                             key=lambda entry: (
                                 bool(_coverage_effective_hard_skip_for_entry(entry)),
+                                int(_coverage_activity_status_rank_for_entry(entry)),
                                 float(_coverage_soft_penalty_for_entry(entry)),
                                 float(
                                     selection_score_by_candidate.get(
@@ -3827,6 +4162,7 @@ class ActiveInferencePolicyEvaluatorV1:
                                 navigation_entries,
                                 key=lambda entry: (
                                     bool(_coverage_effective_hard_skip_for_entry(entry)),
+                                    int(_coverage_activity_status_rank_for_entry(entry)),
                                     float(_coverage_soft_penalty_for_entry(entry)),
                                     _coverage_frontier_visit(entry),
                                     -float(
@@ -3917,6 +4253,7 @@ class ActiveInferencePolicyEvaluatorV1:
                             coverage_pool.sort(
                                 key=lambda entry: (
                                     bool(_coverage_effective_hard_skip_for_entry(entry)),
+                                    int(_coverage_activity_status_rank_for_entry(entry)),
                                     float(_coverage_soft_penalty_for_entry(entry)),
                                     0
                                     if (
@@ -3970,6 +4307,7 @@ class ActiveInferencePolicyEvaluatorV1:
                             coverage_pool.sort(
                                 key=lambda entry: (
                                     bool(_coverage_effective_hard_skip_for_entry(entry)),
+                                    int(_coverage_activity_status_rank_for_entry(entry)),
                                     float(_coverage_soft_penalty_for_entry(entry)),
                                     0
                                     if (
@@ -4317,14 +4655,35 @@ class ActiveInferencePolicyEvaluatorV1:
                                         {},
                                     ).get("edge_blocked_rate", 0.0)
                                 ),
+                                "activity_edge_status": str(
+                                    _coverage_activity_profile_for_entry(entry).get(
+                                        "status",
+                                        "unknown",
+                                    )
+                                ),
+                                "activity_edge_attempts": int(
+                                    _coverage_activity_profile_for_entry(entry).get(
+                                        "attempts",
+                                        0,
+                                    )
+                                ),
+                                "activity_edge_blocked_rate": float(
+                                    _coverage_activity_profile_for_entry(entry).get(
+                                        "blocked_rate",
+                                        0.0,
+                                    )
+                                ),
+                                "activity_edge_source": str(
+                                    _coverage_activity_profile_for_entry(entry).get(
+                                        "source",
+                                        "none",
+                                    )
+                                ),
                                 "blocked_hard_skip": bool(
                                     _coverage_effective_hard_skip_for_entry(entry)
                                 ),
                                 "blocked_soft_penalty": float(
-                                    coverage_block_profile_by_candidate_id.get(
-                                        str(entry.candidate.candidate_id),
-                                        {},
-                                    ).get("soft_penalty", 0.0)
+                                    _coverage_soft_penalty_for_entry(entry)
                                 ),
                                 "blocked_skip_reasons": list(
                                     coverage_block_profile_by_candidate_id.get(
