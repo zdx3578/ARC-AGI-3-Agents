@@ -1054,6 +1054,14 @@ class ActiveInferencePolicyEvaluatorV1:
                     high_info_penalty = float(
                         high_info_penalty + 0.42 + (0.18 * high_info_target_score)
                     )
+            if int(candidate.action_id) in (1, 2, 3, 4):
+                if bool(high_info_focus.get("target_is_reachable_simultaneous", False)):
+                    if bool(high_info_focus.get("moves_toward_target_region", False)):
+                        high_info_bonus = float(high_info_bonus + 0.22)
+                    if bool(high_info_focus.get("moves_away_target_region", False)):
+                        high_info_penalty = float(high_info_penalty + 0.46)
+                if bool(high_info_focus.get("target_is_unreachable_simultaneous", False)):
+                    high_info_penalty = float(high_info_penalty + 0.95)
         orientation_alignment = self._candidate_orientation_alignment_features(candidate)
         orientation_alignment_enabled = bool(
             int(candidate.action_id) in (1, 2, 3, 4)
@@ -2209,6 +2217,12 @@ class ActiveInferencePolicyEvaluatorV1:
             "distance_before": int(raw.get("distance_before", 10**6)),
             "distance_after": int(raw.get("distance_after", 10**6)),
             "distance_delta": int(raw.get("distance_delta", 0)),
+            "target_route_distance_before": int(
+                raw.get("target_route_distance_before", 10**6)
+            ),
+            "target_route_distance_after": int(
+                raw.get("target_route_distance_after", 10**6)
+            ),
             "alternate_coupled_distance": int(
                 raw.get("alternate_coupled_distance", 10**6)
             ),
@@ -2216,6 +2230,15 @@ class ActiveInferencePolicyEvaluatorV1:
             "moves_away_target_region": bool(raw.get("moves_away_target_region", False)),
             "reaches_target_region": bool(raw.get("reaches_target_region", False)),
             "stays_in_current_region": bool(raw.get("stays_in_current_region", False)),
+            "target_is_simultaneous_region": bool(
+                raw.get("target_is_simultaneous_region", False)
+            ),
+            "target_is_reachable_simultaneous": bool(
+                raw.get("target_is_reachable_simultaneous", False)
+            ),
+            "target_is_unreachable_simultaneous": bool(
+                raw.get("target_is_unreachable_simultaneous", False)
+            ),
             "high_block_loop_risk": bool(raw.get("high_block_loop_risk", False)),
             "verify_action_candidate": bool(raw.get("verify_action_candidate", False)),
             "interaction_chain_active": bool(raw.get("interaction_chain_active", False)),
@@ -4436,6 +4459,115 @@ class ActiveInferencePolicyEvaluatorV1:
                         selected_entry = best_verify["entry"]
                         high_info_focus_probe_applied = True
                         high_info_focus_probe_reason = "verify_action_priority"
+                if not high_info_focus_probe_applied:
+                    simultaneous_target_lock_active = bool(
+                        any(
+                            bool(
+                                row["features"].get(
+                                    "target_is_simultaneous_region",
+                                    False,
+                                )
+                            )
+                            for row in high_info_rows
+                        )
+                    )
+                    if simultaneous_target_lock_active:
+                        lock_pool = [
+                            row
+                            for row in candidate_high_info_rows
+                            if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                        ]
+                        lock_toward_pool = [
+                            row
+                            for row in lock_pool
+                            if bool(
+                                row["features"].get(
+                                    "reaches_target_region",
+                                    False,
+                                )
+                            )
+                            or bool(
+                                row["features"].get(
+                                    "moves_toward_target_region",
+                                    False,
+                                )
+                            )
+                        ]
+                        if not lock_toward_pool:
+                            # Fallback: allow blocked edges when they are the only
+                            # candidates that still progress toward the simultaneous target.
+                            lock_toward_pool = [
+                                row
+                                for row in high_info_rows
+                                if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                                and not bool(
+                                    row["features"].get("high_block_loop_risk", False)
+                                )
+                                and (
+                                    bool(
+                                        row["features"].get(
+                                            "reaches_target_region",
+                                            False,
+                                        )
+                                    )
+                                    or bool(
+                                        row["features"].get(
+                                            "moves_toward_target_region",
+                                            False,
+                                        )
+                                    )
+                                )
+                            ]
+                        if lock_toward_pool:
+                            lock_toward_pool.sort(
+                                key=lambda row: (
+                                    0
+                                    if bool(
+                                        row["features"].get(
+                                            "reaches_target_region",
+                                            False,
+                                        )
+                                    )
+                                    else 1,
+                                    0
+                                    if bool(
+                                        row["features"].get(
+                                            "moves_toward_target_region",
+                                            False,
+                                        )
+                                    )
+                                    else 1,
+                                    1 if bool(row.get("blocked_hard_skip", False)) else 0,
+                                    float(row.get("blocked_soft_penalty", 0.0)),
+                                    int(
+                                        row["features"].get(
+                                            "distance_after",
+                                            10**6,
+                                        )
+                                    ),
+                                    int(
+                                        row["features"].get(
+                                            "predicted_edge_attempts",
+                                            10**6,
+                                        )
+                                    ),
+                                    float(row["score"]),
+                                    int(
+                                        action_count_map.get(
+                                            int(row["entry"].candidate.action_id),
+                                            0,
+                                        )
+                                    ),
+                                    int(row["entry"].candidate.action_id),
+                                    str(row["entry"].candidate.candidate_id),
+                                )
+                            )
+                            selected_entry = lock_toward_pool[0]["entry"]
+                            high_info_focus_probe_applied = True
+                            high_info_focus_probe_reason = "simultaneous_target_lock"
+                    if high_info_focus_probe_applied and selected_entry is not entries[0]:
+                        entries.remove(selected_entry)
+                        entries.insert(0, selected_entry)
                 if not high_info_focus_probe_applied:
                     seek_pool = [
                         row
