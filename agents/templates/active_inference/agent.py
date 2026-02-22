@@ -218,6 +218,10 @@ class ActiveInferenceEFE(Agent):
                 min(300, int(self.MAX_ACTIONS)),
             ),
         )
+        self.coverage_prepass_passes = max(
+            1,
+            min(2, _env_int("ACTIVE_INFERENCE_COVERAGE_PREPASS_PASSES", 1)),
+        )
         self.coverage_matrix_sweep_enabled = _env_bool(
             "ACTIVE_INFERENCE_COVERAGE_MATRIX_SWEEP_ENABLED",
             True,
@@ -443,6 +447,7 @@ class ActiveInferenceEFE(Agent):
             coverage_sweep_target_regions=self.coverage_sweep_target_regions,
             coverage_sweep_min_region_visits=self.coverage_sweep_min_region_visits,
             coverage_prepass_steps=self.coverage_prepass_steps,
+            coverage_prepass_passes=self.coverage_prepass_passes,
             coverage_sweep_score_margin=self.coverage_sweep_score_margin,
             coverage_resweep_interval=self.coverage_resweep_interval,
             coverage_resweep_span=self.coverage_resweep_span,

@@ -52,6 +52,7 @@ class ActiveInferencePolicyEvaluatorV1:
         coverage_sweep_score_margin: float = 0.42,
         coverage_resweep_interval: int = 96,
         coverage_resweep_span: int = 24,
+        coverage_prepass_passes: int = 1,
         coverage_sweep_direction_retry_limit: int = 8,
         coverage_matrix_sweep_enabled: bool = True,
         coverage_sweep_force_in_exploit: bool = True,
@@ -112,6 +113,7 @@ class ActiveInferencePolicyEvaluatorV1:
         self.coverage_sweep_score_margin = float(max(0.0, coverage_sweep_score_margin))
         self.coverage_resweep_interval = int(max(0, coverage_resweep_interval))
         self.coverage_resweep_span = int(max(0, coverage_resweep_span))
+        self.coverage_prepass_passes = int(max(1, min(2, coverage_prepass_passes)))
         self.coverage_sweep_direction_retry_limit = int(
             max(1, coverage_sweep_direction_retry_limit)
         )
@@ -539,12 +541,28 @@ class ActiveInferencePolicyEvaluatorV1:
         vertical_span = 1
         return int((row_count * horizontal_span) + ((row_count - 1) * vertical_span))
 
+    def _coverage_prepass_visit_target(self) -> int:
+        return int(
+            max(
+                1,
+                min(
+                    int(self.coverage_sweep_min_region_visits),
+                    int(self.coverage_prepass_passes),
+                ),
+            )
+        )
+
+    def _serpentine_prepass_length(self) -> int:
+        return int(
+            self._serpentine_single_pass_length() * int(max(1, self.coverage_prepass_passes))
+        )
+
     def _two_pass_serpentine_action_id(self, action_counter: int) -> int | None:
         row_count = 8
         horizontal_span = 12
         vertical_span = 1
         pass_length = int(self._serpentine_single_pass_length())
-        total_length = int(2 * pass_length)
+        total_length = int(self._serpentine_prepass_length())
         step = int(max(0, action_counter))
         if step >= int(total_length):
             return None
@@ -577,10 +595,11 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         if traversal_step_counter < 0:
             traversal_step_counter = int(packet.action_counter)
+        prepass_visit_target = int(self._coverage_prepass_visit_target())
         diagnostics: dict[str, Any] = {
             "enabled": False,
             "mode": "inactive",
-            "visit_target": int(max(1, self.coverage_sweep_min_region_visits)),
+            "visit_target": int(prepass_visit_target),
             "known_region_count": 0,
             "min_region_visit_count": 0,
             "regions_visited_at_least_target": 0,
@@ -590,17 +609,24 @@ class ActiveInferencePolicyEvaluatorV1:
             "desired_direction": "na",
             "cross_region_key": "NA",
             "cross_region_visit_count": 0,
-            "cross_visit_target": int(max(1, self.coverage_sweep_min_region_visits)),
+            "cross_visit_target": int(prepass_visit_target),
             "prepass_complete": False,
             "candidate_pool_size": 0,
             "packet_action_counter": int(packet.action_counter),
             "global_action_counter": int(traversal_step_counter),
+            "prepass_passes": int(self.coverage_prepass_passes),
         }
         if int(packet.levels_completed) > 0:
             diagnostics["mode"] = "levels_progressed"
             return None, diagnostics
         if int(traversal_step_counter) >= int(self.coverage_prepass_steps):
             diagnostics["mode"] = "prepass_window_exhausted"
+            return None, diagnostics
+        scripted_total_length = int(self._serpentine_prepass_length())
+        if int(traversal_step_counter) >= int(scripted_total_length):
+            diagnostics["enabled"] = True
+            diagnostics["mode"] = "deterministic_serpentine_complete"
+            diagnostics["prepass_complete"] = True
             return None, diagnostics
 
         navigation_entries = [
@@ -802,7 +828,7 @@ class ActiveInferencePolicyEvaluatorV1:
         if not isinstance(region_visit_histogram, dict):
             region_visit_histogram = {}
 
-        visit_target = int(max(1, self.coverage_sweep_min_region_visits))
+        visit_target = int(prepass_visit_target)
         diagnostics["visit_target"] = int(visit_target)
 
         cross_region = navigation_target.get("cross_like_target_region", {})
@@ -3444,10 +3470,11 @@ class ActiveInferencePolicyEvaluatorV1:
         coverage_sweep_target_region = {"x": -1, "y": -1}
         coverage_sweep_target_direction = "na"
         fixed_two_pass_traversal_applied = False
+        fixed_prepass_pending = False
         fixed_two_pass_traversal_v1: dict[str, Any] = {
             "enabled": False,
             "mode": "inactive",
-            "visit_target": int(max(1, self.coverage_sweep_min_region_visits)),
+            "visit_target": int(self._coverage_prepass_visit_target()),
             "known_region_count": 0,
             "min_region_visit_count": 0,
             "regions_visited_at_least_target": 0,
@@ -3457,7 +3484,7 @@ class ActiveInferencePolicyEvaluatorV1:
             "desired_direction": "na",
             "cross_region_key": "NA",
             "cross_region_visit_count": 0,
-            "cross_visit_target": int(max(1, self.coverage_sweep_min_region_visits)),
+            "cross_visit_target": int(self._coverage_prepass_visit_target()),
             "prepass_complete": False,
             "candidate_pool_size": 0,
         }
@@ -3468,13 +3495,12 @@ class ActiveInferencePolicyEvaluatorV1:
         high_info_focus_probe_candidates: list[dict[str, Any]] = []
         high_info_focus_active_present = False
         high_info_focus_priority_available = False
+        high_info_focus_hard_priority_available = False
         high_info_release_action_counter = int(
             self.high_info_focus_release_action_counter
         )
         if high_info_release_action_counter < 0:
-            high_info_release_action_counter = int(
-                self._serpentine_single_pass_length()
-            )
+            high_info_release_action_counter = int(self._serpentine_prepass_length())
         for entry in entries:
             focus_features = self._candidate_high_info_focus_features(entry.candidate)
             if not (
@@ -3485,21 +3511,25 @@ class ActiveInferencePolicyEvaluatorV1:
             high_info_focus_active_present = True
             if bool(focus_features.get("verify_action_candidate", False)):
                 high_info_focus_priority_available = True
+                high_info_focus_hard_priority_available = True
                 break
             if bool(focus_features.get("reaches_target_region", False)):
                 high_info_focus_priority_available = True
+                high_info_focus_hard_priority_available = True
                 break
             if bool(focus_features.get("moves_toward_target_region", False)):
                 high_info_focus_priority_available = True
-                break
-        high_info_after_first_pass_gate_open = bool(
-            self.high_info_focus_release_after_first_pass
-            and (
-                high_info_focus_active_present
-                or high_info_focus_priority_available
-            )
-            and int(global_action_counter) >= int(high_info_release_action_counter)
-        )
+                target_score = self._clamp01(float(focus_features.get("target_score", 0.0)))
+                target_is_reachable_simultaneous = bool(
+                    focus_features.get("target_is_reachable_simultaneous", False)
+                )
+                remaining_samples = int(max(0, focus_features.get("remaining_samples", 0)))
+                if (
+                    target_is_reachable_simultaneous
+                    and target_score >= 0.80
+                    and remaining_samples > 0
+                ):
+                    high_info_focus_hard_priority_available = True
         fixed_two_pass_suppressed_by_high_info = False
         sequence_causal_probe_applied = False
         sequence_causal_probe_reason = "inactive"
@@ -3513,7 +3543,14 @@ class ActiveInferencePolicyEvaluatorV1:
                 global_action_counter=int(global_action_counter),
             )
         )
-        if fixed_prepass_entry is not None and not high_info_after_first_pass_gate_open:
+        fixed_prepass_pending = bool(fixed_prepass_entry is not None)
+        high_info_after_first_pass_gate_open = bool(
+            self.high_info_focus_release_after_first_pass
+            and bool(high_info_focus_hard_priority_available)
+            and int(global_action_counter) >= int(high_info_release_action_counter)
+            and not bool(fixed_prepass_pending)
+        )
+        if fixed_prepass_entry is not None:
             selected_entry = fixed_prepass_entry
             fixed_two_pass_traversal_applied = True
             least_tried_probe_applied = True
@@ -3554,12 +3591,6 @@ class ActiveInferencePolicyEvaluatorV1:
             if selected_entry is not entries[0]:
                 entries.remove(selected_entry)
                 entries.insert(0, selected_entry)
-        elif fixed_prepass_entry is not None and high_info_after_first_pass_gate_open:
-            fixed_two_pass_suppressed_by_high_info = True
-            fixed_two_pass_traversal_v1["enabled"] = True
-            fixed_two_pass_traversal_v1["mode"] = (
-                "suppressed_by_high_info_after_first_pass"
-            )
 
         early_probe_active = bool(
             (not fixed_two_pass_traversal_applied)
@@ -6367,6 +6398,9 @@ class ActiveInferencePolicyEvaluatorV1:
             "high_info_focus_priority_available": bool(
                 high_info_focus_priority_available
             ),
+            "high_info_focus_hard_priority_available": bool(
+                high_info_focus_hard_priority_available
+            ),
             "high_info_after_first_pass_gate_open": bool(
                 high_info_after_first_pass_gate_open
             ),
@@ -6376,6 +6410,7 @@ class ActiveInferencePolicyEvaluatorV1:
             ),
             "high_info_focus_probe_applied": bool(high_info_focus_probe_applied),
             "high_info_focus_probe_reason": str(high_info_focus_probe_reason),
+            "fixed_prepass_pending": bool(fixed_prepass_pending),
             "sequence_causal_probe_applied": bool(sequence_causal_probe_applied),
             "sequence_causal_probe_reason": str(sequence_causal_probe_reason),
             "previous_navigation_direction": str(previous_navigation_direction),
@@ -6405,6 +6440,7 @@ class ActiveInferencePolicyEvaluatorV1:
             ),
             "coverage_target_region_count": int(coverage_target_region_count),
             "coverage_sweep_min_region_visits": int(self.coverage_sweep_min_region_visits),
+            "coverage_prepass_passes": int(self.coverage_prepass_passes),
             "coverage_prepass_steps": int(self.coverage_prepass_steps),
             "coverage_hard_prepass_active": bool(coverage_hard_prepass_active),
             "coverage_prepass_goal_kind": str(coverage_prepass_goal_kind),
