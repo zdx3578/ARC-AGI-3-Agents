@@ -4466,76 +4466,198 @@ class ActiveInferencePolicyEvaluatorV1:
                         force_blocked_seek = bool(
                             interaction_chain_locked and safe_rows_all_away
                         )
-                        blocked_seek_pool = [
-                            row
-                            for row in high_info_rows
-                            if bool(row.get("blocked_hard_skip", False))
-                            and int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
-                            and (
-                                bool(row["features"].get("moves_toward_target_region", False))
-                                or bool(row["features"].get("reaches_target_region", False))
-                                or (
-                                    force_blocked_seek
-                                    and not bool(
+                        stubborn_self_loop = bool(
+                            interaction_chain_locked
+                            and bool(safe_navigation_rows)
+                            and all(
+                                bool(
+                                    row["features"].get(
+                                        "stays_in_current_region",
+                                        False,
+                                    )
+                                )
+                                for row in safe_navigation_rows
+                            )
+                            and min(
+                                int(row["features"].get("predicted_edge_attempts", 0))
+                                for row in safe_navigation_rows
+                            )
+                            >= 24
+                        )
+                        if stubborn_self_loop:
+                            self_loop_escape_pool = [
+                                row
+                                for row in candidate_high_info_rows
+                                if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                                and not bool(row.get("blocked_hard_skip", False))
+                                and not bool(
+                                    row["features"].get("high_block_loop_risk", False)
+                                )
+                                and not bool(
+                                    row["features"].get(
+                                        "stays_in_current_region",
+                                        False,
+                                    )
+                                )
+                            ]
+                            if self_loop_escape_pool:
+                                self_loop_escape_pool.sort(
+                                    key=lambda row: (
+                                        0
+                                        if (
+                                            str(high_info_bfs_next_region_key) != "NA"
+                                            and str(
+                                                row["features"].get(
+                                                    "predicted_region_key",
+                                                    "NA",
+                                                )
+                                            )
+                                            == str(high_info_bfs_next_region_key)
+                                        )
+                                        else 1,
+                                        0
+                                        if bool(
+                                            row["features"].get(
+                                                "reaches_target_region",
+                                                False,
+                                            )
+                                        )
+                                        or bool(
+                                            row["features"].get(
+                                                "moves_toward_target_region",
+                                                False,
+                                            )
+                                        )
+                                        else 1,
+                                        1
+                                        if bool(
+                                            row["features"].get(
+                                                "moves_away_target_region",
+                                                False,
+                                            )
+                                        )
+                                        else 0,
+                                        float(row.get("blocked_soft_penalty", 1.0)),
+                                        int(
+                                            row["features"].get(
+                                                "predicted_region_visit_count",
+                                                10**6,
+                                            )
+                                        ),
+                                        int(
+                                            row["features"].get(
+                                                "predicted_edge_attempts",
+                                                10**6,
+                                            )
+                                        ),
+                                        int(
+                                            row["features"].get("distance_after", 10**6)
+                                        ),
+                                        float(row["score"]),
+                                        int(
+                                            action_count_map.get(
+                                                int(row["entry"].candidate.action_id),
+                                                0,
+                                            )
+                                        ),
+                                        int(row["entry"].candidate.action_id),
+                                        str(row["entry"].candidate.candidate_id),
+                                    )
+                                )
+                                seek_pool = [self_loop_escape_pool[0]]
+                                high_info_focus_probe_reason = "active_self_loop_escape"
+                        if not seek_pool:
+                            blocked_seek_pool = [
+                                row
+                                for row in high_info_rows
+                                if bool(row.get("blocked_hard_skip", False))
+                                and int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                                and (
+                                    bool(
                                         row["features"].get(
-                                            "moves_away_target_region",
+                                            "moves_toward_target_region",
                                             False,
                                         )
                                     )
-                                )
-                            )
-                        ]
-                        blocked_seek_pool_non_loop = [
-                            row
-                            for row in blocked_seek_pool
-                            if not bool(
-                                row["features"].get("high_block_loop_risk", False)
-                            )
-                        ]
-                        if blocked_seek_pool_non_loop:
-                            blocked_seek_pool = blocked_seek_pool_non_loop
-                        if (
-                            blocked_seek_pool
-                            and (
-                                int(stagnation_streak)
-                                >= int(max(12, self.stagnation_probe_trigger_steps))
-                                or force_blocked_seek
-                            )
-                        ):
-                            blocked_seek_pool.sort(
-                                key=lambda row: (
-                                    0
-                                    if (
-                                        str(high_info_bfs_next_region_key) != "NA"
-                                        and str(
-                                            row["features"].get("predicted_region_key", "NA")
+                                    or bool(
+                                        row["features"].get(
+                                            "reaches_target_region",
+                                            False,
                                         )
-                                        == str(high_info_bfs_next_region_key)
                                     )
-                                    else 1,
-                                    1
-                                    if bool(
-                                        row["features"].get("high_block_loop_risk", False)
+                                    or (
+                                        force_blocked_seek
+                                        and not bool(
+                                            row["features"].get(
+                                                "moves_away_target_region",
+                                                False,
+                                            )
+                                        )
                                     )
-                                    else 0,
-                                    float(row.get("blocked_soft_penalty", 1.0)),
-                                    float(row["score"]),
-                                    int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
-                                    int(row["entry"].candidate.action_id),
-                                    str(row["entry"].candidate.candidate_id),
                                 )
-                            )
-                            best_blocked_seek = blocked_seek_pool[0]
-                            soft_penalty_gate = float(
-                                best_blocked_seek.get("blocked_soft_penalty", 1.0)
-                            )
-                            if force_blocked_seek or soft_penalty_gate <= 0.90:
-                                seek_pool = [best_blocked_seek]
-                                high_info_focus_probe_reason = (
-                                    "blocked_seek_chain_override"
-                                    if force_blocked_seek
-                                    else "blocked_seek_revalidation"
+                            ]
+                            blocked_seek_pool_non_loop = [
+                                row
+                                for row in blocked_seek_pool
+                                if not bool(
+                                    row["features"].get("high_block_loop_risk", False)
                                 )
+                            ]
+                            if blocked_seek_pool_non_loop:
+                                blocked_seek_pool = blocked_seek_pool_non_loop
+                            if (
+                                blocked_seek_pool
+                                and (
+                                    int(stagnation_streak)
+                                    >= int(max(12, self.stagnation_probe_trigger_steps))
+                                    or force_blocked_seek
+                                )
+                            ):
+                                blocked_seek_pool.sort(
+                                    key=lambda row: (
+                                        0
+                                        if (
+                                            str(high_info_bfs_next_region_key) != "NA"
+                                            and str(
+                                                row["features"].get(
+                                                    "predicted_region_key",
+                                                    "NA",
+                                                )
+                                            )
+                                            == str(high_info_bfs_next_region_key)
+                                        )
+                                        else 1,
+                                        1
+                                        if bool(
+                                            row["features"].get(
+                                                "high_block_loop_risk",
+                                                False,
+                                            )
+                                        )
+                                        else 0,
+                                        float(row.get("blocked_soft_penalty", 1.0)),
+                                        float(row["score"]),
+                                        int(
+                                            action_count_map.get(
+                                                int(row["entry"].candidate.action_id),
+                                                0,
+                                            )
+                                        ),
+                                        int(row["entry"].candidate.action_id),
+                                        str(row["entry"].candidate.candidate_id),
+                                    )
+                                )
+                                best_blocked_seek = blocked_seek_pool[0]
+                                soft_penalty_gate = float(
+                                    best_blocked_seek.get("blocked_soft_penalty", 1.0)
+                                )
+                                if force_blocked_seek or soft_penalty_gate <= 0.90:
+                                    seek_pool = [best_blocked_seek]
+                                    high_info_focus_probe_reason = (
+                                        "blocked_seek_chain_override"
+                                        if force_blocked_seek
+                                        else "blocked_seek_revalidation"
+                                    )
                     if seek_pool:
                         seek_pool_non_loop = [
                             row
@@ -4579,10 +4701,120 @@ class ActiveInferencePolicyEvaluatorV1:
                             and str(best_seek["features"].get("predicted_region_key", "NA"))
                             == str(high_info_bfs_next_region_key)
                         )
+                        seek_force_escape = False
+                        best_seek_predicted_region_visit = int(
+                            best_seek["features"].get("predicted_region_visit_count", 0)
+                        )
+                        best_seek_predicted_edge_attempts = int(
+                            best_seek["features"].get("predicted_edge_attempts", 0)
+                        )
+                        seek_trap_risk = bool(
+                            best_seek_predicted_region_visit >= 60
+                            and best_seek_predicted_edge_attempts >= 20
+                            and not bool(
+                                best_seek["features"].get(
+                                    "reaches_target_region",
+                                    False,
+                                )
+                            )
+                            and int(best_seek["features"].get("distance_after", 10**6))
+                            > 0
+                        )
+                        if seek_trap_risk:
+                            seek_escape_pool = [
+                                row
+                                for row in candidate_high_info_rows
+                                if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                                and not bool(row.get("blocked_hard_skip", False))
+                                and not bool(
+                                    row["features"].get("high_block_loop_risk", False)
+                                )
+                                and str(
+                                    row["features"].get("predicted_region_key", "NA")
+                                )
+                                != str(
+                                    best_seek["features"].get("predicted_region_key", "NA")
+                                )
+                            ]
+                            if seek_escape_pool:
+                                seek_escape_pool.sort(
+                                    key=lambda row: (
+                                        0
+                                        if bool(
+                                            row["features"].get(
+                                                "reaches_target_region",
+                                                False,
+                                            )
+                                        )
+                                        or bool(
+                                            row["features"].get(
+                                                "moves_toward_target_region",
+                                                False,
+                                            )
+                                        )
+                                        else 1,
+                                        int(
+                                            row["features"].get(
+                                                "predicted_region_visit_count",
+                                                10**6,
+                                            )
+                                        ),
+                                        int(
+                                            row["features"].get(
+                                                "predicted_edge_attempts",
+                                                10**6,
+                                            )
+                                        ),
+                                        int(
+                                            row["features"].get("distance_after", 10**6)
+                                        ),
+                                        float(row["score"]),
+                                        int(
+                                            action_count_map.get(
+                                                int(row["entry"].candidate.action_id),
+                                                0,
+                                            )
+                                        ),
+                                        int(row["entry"].candidate.action_id),
+                                        str(row["entry"].candidate.candidate_id),
+                                    )
+                                )
+                                best_seek_escape = seek_escape_pool[0]
+                                escape_predicted_region_visit = int(
+                                    best_seek_escape["features"].get(
+                                        "predicted_region_visit_count",
+                                        10**6,
+                                    )
+                                )
+                                escape_predicted_edge_attempts = int(
+                                    best_seek_escape["features"].get(
+                                        "predicted_edge_attempts",
+                                        10**6,
+                                    )
+                                )
+                                if (
+                                    escape_predicted_region_visit
+                                    <= (best_seek_predicted_region_visit - 24)
+                                    or escape_predicted_edge_attempts
+                                    <= (best_seek_predicted_edge_attempts - 12)
+                                ):
+                                    best_seek = best_seek_escape
+                                    best_seek_bfs_match = bool(
+                                        str(high_info_bfs_next_region_key) != "NA"
+                                        and str(
+                                            best_seek["features"].get(
+                                                "predicted_region_key",
+                                                "NA",
+                                            )
+                                        )
+                                        == str(high_info_bfs_next_region_key)
+                                    )
+                                    seek_force_escape = True
                         seek_margin = float(max(self.sequence_probe_score_margin, 0.40))
                         if (
                             bool(best_seek["features"].get("reaches_target_region", False))
                             or best_seek_bfs_match
+                            or seek_force_escape
                             or float(best_seek["score"])
                             <= (best_high_info_score + seek_margin)
                         ):
@@ -4592,9 +4824,13 @@ class ActiveInferencePolicyEvaluatorV1:
                                 "blocked_seek_"
                             ):
                                 high_info_focus_probe_reason = (
-                                    "seek_target_bfs_priority"
-                                    if best_seek_bfs_match
-                                    else "seek_target_priority"
+                                    "seek_trap_escape"
+                                    if seek_force_escape
+                                    else (
+                                        "seek_target_bfs_priority"
+                                        if best_seek_bfs_match
+                                        else "seek_target_priority"
+                                    )
                                 )
                 if not high_info_focus_probe_applied:
                     value_pool = [
