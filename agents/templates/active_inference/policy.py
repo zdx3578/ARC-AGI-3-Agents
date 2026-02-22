@@ -4380,6 +4380,44 @@ class ActiveInferencePolicyEvaluatorV1:
                             or bool(row["features"].get("reaches_target_region", False))
                         )
                     ]
+                    if not seek_pool:
+                        blocked_seek_pool = [
+                            row
+                            for row in high_info_rows
+                            if bool(row.get("blocked_hard_skip", False))
+                            and int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                            and (
+                                bool(row["features"].get("moves_toward_target_region", False))
+                                or bool(row["features"].get("reaches_target_region", False))
+                            )
+                        ]
+                        if (
+                            blocked_seek_pool
+                            and int(stagnation_streak)
+                            >= int(max(12, self.stagnation_probe_trigger_steps))
+                        ):
+                            blocked_seek_pool.sort(
+                                key=lambda row: (
+                                    0
+                                    if (
+                                        str(high_info_bfs_next_region_key) != "NA"
+                                        and str(
+                                            row["features"].get("predicted_region_key", "NA")
+                                        )
+                                        == str(high_info_bfs_next_region_key)
+                                    )
+                                    else 1,
+                                    float(row.get("blocked_soft_penalty", 1.0)),
+                                    float(row["score"]),
+                                    int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                                    int(row["entry"].candidate.action_id),
+                                    str(row["entry"].candidate.candidate_id),
+                                )
+                            )
+                            best_blocked_seek = blocked_seek_pool[0]
+                            if float(best_blocked_seek.get("blocked_soft_penalty", 1.0)) <= 0.85:
+                                seek_pool = [best_blocked_seek]
+                                high_info_focus_probe_reason = "blocked_seek_revalidation"
                     if seek_pool:
                         seek_pool.sort(
                             key=lambda row: (

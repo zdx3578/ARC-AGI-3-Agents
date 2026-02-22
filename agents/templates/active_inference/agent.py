@@ -1604,6 +1604,7 @@ class ActiveInferenceEFE(Agent):
             else {}
         )
         nav_region_hints: dict[str, float] = {}
+        nav_region_kind_rank: dict[str, int] = {}
         targets = nav.get("targets", [])
         if isinstance(targets, list):
             for row in targets:
@@ -1619,14 +1620,20 @@ class ActiveInferenceEFE(Agent):
                 hint = float(max(0.0, row.get("target_priority", row.get("salience", 0.0))))
                 target_kind = str(row.get("kind", ""))
                 kind_bonus = 0.0
+                kind_rank = 0
                 if target_kind == "cross_like":
                     kind_bonus = 0.22
+                    kind_rank = 2
                 elif target_kind == "salient":
                     kind_bonus = 0.08
+                    kind_rank = 1
                 hint = float(min(1.0, hint + kind_bonus))
                 nav_region_hints[str(region_key)] = max(
                     float(nav_region_hints.get(str(region_key), 0.0)),
                     float(min(1.0, hint)),
+                )
+                nav_region_kind_rank[str(region_key)] = int(
+                    max(int(nav_region_kind_rank.get(str(region_key), 0)), int(kind_rank))
                 )
 
         orientation_state = nav.get("orientation_alignment_v1", {})
@@ -1706,10 +1713,13 @@ class ActiveInferenceEFE(Agent):
             strong_rate = float(max(0.0, row.get("strong_change_rate", 0.0)))
             progress_rate = float(max(0.0, row.get("progress_rate", 0.0)))
             ui_suppression = float(max(0.0, min(1.0, row.get("ui_suppression", 0.0))))
+            monotony_penalty = float(max(0.0, row.get("monotony_penalty", 0.0)))
             attempts = int(max(0, row.get("attempts", 0)))
             visit_count = int(max(0, self._region_visit_counts.get(str(region_key), 0)))
             novelty = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 12.0)))
             nav_hint = float(max(0.0, min(1.0, nav_region_hints.get(str(region_key), 0.0))))
+            nav_kind_rank = int(max(0, min(2, nav_region_kind_rank.get(str(region_key), 0))))
+            nav_kind_bonus = float(0.05 * float(nav_kind_rank))
             support = float(1.0 - math.exp(-float(max(0, attempts)) / 4.0))
             support_prior = float(min(0.90, 0.35 + (0.45 * nav_hint)))
             base = float(
@@ -1722,26 +1732,62 @@ class ActiveInferenceEFE(Agent):
             )
             base = float(base * (1.0 - (0.85 * ui_suppression)))
             base = float(base + (0.08 * novelty))
+            base = float(base + nav_kind_bonus)
+            stagnation_penalty = 0.0
+            if attempts >= 4 and progress_rate <= 0.0:
+                stagnation_penalty = float(
+                    min(
+                        0.35,
+                        float(monotony_penalty) + (0.006 * float(max(0, visit_count - 10))),
+                    )
+                )
+                base = float(max(0.0, base - stagnation_penalty))
+            exploration_boost = 0.0
+            if nav_kind_rank >= 2 and attempts < 2:
+                exploration_boost = float(0.28 + (0.08 * float(max(0, 1 - attempts))))
+            elif nav_hint >= 0.75 and attempts <= 0:
+                exploration_boost = 0.12
+            base = float(base + exploration_boost)
+            if attempts <= 0 and nav_hint >= 0.70:
+                unseen_hint_bonus = float(0.05 + (0.04 * float(nav_kind_rank)))
+                base = float(base + unseen_hint_bonus)
             base = float(max(base, (0.18 * nav_hint * novelty)))
             base = float(max(support_prior, (0.30 + (0.70 * support))) * base)
             if str(region_key) == str(fallback_key):
                 base = float(base + 0.05)
             return float(max(0.0, min(1.0, base)))
 
-        primary_candidates: list[tuple[float, int, int, str]] = []
+        primary_candidates: list[tuple[float, int, int, int, str]] = []
         for region_key in candidate_region_keys:
             if self._parse_region_key_v1(str(region_key)) is None:
                 continue
             score = float(_region_base_score(str(region_key)))
+            kind_rank = int(max(0, min(2, nav_region_kind_rank.get(str(region_key), 0))))
             visit_count = int(max(0, self._region_visit_counts.get(str(region_key), 0)))
             attempts = int(max(0, row_by_region.get(str(region_key), {}).get("attempts", 0)))
-            primary_candidates.append((float(score), -int(attempts), int(visit_count), str(region_key)))
-        primary_candidates.sort(key=lambda item: (-float(item[0]), int(item[1]), int(item[2]), str(item[3])))
+            primary_candidates.append(
+                (
+                    float(score),
+                    -int(kind_rank),
+                    -int(attempts),
+                    int(visit_count),
+                    str(region_key),
+                )
+            )
+        primary_candidates.sort(
+            key=lambda item: (
+                -float(item[0]),
+                int(item[1]),
+                int(item[2]),
+                int(item[3]),
+                str(item[4]),
+            )
+        )
 
         primary_region_key = "NA"
         primary_region_score = 0.0
         if primary_candidates and float(primary_candidates[0][0]) >= 0.12:
-            primary_region_key = str(primary_candidates[0][3])
+            primary_region_key = str(primary_candidates[0][4])
             primary_region_score = float(primary_candidates[0][0])
         elif fallback_key != "NA":
             primary_region_key = str(fallback_key)
@@ -2260,6 +2306,22 @@ class ActiveInferenceEFE(Agent):
                     ),
                 )
             )
+            monotony_penalty = 0.0
+            if attempts >= 4 and progress_rate <= 0.0:
+                deterministic = float(max(0.0, min(1.0, 1.0 - float(entropy_norm))))
+                stagnant_visits = int(max(0, visit_count - 8))
+                monotony_penalty = float(
+                    min(
+                        0.42,
+                        (0.18 * deterministic) + (0.012 * float(stagnant_visits)),
+                    )
+                )
+                if (
+                    non_no_change_rate >= 0.95
+                    and entropy_norm <= 0.05
+                    and attempts >= 6
+                ):
+                    monotony_penalty = float(min(0.55, monotony_penalty + 0.12))
             info_score = float(
                 max(
                     0.0,
@@ -2269,7 +2331,8 @@ class ActiveInferenceEFE(Agent):
                             (0.92 * float(coupling_profile.get("score", 0.0)))
                             + (0.06 * visit_novelty)
                         )
-                        * (1.0 - ui_suppression),
+                        * (1.0 - ui_suppression)
+                        - float(monotony_penalty),
                     ),
                 )
             )
@@ -2294,6 +2357,7 @@ class ActiveInferenceEFE(Agent):
                 "coupling_signal_kind": str(coupling_profile.get("kind", "unknown")),
                 "coupling_components": dict(coupling_profile.get("components", {})),
                 "coupling_weights": dict(coupling_profile.get("weights", {})),
+                "monotony_penalty": float(monotony_penalty),
                 "visit_count": int(visit_count),
                 "event_histogram": {str(k): int(v) for (k, v) in sorted(histogram.items())},
             }
@@ -3125,6 +3189,14 @@ class ActiveInferenceEFE(Agent):
             rows = scoreboard.get("rows", [])
             if not isinstance(rows, list):
                 rows = []
+            rows_by_region_key: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                region_key = str(row.get("region_key", "NA"))
+                if self._parse_region_key_v1(region_key) is None:
+                    continue
+                rows_by_region_key[str(region_key)] = dict(row)
             for row in rows:
                 if not isinstance(row, dict):
                     continue
@@ -3141,6 +3213,7 @@ class ActiveInferenceEFE(Agent):
                 if coupled_progress_locked and region_key not in coupled_region_keys:
                     progress_rate = float(max(0.0, row.get("progress_rate", 0.0)))
                     coupling_score = float(max(0.0, row.get("coupling_signal_score", 0.0)))
+                    monotony_penalty = float(max(0.0, row.get("monotony_penalty", 0.0)))
                     if (
                         visit_count >= 8
                         and info_score <= 0.58
@@ -3148,6 +3221,14 @@ class ActiveInferenceEFE(Agent):
                         and progress_rate <= 0.0
                     ):
                         stale_loop_penalty = float(min(0.34, 0.04 * float(visit_count - 7)))
+                    if monotony_penalty > 0.0 and progress_rate <= 0.0:
+                        stale_loop_penalty = float(
+                            stale_loop_penalty + min(0.28, monotony_penalty)
+                        )
+                    if visit_count >= 24 and progress_rate <= 0.0 and coupling_score <= 0.82:
+                        stale_loop_penalty = float(
+                            stale_loop_penalty + min(0.30, 0.01 * float(visit_count - 23))
+                        )
                 score = float(
                     max(
                         0.0,
@@ -3202,6 +3283,10 @@ class ActiveInferenceEFE(Agent):
                             )
             for region_key in coupled_region_keys:
                 base_floor = float(coupled_floor)
+                region_row = rows_by_region_key.get(str(region_key), {})
+                region_visit_count = int(max(0, self._region_visit_counts.get(str(region_key), 0)))
+                region_progress_rate = float(max(0.0, region_row.get("progress_rate", 0.0)))
+                region_monotony_penalty = float(max(0.0, region_row.get("monotony_penalty", 0.0)))
                 if region_key == str(primary_coupled_region_key):
                     if orientation_misaligned:
                         base_floor = float(min(1.0, base_floor + 0.14))
@@ -3214,6 +3299,16 @@ class ActiveInferenceEFE(Agent):
                         base_floor = float(min(1.0, base_floor + 0.06))
                 elif strong_event and str(source_region_key) == str(primary_coupled_region_key):
                     base_floor = float(min(1.0, base_floor + 0.05))
+                required_samples = int(_required_samples(str(region_key)))
+                region_sample_count = int(max(0, target_sample_counts.get(str(region_key), 0)))
+                if (
+                    coupled_progress_locked
+                    and region_progress_rate <= 0.0
+                    and region_sample_count >= required_samples
+                    and region_visit_count >= int(max(12, required_samples + 6))
+                    and region_monotony_penalty >= 0.12
+                ):
+                    base_floor = float(min(base_floor, 0.52))
                 target_scores_local[str(region_key)] = max(
                     float(target_scores_local.get(str(region_key), 0.0)),
                     float(base_floor),
@@ -3421,6 +3516,78 @@ class ActiveInferenceEFE(Agent):
             )
 
         if not bool(state.get("active", False)):
+            if coupled_progress_locked:
+                rearm_scores: dict[str, float] = {}
+                if self._parse_region_key_v1(str(primary_coupled_region_key)) is not None:
+                    rearm_scores[str(primary_coupled_region_key)] = float(
+                        max(float(coupled_floor), 0.62)
+                    )
+                if (
+                    self._parse_region_key_v1(str(secondary_coupled_region_key)) is not None
+                    and str(secondary_coupled_region_key) != str(primary_coupled_region_key)
+                ):
+                    rearm_scores[str(secondary_coupled_region_key)] = float(
+                        max(float(coupled_floor - 0.08), 0.54)
+                    )
+                if rearm_scores:
+                    rearm_anchor = str(nav_region_key)
+                    if self._parse_region_key_v1(rearm_anchor) is None:
+                        rearm_anchor = str(source_region_key)
+                    for region_key in rearm_scores.keys():
+                        target_sample_counts.setdefault(str(region_key), 0)
+                        target_required_samples[str(region_key)] = int(
+                            _required_samples(str(region_key))
+                        )
+                    rearm_queue = _rank_queue(
+                        rearm_scores,
+                        anchor_region_key=str(rearm_anchor),
+                        completed_recent=set(),
+                        sample_counts=target_sample_counts,
+                    )
+                    if rearm_queue:
+                        rearm_chain = _build_interaction_chain(
+                            list(rearm_queue),
+                            source_key=str(rearm_anchor),
+                        )
+                        interaction_chain_active = bool(len(rearm_chain) >= 2)
+                        state["active"] = True
+                        state["stage"] = "seek"
+                        state["window_steps"] = int(self.high_info_focus_window_steps)
+                        state["steps_remaining"] = int(
+                            max(2, int(self.high_info_focus_window_steps // 2))
+                        )
+                        state["trigger_action_counter"] = int(current_counter)
+                        state["deadline_action_counter"] = int(
+                            max(
+                                int(state.get("deadline_action_counter", -1)),
+                                int(current_counter + int(self.high_info_focus_window_steps)),
+                            )
+                        )
+                        state["source_region_key"] = str(rearm_anchor)
+                        state["trigger_event_type"] = "IDLE_REARM"
+                        state["current_target_region_key"] = str(rearm_queue[0])
+                        state["target_region_queue"] = list(rearm_queue)
+                        state["target_region_scores"] = dict(rearm_scores)
+                        state["target_sample_counts"] = dict(target_sample_counts)
+                        state["target_required_samples"] = dict(target_required_samples)
+                        state["completed_target_regions"] = list(completed_regions[-16:])
+                        state["primary_coupled_region_key"] = str(primary_coupled_region_key)
+                        state["secondary_coupled_region_key"] = str(secondary_coupled_region_key)
+                        state["cross_region_key"] = str(primary_coupled_region_key)
+                        state["gate_region_key"] = str(secondary_coupled_region_key)
+                        state["coupled_region_keys"] = [
+                            str(v) for v in sorted(coupled_region_keys)
+                        ]
+                        state["interaction_chain_active"] = bool(interaction_chain_active)
+                        state["interaction_target_chain"] = list(rearm_chain[:16])
+                        state["interaction_target_index"] = 0
+                        state["interaction_last_status"] = (
+                            "rearm_tracking"
+                            if interaction_chain_active
+                            else "rearm_single"
+                        )
+                        state["last_status"] = "idle_rearm"
+                        return
             state["target_region_scores"] = dict(score_memory)
             state["completed_target_regions"] = list(completed_regions[-16:])
             state["target_sample_counts"] = dict(target_sample_counts)
