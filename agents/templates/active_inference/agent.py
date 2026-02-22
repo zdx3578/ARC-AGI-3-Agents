@@ -1776,7 +1776,7 @@ class ActiveInferenceEFE(Agent):
                 (
                     float(score),
                     -int(kind_rank),
-                    -int(attempts),
+                    int(attempts),
                     int(visit_count),
                     str(region_key),
                 )
@@ -1827,6 +1827,10 @@ class ActiveInferenceEFE(Agent):
                 )
                 base = float(_region_base_score(key))
                 attempts = int(max(0, row.get("attempts", 0)))
+                visit_count = int(max(0, self._region_visit_counts.get(key, 0)))
+                nav_hint = float(max(0.0, min(1.0, nav_region_hints.get(key, 0.0))))
+                nav_kind_rank = int(max(0, min(2, nav_region_kind_rank.get(key, 0))))
+                monotony_penalty = float(max(0.0, row.get("monotony_penalty", 0.0)))
                 locality_penalty = 0.0
                 if distance <= 1 and structural_signal < 0.35:
                     locality_penalty = float(
@@ -1839,24 +1843,40 @@ class ActiveInferenceEFE(Agent):
                 stale_penalty = 0.0
                 if attempts >= 6 and progress_rate <= 0.0 and structural_signal < 0.20:
                     stale_penalty = float(min(0.22, 0.04 * float(attempts - 5)))
+                loop_penalty = 0.0
+                if progress_rate <= 0.0:
+                    if visit_count >= 8:
+                        loop_penalty += float(min(0.30, 0.02 * float(visit_count - 7)))
+                    if attempts >= 4 and nav_hint < 0.30:
+                        loop_penalty += float(min(0.24, 0.04 * float(attempts - 3)))
+                    if monotony_penalty > 0.0:
+                        loop_penalty += float(min(0.30, 0.60 * monotony_penalty))
                 far_structural_bonus = 0.0
                 if distance >= 2 and structural_signal >= 0.60:
                     far_structural_bonus = 0.08
+                anchor_bonus = 0.0
+                if nav_hint >= 0.70 and attempts <= 3:
+                    anchor_bonus += 0.14
+                elif nav_kind_rank >= 2 and attempts <= 4:
+                    anchor_bonus += 0.10
+                if orientation_misaligned and nav_kind_rank >= 2:
+                    anchor_bonus += 0.08
                 score = float(
                     (0.50 * base)
                     + (0.20 * pair_affinity)
                     + (0.08 * distance_term)
                     + (0.16 * structural_signal)
-                    + (0.08 * float(max(0.0, nav_region_hints.get(key, 0.0))))
+                    + (0.16 * nav_hint)
                     + float(far_structural_bonus)
+                    + float(anchor_bonus)
                     - float(locality_penalty)
                     - float(stale_penalty)
+                    - float(loop_penalty)
                 )
-                visit_count = int(max(0, self._region_visit_counts.get(key, 0)))
                 secondary_candidates.append(
                     (
                         float(score),
-                        -int(attempts),
+                        int(attempts),
                         int(visit_count),
                         str(key),
                         float(pair_affinity),
@@ -2603,13 +2623,18 @@ class ActiveInferenceEFE(Agent):
         predicted_region_features: dict[str, Any] | None,
     ) -> dict[str, Any]:
         state = self._high_info_focus_state_snapshot_v1()
-        current_region_key = self._current_region_key_v1()
+        raw_current_region_key = self._current_region_key_v1()
+        current_region_key = str(raw_current_region_key)
+        predicted_current_region_key = "NA"
         target_region_key = str(state.get("current_target_region_key", "NA"))
         predicted_region_key = str(current_region_key)
         predicted_region_visit_count = 0
         predicted_edge_attempts = 0
         predicted_edge_blocked_rate = 0.0
         if isinstance(predicted_region_features, dict):
+            current_key = str(predicted_region_features.get("current_region_key", "NA"))
+            if self._parse_region_key_v1(current_key) is not None:
+                predicted_current_region_key = str(current_key)
             key = str(predicted_region_features.get("predicted_region_key", "NA"))
             if self._parse_region_key_v1(key) is not None:
                 predicted_region_key = str(key)
@@ -2625,6 +2650,16 @@ class ActiveInferenceEFE(Agent):
                     min(1.0, predicted_region_features.get("edge_blocked_rate", 0.0)),
                 )
             )
+        raw_current_region_tuple = self._parse_region_key_v1(raw_current_region_key)
+        predicted_current_region_tuple = self._parse_region_key_v1(predicted_current_region_key)
+        if predicted_current_region_tuple is not None:
+            current_region_key = str(predicted_current_region_key)
+        current_region_tuple = self._parse_region_key_v1(current_region_key)
+        current_region_mismatch = bool(
+            raw_current_region_tuple is not None
+            and predicted_current_region_tuple is not None
+            and str(raw_current_region_key) != str(predicted_current_region_key)
+        )
         distance_before = int(self._region_distance_v1(current_region_key, target_region_key))
         distance_after = int(self._region_distance_v1(predicted_region_key, target_region_key))
         distance_delta = int(distance_after - distance_before)
@@ -2636,6 +2671,16 @@ class ActiveInferenceEFE(Agent):
         reaches_target = bool(
             self._parse_region_key_v1(predicted_region_key) is not None
             and str(predicted_region_key) == str(target_region_key)
+        )
+        stays_in_current_region = bool(
+            current_region_tuple is not None
+            and self._parse_region_key_v1(predicted_region_key) is not None
+            and str(predicted_region_key) == str(current_region_key)
+        )
+        high_block_loop_risk = bool(
+            stays_in_current_region
+            and int(predicted_edge_attempts) >= 12
+            and float(predicted_edge_blocked_rate) >= 0.65
         )
         moves_toward_target = bool(distance_after < distance_before)
         moves_away_target = bool(distance_after > distance_before)
@@ -2748,6 +2793,17 @@ class ActiveInferenceEFE(Agent):
                     bonus_hint += 0.18
                 if moves_away_target:
                     penalty_hint += 0.38
+                if high_block_loop_risk:
+                    penalty_hint += 0.95
+                    bonus_hint = float(0.55 * bonus_hint)
+                elif (
+                    stays_in_current_region
+                    and int(predicted_edge_attempts) >= 8
+                    and float(predicted_edge_blocked_rate) >= 0.50
+                ):
+                    penalty_hint += 0.35
+        if current_region_mismatch and action_id in (1, 2, 3, 4):
+            penalty_hint += 0.28
         bonus_hint = float((0.75 + (0.25 * urgency)) * bonus_hint)
         return {
             "schema_name": "active_inference_high_info_focus_features_v1",
@@ -2755,7 +2811,10 @@ class ActiveInferenceEFE(Agent):
             "enabled": bool(state.get("enabled", False)),
             "active": bool(state.get("active", False)),
             "stage": str(state.get("stage", "idle")),
+            "raw_current_region_key": str(raw_current_region_key),
+            "predicted_current_region_key": str(predicted_current_region_key),
             "current_region_key": str(current_region_key),
+            "current_region_mismatch": bool(current_region_mismatch),
             "target_region_key": str(target_region_key),
             "predicted_region_key": str(predicted_region_key),
             "predicted_region_visit_count": int(predicted_region_visit_count),
@@ -2774,6 +2833,8 @@ class ActiveInferenceEFE(Agent):
             "moves_toward_target_region": bool(moves_toward_target),
             "moves_away_target_region": bool(moves_away_target),
             "reaches_target_region": bool(reaches_target),
+            "stays_in_current_region": bool(stays_in_current_region),
+            "high_block_loop_risk": bool(high_block_loop_risk),
             "verify_action_ids": [int(v) for v in sorted(verify_action_set)],
             "verify_action_candidate": bool(verify_action_candidate),
             "interaction_chain_active": bool(interaction_chain_active),
@@ -4865,34 +4926,14 @@ class ActiveInferenceEFE(Agent):
             payload["reason"] = "non_navigation_action"
             return payload
         current_region: tuple[int, int] | None = None
-        latest_navigation = (
-            self._latest_navigation_state_estimate
-            if isinstance(self._latest_navigation_state_estimate, dict)
-            else {}
-        )
-        latest_region = latest_navigation.get("agent_pos_region", {})
-        if (
-            bool(latest_navigation.get("matched", False))
-            and isinstance(latest_region, dict)
-        ):
-            latest_rx = int(latest_region.get("x", -1))
-            latest_ry = int(latest_region.get("y", -1))
-            if latest_rx >= 0 and latest_ry >= 0:
-                latest_key = f"{int(latest_rx)}:{int(latest_ry)}"
-                plausible_latest = True
-                if self._last_known_agent_pos_region is not None:
-                    last_rx, last_ry = self._last_known_agent_pos_region
-                    last_key = f"{int(last_rx)}:{int(last_ry)}"
-                    plausible_latest = bool(
-                        self._region_step_plausible_v1(
-                            str(last_key),
-                            str(latest_key),
-                            max_axis_step=1,
-                        )
-                    )
-                if plausible_latest:
-                    current_region = (int(latest_rx), int(latest_ry))
-                    payload["current_region_source"] = "latest_navigation_state"
+        current_region_key_v1 = self._current_region_key_v1()
+        parsed_current_region = self._parse_region_key_v1(str(current_region_key_v1))
+        if parsed_current_region is not None:
+            current_region = (
+                int(parsed_current_region[0]),
+                int(parsed_current_region[1]),
+            )
+            payload["current_region_source"] = "current_region_key_v1"
         if current_region is None and self._last_known_agent_pos_region is not None:
             current_region = (
                 int(self._last_known_agent_pos_region[0]),
@@ -5171,6 +5212,7 @@ class ActiveInferenceEFE(Agent):
         )
         palette_changed = bool(palette_delta_total > 0)
         source_region_key = self._current_region_key_v1()
+        edge_source_region_key = str(source_region_key)
         if action_id in (1, 2, 3, 4):
             self._navigation_attempt_count += 1
             action_key = str(action_id)
@@ -5180,10 +5222,14 @@ class ActiveInferenceEFE(Agent):
             )
             action_stats["attempts"] = int(action_stats.get("attempts", 0) + 1)
             edge_key = None
-            if self._last_known_agent_pos_region is not None:
+            if (
+                self._parse_region_key_v1(str(edge_source_region_key)) is None
+                and self._last_known_agent_pos_region is not None
+            ):
                 rx, ry = self._last_known_agent_pos_region
-                source_region_key = f"{rx}:{ry}"
-                edge_key = f"region={rx}:{ry}|action={action_id}"
+                edge_source_region_key = f"{rx}:{ry}"
+            if self._parse_region_key_v1(str(edge_source_region_key)) is not None:
+                edge_key = f"region={str(edge_source_region_key)}|action={action_id}"
                 self._edge_attempt_counts[edge_key] = int(
                     self._edge_attempt_counts.get(edge_key, 0) + 1
                 )
@@ -5257,10 +5303,10 @@ class ActiveInferenceEFE(Agent):
                     if rx >= 0 and ry >= 0:
                         target_region_key = f"{rx}:{ry}"
                         plausible_transition = True
-                        if self._parse_region_key_v1(str(source_region_key)) is not None:
+                        if self._parse_region_key_v1(str(edge_source_region_key)) is not None:
                             plausible_transition = bool(
                                 self._region_step_plausible_v1(
-                                    str(source_region_key),
+                                    str(edge_source_region_key),
                                     str(target_region_key),
                                     max_axis_step=1,
                                 )
@@ -5270,8 +5316,10 @@ class ActiveInferenceEFE(Agent):
                             self._region_visit_counts[target_region_key] = int(
                                 self._region_visit_counts.get(target_region_key, 0) + 1
                             )
-                            if source_region_key != "NA":
-                                region_action_key = f"{source_region_key}|a{action_id}"
+                            if str(edge_source_region_key) != "NA":
+                                region_action_key = (
+                                    f"{str(edge_source_region_key)}|a{action_id}"
+                                )
                                 target_histogram = self._region_action_transition_counts.setdefault(
                                     region_action_key,
                                     {},

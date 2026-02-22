@@ -2186,7 +2186,12 @@ class ActiveInferencePolicyEvaluatorV1:
             "enabled": bool(raw.get("enabled", False)),
             "active": bool(raw.get("active", False)),
             "stage": str(raw.get("stage", "idle")),
+            "raw_current_region_key": str(raw.get("raw_current_region_key", "NA")),
+            "predicted_current_region_key": str(
+                raw.get("predicted_current_region_key", "NA")
+            ),
             "current_region_key": str(raw.get("current_region_key", "NA")),
+            "current_region_mismatch": bool(raw.get("current_region_mismatch", False)),
             "target_region_key": str(raw.get("target_region_key", "NA")),
             "predicted_region_key": str(raw.get("predicted_region_key", "NA")),
             "predicted_region_visit_count": int(
@@ -2210,6 +2215,8 @@ class ActiveInferencePolicyEvaluatorV1:
             "moves_toward_target_region": bool(raw.get("moves_toward_target_region", False)),
             "moves_away_target_region": bool(raw.get("moves_away_target_region", False)),
             "reaches_target_region": bool(raw.get("reaches_target_region", False)),
+            "stays_in_current_region": bool(raw.get("stays_in_current_region", False)),
+            "high_block_loop_risk": bool(raw.get("high_block_loop_risk", False)),
             "verify_action_candidate": bool(raw.get("verify_action_candidate", False)),
             "interaction_chain_active": bool(raw.get("interaction_chain_active", False)),
             "verify_action_ids": [
@@ -4354,6 +4361,22 @@ class ActiveInferencePolicyEvaluatorV1:
                 candidate_high_info_rows = (
                     safe_high_info_rows if safe_high_info_rows else high_info_rows
                 )
+                interaction_chain_present = bool(
+                    any(
+                        bool(row["features"].get("interaction_chain_active", False))
+                        for row in candidate_high_info_rows
+                    )
+                )
+                loop_safe_rows = [
+                    row
+                    for row in candidate_high_info_rows
+                    if not bool(row["features"].get("high_block_loop_risk", False))
+                ]
+                if interaction_chain_present and loop_safe_rows and (
+                    len(loop_safe_rows) < len(candidate_high_info_rows)
+                ):
+                    candidate_high_info_rows = loop_safe_rows
+                    high_info_focus_probe_reason = "active_loop_risk_auto_skip"
                 high_info_bfs_next_region_key = "NA"
                 if candidate_high_info_rows:
                     sample_features = candidate_high_info_rows[0]["features"]
@@ -4384,7 +4407,10 @@ class ActiveInferencePolicyEvaluatorV1:
                                     goal_region_key=str(hi_target_region_key),
                                 )
                             )
-                if len(candidate_high_info_rows) < len(high_info_rows):
+                if (
+                    len(candidate_high_info_rows) < len(high_info_rows)
+                    and str(high_info_focus_probe_reason) == "active_no_override"
+                ):
                     high_info_focus_probe_reason = "active_blocked_edge_auto_skip"
                 best_high_info_score = min(
                     float(row["score"]) for row in candidate_high_info_rows
@@ -4459,6 +4485,15 @@ class ActiveInferencePolicyEvaluatorV1:
                                 )
                             )
                         ]
+                        blocked_seek_pool_non_loop = [
+                            row
+                            for row in blocked_seek_pool
+                            if not bool(
+                                row["features"].get("high_block_loop_risk", False)
+                            )
+                        ]
+                        if blocked_seek_pool_non_loop:
+                            blocked_seek_pool = blocked_seek_pool_non_loop
                         if (
                             blocked_seek_pool
                             and (
@@ -4478,6 +4513,11 @@ class ActiveInferencePolicyEvaluatorV1:
                                         == str(high_info_bfs_next_region_key)
                                     )
                                     else 1,
+                                    1
+                                    if bool(
+                                        row["features"].get("high_block_loop_risk", False)
+                                    )
+                                    else 0,
                                     float(row.get("blocked_soft_penalty", 1.0)),
                                     float(row["score"]),
                                     int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
@@ -4497,6 +4537,15 @@ class ActiveInferencePolicyEvaluatorV1:
                                     else "blocked_seek_revalidation"
                                 )
                     if seek_pool:
+                        seek_pool_non_loop = [
+                            row
+                            for row in seek_pool
+                            if not bool(
+                                row["features"].get("high_block_loop_risk", False)
+                            )
+                        ]
+                        if seek_pool_non_loop:
+                            seek_pool = seek_pool_non_loop
                         seek_pool.sort(
                             key=lambda row: (
                                 0
@@ -4508,6 +4557,11 @@ class ActiveInferencePolicyEvaluatorV1:
                                     == str(high_info_bfs_next_region_key)
                                 )
                                 else 1,
+                                1
+                                if bool(
+                                    row["features"].get("high_block_loop_risk", False)
+                                )
+                                else 0,
                                 0 if bool(row["features"].get("reaches_target_region", False)) else 1,
                                 -int(row["features"].get("remaining_samples", 0)),
                                 int(row["features"].get("distance_after", 10**6)),
@@ -4588,6 +4642,15 @@ class ActiveInferencePolicyEvaluatorV1:
                     if safe_value_pool:
                         value_pool = list(safe_value_pool)
                     if value_pool:
+                        value_pool_non_loop = [
+                            row
+                            for row in value_pool
+                            if not bool(
+                                row["features"].get("high_block_loop_risk", False)
+                            )
+                        ]
+                        if value_pool_non_loop:
+                            value_pool = value_pool_non_loop
                         interaction_chain_detour = bool(
                             any(
                                 bool(
@@ -4617,6 +4680,11 @@ class ActiveInferencePolicyEvaluatorV1:
                         if interaction_chain_detour:
                             value_pool.sort(
                                 key=lambda row: (
+                                    1
+                                    if bool(
+                                        row["features"].get("high_block_loop_risk", False)
+                                    )
+                                    else 0,
                                     int(
                                         row["features"].get(
                                             "alternate_coupled_distance",
@@ -4665,6 +4733,11 @@ class ActiveInferencePolicyEvaluatorV1:
                                         == str(high_info_bfs_next_region_key)
                                     )
                                     else 1,
+                                    1
+                                    if bool(
+                                        row["features"].get("high_block_loop_risk", False)
+                                    )
+                                    else 0,
                                     -int(row["features"].get("remaining_samples", 0)),
                                     -float(row["features"].get("target_score", 0.0)),
                                     -float(row["features"].get("bonus_hint", 0.0)),
@@ -4715,6 +4788,18 @@ class ActiveInferencePolicyEvaluatorV1:
                         "current_region_key": str(
                             row["features"].get("current_region_key", "NA")
                         ),
+                        "raw_current_region_key": str(
+                            row["features"].get("raw_current_region_key", "NA")
+                        ),
+                        "predicted_current_region_key": str(
+                            row["features"].get(
+                                "predicted_current_region_key",
+                                "NA",
+                            )
+                        ),
+                        "current_region_mismatch": bool(
+                            row["features"].get("current_region_mismatch", False)
+                        ),
                         "target_region_key": str(
                             row["features"].get("target_region_key", "NA")
                         ),
@@ -4753,6 +4838,12 @@ class ActiveInferencePolicyEvaluatorV1:
                         ),
                         "reaches_target_region": bool(
                             row["features"].get("reaches_target_region", False)
+                        ),
+                        "stays_in_current_region": bool(
+                            row["features"].get("stays_in_current_region", False)
+                        ),
+                        "high_block_loop_risk": bool(
+                            row["features"].get("high_block_loop_risk", False)
                         ),
                         "verify_action_candidate": bool(
                             row["features"].get("verify_action_candidate", False)
