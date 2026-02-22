@@ -203,6 +203,26 @@ class ActiveInferencePolicyEvaluatorV1:
         tx, ty = target
         return int(abs(int(sx) - int(tx)) + abs(int(sy) - int(ty)))
 
+    @classmethod
+    def _region_step_plausible(
+        cls,
+        source_region_key: str,
+        target_region_key: str,
+        *,
+        max_axis_step: int = 1,
+    ) -> bool:
+        source = cls._parse_region_key(source_region_key)
+        target = cls._parse_region_key(target_region_key)
+        if source is None or target is None:
+            return False
+        limit = int(max(0, max_axis_step))
+        sx, sy = source
+        tx, ty = target
+        return bool(
+            abs(int(sx) - int(tx)) <= limit
+            and abs(int(sy) - int(ty)) <= limit
+        )
+
     def _region_graph_adjacency(
         self,
         snapshot: dict[str, Any] | None,
@@ -224,6 +244,14 @@ class ActiveInferencePolicyEvaluatorV1:
                 continue
             count = int(max(0, row.get("count", 0)))
             if count <= 0:
+                continue
+            if not self._region_step_plausible(
+                str(source),
+                str(target),
+                max_axis_step=1,
+            ):
+                continue
+            if str(source) != str(target) and int(count) < 2:
                 continue
             source_hist = adjacency.setdefault(source, {})
             source_hist[target] = max(int(source_hist.get(target, 0)), int(count))
@@ -1021,9 +1049,11 @@ class ActiveInferencePolicyEvaluatorV1:
                 high_info_bonus = float(high_info_bonus + (0.45 * high_info_target_score))
             if high_info_interaction_chain_active and int(candidate.action_id) in (1, 2, 3, 4):
                 if bool(high_info_focus.get("moves_toward_target_region", False)):
-                    high_info_bonus = float(high_info_bonus + 0.12)
+                    high_info_bonus = float(high_info_bonus + 0.20)
                 if bool(high_info_focus.get("moves_away_target_region", False)):
-                    high_info_penalty = float(high_info_penalty + 0.16)
+                    high_info_penalty = float(
+                        high_info_penalty + 0.42 + (0.18 * high_info_target_score)
+                    )
         orientation_alignment = self._candidate_orientation_alignment_features(candidate)
         orientation_alignment_enabled = bool(
             int(candidate.action_id) in (1, 2, 3, 4)
@@ -2159,6 +2189,13 @@ class ActiveInferencePolicyEvaluatorV1:
             "current_region_key": str(raw.get("current_region_key", "NA")),
             "target_region_key": str(raw.get("target_region_key", "NA")),
             "predicted_region_key": str(raw.get("predicted_region_key", "NA")),
+            "predicted_region_visit_count": int(
+                max(0, raw.get("predicted_region_visit_count", 0))
+            ),
+            "predicted_edge_attempts": int(max(0, raw.get("predicted_edge_attempts", 0))),
+            "predicted_edge_blocked_rate": self._clamp01(
+                float(raw.get("predicted_edge_blocked_rate", 0.0))
+            ),
             "queue_length": int(max(0, raw.get("queue_length", 0))),
             "steps_remaining": int(max(0, raw.get("steps_remaining", 0))),
             "target_score": self._clamp01(float(raw.get("target_score", 0.0))),
@@ -2167,6 +2204,9 @@ class ActiveInferencePolicyEvaluatorV1:
             "distance_before": int(raw.get("distance_before", 10**6)),
             "distance_after": int(raw.get("distance_after", 10**6)),
             "distance_delta": int(raw.get("distance_delta", 0)),
+            "alternate_coupled_distance": int(
+                raw.get("alternate_coupled_distance", 10**6)
+            ),
             "moves_toward_target_region": bool(raw.get("moves_toward_target_region", False)),
             "moves_away_target_region": bool(raw.get("moves_away_target_region", False)),
             "reaches_target_region": bool(raw.get("reaches_target_region", False)),
@@ -4381,6 +4421,25 @@ class ActiveInferencePolicyEvaluatorV1:
                         )
                     ]
                     if not seek_pool:
+                        interaction_chain_locked = bool(
+                            any(
+                                bool(row["features"].get("interaction_chain_active", False))
+                                for row in high_info_rows
+                            )
+                        )
+                        safe_navigation_rows = [
+                            row
+                            for row in candidate_high_info_rows
+                            if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                        ]
+                        safe_rows_all_away = bool(safe_navigation_rows) and all(
+                            not bool(row["features"].get("moves_toward_target_region", False))
+                            and not bool(row["features"].get("reaches_target_region", False))
+                            for row in safe_navigation_rows
+                        )
+                        force_blocked_seek = bool(
+                            interaction_chain_locked and safe_rows_all_away
+                        )
                         blocked_seek_pool = [
                             row
                             for row in high_info_rows
@@ -4389,12 +4448,24 @@ class ActiveInferencePolicyEvaluatorV1:
                             and (
                                 bool(row["features"].get("moves_toward_target_region", False))
                                 or bool(row["features"].get("reaches_target_region", False))
+                                or (
+                                    force_blocked_seek
+                                    and not bool(
+                                        row["features"].get(
+                                            "moves_away_target_region",
+                                            False,
+                                        )
+                                    )
+                                )
                             )
                         ]
                         if (
                             blocked_seek_pool
-                            and int(stagnation_streak)
-                            >= int(max(12, self.stagnation_probe_trigger_steps))
+                            and (
+                                int(stagnation_streak)
+                                >= int(max(12, self.stagnation_probe_trigger_steps))
+                                or force_blocked_seek
+                            )
                         ):
                             blocked_seek_pool.sort(
                                 key=lambda row: (
@@ -4415,9 +4486,16 @@ class ActiveInferencePolicyEvaluatorV1:
                                 )
                             )
                             best_blocked_seek = blocked_seek_pool[0]
-                            if float(best_blocked_seek.get("blocked_soft_penalty", 1.0)) <= 0.85:
+                            soft_penalty_gate = float(
+                                best_blocked_seek.get("blocked_soft_penalty", 1.0)
+                            )
+                            if force_blocked_seek or soft_penalty_gate <= 0.90:
                                 seek_pool = [best_blocked_seek]
-                                high_info_focus_probe_reason = "blocked_seek_revalidation"
+                                high_info_focus_probe_reason = (
+                                    "blocked_seek_chain_override"
+                                    if force_blocked_seek
+                                    else "blocked_seek_revalidation"
+                                )
                     if seek_pool:
                         seek_pool.sort(
                             key=lambda row: (
@@ -4456,40 +4534,147 @@ class ActiveInferencePolicyEvaluatorV1:
                         ):
                             selected_entry = best_seek["entry"]
                             high_info_focus_probe_applied = True
-                            high_info_focus_probe_reason = (
-                                "seek_target_bfs_priority"
-                                if best_seek_bfs_match
-                                else "seek_target_priority"
-                            )
+                            if not str(high_info_focus_probe_reason).startswith(
+                                "blocked_seek_"
+                            ):
+                                high_info_focus_probe_reason = (
+                                    "seek_target_bfs_priority"
+                                    if best_seek_bfs_match
+                                    else "seek_target_priority"
+                                )
                 if not high_info_focus_probe_applied:
                     value_pool = [
                         row
                         for row in candidate_high_info_rows
                         if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
                         and float(row["features"].get("target_score", 0.0)) >= 0.32
+                        and not bool(row["features"].get("moves_away_target_region", False))
                     ]
+                    if not value_pool:
+                        value_pool = [
+                            row
+                            for row in candidate_high_info_rows
+                            if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                            and float(row["features"].get("target_score", 0.0)) >= 0.32
+                            and (
+                                bool(row["features"].get("moves_toward_target_region", False))
+                                or bool(row["features"].get("reaches_target_region", False))
+                            )
+                        ]
+                    if not value_pool:
+                        value_pool = [
+                            row
+                            for row in candidate_high_info_rows
+                            if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                            and float(row["features"].get("target_score", 0.0)) >= 0.32
+                            and not bool(row["features"].get("interaction_chain_active", False))
+                        ]
+                    if not value_pool:
+                        value_pool = [
+                            row
+                            for row in candidate_high_info_rows
+                            if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                            and float(row["features"].get("target_score", 0.0)) >= 0.32
+                        ]
+                    safe_value_pool = [
+                        row
+                        for row in value_pool
+                        if (
+                            not bool(row["features"].get("interaction_chain_active", False))
+                            or bool(row["features"].get("reaches_target_region", False))
+                            or bool(row["features"].get("moves_toward_target_region", False))
+                        )
+                    ]
+                    if safe_value_pool:
+                        value_pool = list(safe_value_pool)
                     if value_pool:
-                        value_pool.sort(
-                            key=lambda row: (
-                                0
-                                if (
-                                    str(high_info_bfs_next_region_key) != "NA"
-                                    and str(
-                                        row["features"].get("predicted_region_key", "NA")
+                        interaction_chain_detour = bool(
+                            any(
+                                bool(
+                                    row["features"].get(
+                                        "interaction_chain_active",
+                                        False,
                                     )
-                                    == str(high_info_bfs_next_region_key)
                                 )
-                                else 1,
-                                -int(row["features"].get("remaining_samples", 0)),
-                                -float(row["features"].get("target_score", 0.0)),
-                                -float(row["features"].get("bonus_hint", 0.0)),
-                                int(row["features"].get("distance_after", 10**6)),
-                                float(row["score"]),
-                                int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
-                                int(row["entry"].candidate.action_id),
-                                str(row["entry"].candidate.candidate_id),
+                                for row in value_pool
+                            )
+                            and all(
+                                not bool(
+                                    row["features"].get(
+                                        "moves_toward_target_region",
+                                        False,
+                                    )
+                                )
+                                and not bool(
+                                    row["features"].get(
+                                        "reaches_target_region",
+                                        False,
+                                    )
+                                )
+                                for row in value_pool
                             )
                         )
+                        if interaction_chain_detour:
+                            value_pool.sort(
+                                key=lambda row: (
+                                    int(
+                                        row["features"].get(
+                                            "alternate_coupled_distance",
+                                            10**6,
+                                        )
+                                    ),
+                                    int(
+                                        row["features"].get(
+                                            "predicted_region_visit_count",
+                                            10**6,
+                                        )
+                                    ),
+                                    int(
+                                        row["features"].get(
+                                            "predicted_edge_attempts",
+                                            10**6,
+                                        )
+                                    ),
+                                    float(
+                                        row["features"].get(
+                                            "predicted_edge_blocked_rate",
+                                            1.0,
+                                        )
+                                    ),
+                                    int(row["features"].get("distance_after", 10**6)),
+                                    float(row["score"]),
+                                    int(
+                                        action_count_map.get(
+                                            int(row["entry"].candidate.action_id),
+                                            0,
+                                        )
+                                    ),
+                                    int(row["entry"].candidate.action_id),
+                                    str(row["entry"].candidate.candidate_id),
+                                )
+                            )
+                        else:
+                            value_pool.sort(
+                                key=lambda row: (
+                                    0
+                                    if (
+                                        str(high_info_bfs_next_region_key) != "NA"
+                                        and str(
+                                            row["features"].get("predicted_region_key", "NA")
+                                        )
+                                        == str(high_info_bfs_next_region_key)
+                                    )
+                                    else 1,
+                                    -int(row["features"].get("remaining_samples", 0)),
+                                    -float(row["features"].get("target_score", 0.0)),
+                                    -float(row["features"].get("bonus_hint", 0.0)),
+                                    int(row["features"].get("distance_after", 10**6)),
+                                    float(row["score"]),
+                                    int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                                    int(row["entry"].candidate.action_id),
+                                    str(row["entry"].candidate.candidate_id),
+                                )
+                            )
                         best_value = value_pool[0]
                         best_value_bfs_match = bool(
                             str(high_info_bfs_next_region_key) != "NA"
@@ -4505,11 +4690,14 @@ class ActiveInferencePolicyEvaluatorV1:
                         ):
                             selected_entry = best_value["entry"]
                             high_info_focus_probe_applied = True
-                            high_info_focus_probe_reason = (
-                                "high_value_bfs_priority"
-                                if best_value_bfs_match
-                                else "high_value_region_priority"
-                            )
+                            if interaction_chain_detour:
+                                high_info_focus_probe_reason = "high_value_detour_priority"
+                            else:
+                                high_info_focus_probe_reason = (
+                                    "high_value_bfs_priority"
+                                    if best_value_bfs_match
+                                    else "high_value_region_priority"
+                                )
                 if high_info_focus_probe_applied:
                     least_tried_probe_applied = True
                     if selected_entry is not entries[0]:
@@ -4541,6 +4729,18 @@ class ActiveInferencePolicyEvaluatorV1:
                         ),
                         "distance_before": int(row["features"].get("distance_before", 10**6)),
                         "distance_after": int(row["features"].get("distance_after", 10**6)),
+                        "predicted_region_visit_count": int(
+                            row["features"].get("predicted_region_visit_count", 0)
+                        ),
+                        "predicted_edge_attempts": int(
+                            row["features"].get("predicted_edge_attempts", 0)
+                        ),
+                        "predicted_edge_blocked_rate": float(
+                            row["features"].get("predicted_edge_blocked_rate", 0.0)
+                        ),
+                        "alternate_coupled_distance": int(
+                            row["features"].get("alternate_coupled_distance", 10**6)
+                        ),
                         "target_score": float(row["features"].get("target_score", 0.0)),
                         "target_sample_count": int(
                             row["features"].get("target_sample_count", 0)

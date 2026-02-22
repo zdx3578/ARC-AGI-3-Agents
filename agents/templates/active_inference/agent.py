@@ -447,6 +447,7 @@ class ActiveInferenceEFE(Agent):
         self._navigation_attempt_count = 0
         self._navigation_blocked_count = 0
         self._navigation_moved_count = 0
+        self._navigation_implausible_transition_count = 0
         self._navigation_match_count = 0
         self._navigation_semantic_compare_count = 0
         self._navigation_semantic_mismatch_count = 0
@@ -1684,6 +1685,12 @@ class ActiveInferenceEFE(Agent):
                 target_key = str(target_region_key)
                 if self._parse_region_key_v1(target_key) is None:
                     continue
+                if not self._region_step_plausible_v1(
+                    str(source_region_key),
+                    str(target_key),
+                    max_axis_step=1,
+                ):
+                    continue
                 count = int(max(0, count_raw))
                 if count <= 0:
                     continue
@@ -1930,6 +1937,25 @@ class ActiveInferenceEFE(Agent):
         tx, ty = target
         return int(abs(int(sx) - int(tx)) + abs(int(sy) - int(ty)))
 
+    @classmethod
+    def _region_step_plausible_v1(
+        cls,
+        source_region_key: str,
+        target_region_key: str,
+        *,
+        max_axis_step: int = 1,
+    ) -> bool:
+        source = cls._parse_region_key_v1(source_region_key)
+        target = cls._parse_region_key_v1(target_region_key)
+        if source is None or target is None:
+            return False
+        limit = int(max(0, max_axis_step))
+        sx, sy = source
+        tx, ty = target
+        dx = abs(int(sx) - int(tx))
+        dy = abs(int(sy) - int(ty))
+        return bool(dx <= limit and dy <= limit)
+
     def _current_region_key_v1(self) -> str:
         latest = (
             self._latest_navigation_state_estimate
@@ -1941,7 +1967,26 @@ class ActiveInferenceEFE(Agent):
             rx = int(region.get("x", -1))
             ry = int(region.get("y", -1))
             if rx >= 0 and ry >= 0:
-                return f"{rx}:{ry}"
+                latest_key = f"{int(rx)}:{int(ry)}"
+                if self._last_known_agent_pos_region is not None:
+                    last_rx, last_ry = self._last_known_agent_pos_region
+                    last_key = f"{int(last_rx)}:{int(last_ry)}"
+                    if not self._region_step_plausible_v1(
+                        str(last_key),
+                        str(latest_key),
+                        max_axis_step=1,
+                    ):
+                        if self._latest_observed_agent_pos_region is not None:
+                            orx, ory = self._latest_observed_agent_pos_region
+                            observed_key = f"{int(orx)}:{int(ory)}"
+                            if self._region_step_plausible_v1(
+                                str(last_key),
+                                str(observed_key),
+                                max_axis_step=1,
+                            ):
+                                return str(observed_key)
+                        return str(last_key)
+                return str(latest_key)
         if self._latest_observed_agent_pos_region is not None:
             rx, ry = self._latest_observed_agent_pos_region
             return f"{int(rx)}:{int(ry)}"
@@ -2561,10 +2606,25 @@ class ActiveInferenceEFE(Agent):
         current_region_key = self._current_region_key_v1()
         target_region_key = str(state.get("current_target_region_key", "NA"))
         predicted_region_key = str(current_region_key)
+        predicted_region_visit_count = 0
+        predicted_edge_attempts = 0
+        predicted_edge_blocked_rate = 0.0
         if isinstance(predicted_region_features, dict):
             key = str(predicted_region_features.get("predicted_region_key", "NA"))
             if self._parse_region_key_v1(key) is not None:
                 predicted_region_key = str(key)
+            predicted_region_visit_count = int(
+                max(0, predicted_region_features.get("predicted_region_visit_count", 0))
+            )
+            predicted_edge_attempts = int(
+                max(0, predicted_region_features.get("edge_attempts", 0))
+            )
+            predicted_edge_blocked_rate = float(
+                max(
+                    0.0,
+                    min(1.0, predicted_region_features.get("edge_blocked_rate", 0.0)),
+                )
+            )
         distance_before = int(self._region_distance_v1(current_region_key, target_region_key))
         distance_after = int(self._region_distance_v1(predicted_region_key, target_region_key))
         distance_delta = int(distance_after - distance_before)
@@ -2603,6 +2663,19 @@ class ActiveInferenceEFE(Agent):
         if not isinstance(coupled_regions, list):
             coupled_regions = []
         coupled_region_set = {str(v) for v in coupled_regions}
+        alternate_coupled_distance = 10**6
+        if self._parse_region_key_v1(predicted_region_key) is not None:
+            for region_key in coupled_region_set:
+                if str(region_key) == str(target_region_key):
+                    continue
+                candidate_distance = int(
+                    self._region_distance_v1(
+                        str(predicted_region_key),
+                        str(region_key),
+                    )
+                )
+                if candidate_distance < alternate_coupled_distance:
+                    alternate_coupled_distance = int(candidate_distance)
         target_sample_count = int(max(0, sample_counts.get(target_region_key, 0)))
         required_samples = int(
             max(
@@ -2618,6 +2691,7 @@ class ActiveInferenceEFE(Agent):
         )
         bonus_hint = 0.0
         penalty_hint = 0.0
+        interaction_chain_active = bool(state.get("interaction_chain_active", False))
         if bool(state.get("active", False)):
             if verify_action_candidate:
                 bonus_hint += 1.0
@@ -2627,13 +2701,34 @@ class ActiveInferenceEFE(Agent):
                 elif moves_toward_target:
                     bonus_hint += 0.45
                 if moves_away_target:
-                    penalty_hint += 0.45
+                    penalty_hint += 0.55
             elif str(state.get("stage", "idle")) == "verify":
                 penalty_hint += 0.20
+            sample_bonus = 0.0
+            coupled_sample_bonus = 0.0
             if remaining_samples > 0:
-                bonus_hint += float(min(0.45, 0.15 * float(remaining_samples)))
+                sample_bonus = float(min(0.45, 0.15 * float(remaining_samples)))
                 if str(target_region_key) in coupled_region_set:
-                    bonus_hint += float(min(0.48, 0.18 * float(remaining_samples)))
+                    coupled_sample_bonus = float(min(0.48, 0.18 * float(remaining_samples)))
+            if action_id in (1, 2, 3, 4):
+                if reaches_target or moves_toward_target:
+                    bonus_hint += float(sample_bonus + coupled_sample_bonus)
+                    if interaction_chain_active:
+                        bonus_hint += 0.12
+                elif moves_away_target:
+                    penalty_hint += float(
+                        min(0.42, 0.14 * float(max(0, remaining_samples)))
+                    )
+                    if str(target_region_key) in coupled_region_set:
+                        penalty_hint += float(
+                            min(0.16, 0.06 * float(max(0, remaining_samples)))
+                        )
+                    if interaction_chain_active:
+                        penalty_hint += 0.36
+                else:
+                    bonus_hint += float(0.10 * sample_bonus)
+            elif verify_action_candidate:
+                bonus_hint += float(0.18 * sample_bonus)
         urgency = float(
             min(
                 1.0,
@@ -2647,13 +2742,12 @@ class ActiveInferenceEFE(Agent):
                 ),
             )
         )
-        interaction_chain_active = bool(state.get("interaction_chain_active", False))
         if interaction_chain_active and bool(state.get("active", False)):
             if action_id in (1, 2, 3, 4):
                 if reaches_target or moves_toward_target:
-                    bonus_hint += 0.14
+                    bonus_hint += 0.18
                 if moves_away_target:
-                    penalty_hint += 0.18
+                    penalty_hint += 0.38
         bonus_hint = float((0.75 + (0.25 * urgency)) * bonus_hint)
         return {
             "schema_name": "active_inference_high_info_focus_features_v1",
@@ -2664,6 +2758,9 @@ class ActiveInferenceEFE(Agent):
             "current_region_key": str(current_region_key),
             "target_region_key": str(target_region_key),
             "predicted_region_key": str(predicted_region_key),
+            "predicted_region_visit_count": int(predicted_region_visit_count),
+            "predicted_edge_attempts": int(predicted_edge_attempts),
+            "predicted_edge_blocked_rate": float(predicted_edge_blocked_rate),
             "queue_length": int(len(state.get("target_region_queue", []))),
             "steps_remaining": int(max(0, state.get("steps_remaining", 0))),
             "target_score": float(target_score),
@@ -2673,6 +2770,7 @@ class ActiveInferenceEFE(Agent):
             "distance_before": int(distance_before),
             "distance_after": int(distance_after),
             "distance_delta": int(distance_delta),
+            "alternate_coupled_distance": int(alternate_coupled_distance),
             "moves_toward_target_region": bool(moves_toward_target),
             "moves_away_target_region": bool(moves_away_target),
             "reaches_target_region": bool(reaches_target),
@@ -3169,7 +3267,21 @@ class ActiveInferenceEFE(Agent):
                 if previous_trigger_counter >= 0
                 else 10**6
             )
+            high_conf_retrigger = bool(
+                level_delta_now > 0
+                or obs_change_type == "METADATA_PROGRESS_CHANGE"
+                or trigger_score >= max(
+                    0.75,
+                    float(self.high_info_focus_min_trigger_score) + 0.20,
+                )
+            )
             if (
+                retrigger_cooldown > 0
+                and steps_since_trigger < retrigger_cooldown
+                and (not high_conf_retrigger)
+            ):
+                should_trigger = False
+            elif (
                 retrigger_cooldown > 0
                 and str(previous_source_region_key) == str(source_region_key)
                 and steps_since_trigger < retrigger_cooldown
@@ -3405,6 +3517,15 @@ class ActiveInferenceEFE(Agent):
             preferred = [key for key in normalized if str(key) != str(source_key)]
             if preferred:
                 normalized = list(preferred)
+            if coupled_progress_locked:
+                coupled_only = [key for key in normalized if key in coupled_region_keys]
+                if len(coupled_only) >= 2:
+                    normalized = [str(coupled_only[0]), str(coupled_only[1])]
+                elif len(coupled_only) == 1:
+                    spillover = [key for key in normalized if key not in coupled_only]
+                    normalized = [str(coupled_only[0])]
+                    if spillover:
+                        normalized.append(str(spillover[0]))
             max_region_count = int(max(2, min(5, max(2, self.high_info_focus_max_targets))))
             normalized = normalized[:max_region_count]
             if not normalized:
@@ -4757,8 +4878,21 @@ class ActiveInferenceEFE(Agent):
             latest_rx = int(latest_region.get("x", -1))
             latest_ry = int(latest_region.get("y", -1))
             if latest_rx >= 0 and latest_ry >= 0:
-                current_region = (int(latest_rx), int(latest_ry))
-                payload["current_region_source"] = "latest_navigation_state"
+                latest_key = f"{int(latest_rx)}:{int(latest_ry)}"
+                plausible_latest = True
+                if self._last_known_agent_pos_region is not None:
+                    last_rx, last_ry = self._last_known_agent_pos_region
+                    last_key = f"{int(last_rx)}:{int(last_ry)}"
+                    plausible_latest = bool(
+                        self._region_step_plausible_v1(
+                            str(last_key),
+                            str(latest_key),
+                            max_axis_step=1,
+                        )
+                    )
+                if plausible_latest:
+                    current_region = (int(latest_rx), int(latest_ry))
+                    payload["current_region_source"] = "latest_navigation_state"
         if current_region is None and self._last_known_agent_pos_region is not None:
             current_region = (
                 int(self._last_known_agent_pos_region[0]),
@@ -4814,18 +4948,28 @@ class ActiveInferenceEFE(Agent):
             {},
         )
         if isinstance(empirical_transition_counts, dict):
-            empirical_total = int(
-                sum(
-                    int(max(0, count))
-                    for count in empirical_transition_counts.values()
-                )
-            )
+            plausible_empirical_counts: dict[str, int] = {}
+            for candidate_region_key, candidate_count_raw in empirical_transition_counts.items():
+                candidate_key = str(candidate_region_key)
+                if self._parse_region_key_v1(candidate_key) is None:
+                    continue
+                if not self._region_step_plausible_v1(
+                    str(current_region_key),
+                    str(candidate_key),
+                    max_axis_step=1,
+                ):
+                    continue
+                candidate_count = int(max(0, candidate_count_raw))
+                if candidate_count <= 0:
+                    continue
+                plausible_empirical_counts[candidate_key] = int(candidate_count)
+            empirical_total = int(sum(plausible_empirical_counts.values()))
             payload["empirical_transition_total"] = int(empirical_total)
             if empirical_total > 0:
                 empirical_target_key, empirical_target_count = max(
                     (
                         (str(region_key), int(max(0, count)))
-                        for (region_key, count) in empirical_transition_counts.items()
+                        for (region_key, count) in plausible_empirical_counts.items()
                     ),
                     key=lambda item: item[1],
                 )
@@ -4850,7 +4994,7 @@ class ActiveInferenceEFE(Agent):
                 frontier_key = "NA"
                 frontier_count = 0
                 frontier_visit = 10**9
-                for (candidate_region_key, candidate_count_raw) in empirical_transition_counts.items():
+                for (candidate_region_key, candidate_count_raw) in plausible_empirical_counts.items():
                     candidate_count = int(max(0, candidate_count_raw))
                     if candidate_count <= 0:
                         continue
@@ -5111,19 +5255,33 @@ class ActiveInferenceEFE(Agent):
                     rx = int(region.get("x", -1))
                     ry = int(region.get("y", -1))
                     if rx >= 0 and ry >= 0:
-                        self._last_known_agent_pos_region = (rx, ry)
                         target_region_key = f"{rx}:{ry}"
-                        self._region_visit_counts[target_region_key] = int(
-                            self._region_visit_counts.get(target_region_key, 0) + 1
-                        )
-                        if source_region_key != "NA":
-                            region_action_key = f"{source_region_key}|a{action_id}"
-                            target_histogram = self._region_action_transition_counts.setdefault(
-                                region_action_key,
-                                {},
+                        plausible_transition = True
+                        if self._parse_region_key_v1(str(source_region_key)) is not None:
+                            plausible_transition = bool(
+                                self._region_step_plausible_v1(
+                                    str(source_region_key),
+                                    str(target_region_key),
+                                    max_axis_step=1,
+                                )
                             )
-                            target_histogram[target_region_key] = int(
-                                target_histogram.get(target_region_key, 0) + 1
+                        if plausible_transition:
+                            self._last_known_agent_pos_region = (rx, ry)
+                            self._region_visit_counts[target_region_key] = int(
+                                self._region_visit_counts.get(target_region_key, 0) + 1
+                            )
+                            if source_region_key != "NA":
+                                region_action_key = f"{source_region_key}|a{action_id}"
+                                target_histogram = self._region_action_transition_counts.setdefault(
+                                    region_action_key,
+                                    {},
+                                )
+                                target_histogram[target_region_key] = int(
+                                    target_histogram.get(target_region_key, 0) + 1
+                                )
+                        else:
+                            self._navigation_implausible_transition_count = int(
+                                self._navigation_implausible_transition_count + 1
                             )
             else:
                 self._navigation_blocked_count += 1
@@ -5254,6 +5412,9 @@ class ActiveInferenceEFE(Agent):
             "navigation_attempt_count": nav_attempts,
             "navigation_moved_count": nav_moved,
             "navigation_blocked_count": nav_blocked,
+            "navigation_implausible_transition_count": int(
+                self._navigation_implausible_transition_count
+            ),
             "navigation_blocked_rate": float(nav_blocked / float(max(1, nav_attempts))),
             "navigation_ui_reject_count": int(nav_ui_reject),
             "navigation_ui_reject_rate": float(nav_ui_reject / float(max(1, nav_attempts))),
