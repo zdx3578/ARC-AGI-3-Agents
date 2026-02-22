@@ -337,7 +337,15 @@ class ActiveInferencePolicyEvaluatorV1:
         packet: ObservationPacketV1,
         entries: list[FreeEnergyLedgerEntryV1],
         action_count_map: dict[int, int],
+        global_action_counter: int | None = None,
     ) -> tuple[FreeEnergyLedgerEntryV1 | None, dict[str, Any]]:
+        traversal_step_counter = int(
+            global_action_counter
+            if global_action_counter is not None
+            else int(packet.action_counter)
+        )
+        if traversal_step_counter < 0:
+            traversal_step_counter = int(packet.action_counter)
         diagnostics: dict[str, Any] = {
             "enabled": False,
             "mode": "inactive",
@@ -354,11 +362,13 @@ class ActiveInferencePolicyEvaluatorV1:
             "cross_visit_target": int(max(1, self.coverage_sweep_min_region_visits)),
             "prepass_complete": False,
             "candidate_pool_size": 0,
+            "packet_action_counter": int(packet.action_counter),
+            "global_action_counter": int(traversal_step_counter),
         }
         if int(packet.levels_completed) > 0:
             diagnostics["mode"] = "levels_progressed"
             return None, diagnostics
-        if int(packet.action_counter) >= int(self.coverage_prepass_steps):
+        if int(traversal_step_counter) >= int(self.coverage_prepass_steps):
             diagnostics["mode"] = "prepass_window_exhausted"
             return None, diagnostics
 
@@ -406,9 +416,7 @@ class ActiveInferencePolicyEvaluatorV1:
         )
         diagnostics["blocked_hard_skip_count"] = int(blocked_hard_skip_count)
         diagnostics["blocked_hard_skip_applied"] = False
-        scripted_action_id = self._two_pass_serpentine_action_id(
-            int(packet.action_counter)
-        )
+        scripted_action_id = self._two_pass_serpentine_action_id(int(traversal_step_counter))
         if scripted_action_id is not None:
             scripted_direction = self._navigation_action_direction(int(scripted_action_id))
 
@@ -997,6 +1005,9 @@ class ActiveInferencePolicyEvaluatorV1:
         high_info_verify_action_candidate = bool(
             high_info_focus.get("verify_action_candidate", False)
         )
+        high_info_interaction_chain_active = bool(
+            high_info_focus.get("interaction_chain_active", False)
+        )
         high_info_bonus = 0.0
         high_info_penalty = 0.0
         if high_info_focus_enabled and high_info_focus_active:
@@ -1008,6 +1019,11 @@ class ActiveInferencePolicyEvaluatorV1:
             )
             if high_info_verify_action_candidate:
                 high_info_bonus = float(high_info_bonus + (0.45 * high_info_target_score))
+            if high_info_interaction_chain_active and int(candidate.action_id) in (1, 2, 3, 4):
+                if bool(high_info_focus.get("moves_toward_target_region", False)):
+                    high_info_bonus = float(high_info_bonus + 0.12)
+                if bool(high_info_focus.get("moves_away_target_region", False)):
+                    high_info_penalty = float(high_info_penalty + 0.16)
         orientation_alignment = self._candidate_orientation_alignment_features(candidate)
         orientation_alignment_enabled = bool(
             int(candidate.action_id) in (1, 2, 3, 4)
@@ -2155,6 +2171,7 @@ class ActiveInferencePolicyEvaluatorV1:
             "moves_away_target_region": bool(raw.get("moves_away_target_region", False)),
             "reaches_target_region": bool(raw.get("reaches_target_region", False)),
             "verify_action_candidate": bool(raw.get("verify_action_candidate", False)),
+            "interaction_chain_active": bool(raw.get("interaction_chain_active", False)),
             "verify_action_ids": [
                 int(v)
                 for v in verify_action_ids
@@ -3001,6 +3018,9 @@ class ActiveInferencePolicyEvaluatorV1:
             )
 
         action_count_map = action_select_count or {}
+        global_action_counter = int(
+            sum(int(max(0, value)) for value in action_count_map.values())
+        )
         candidate_count_map = candidate_select_count or {}
         cluster_count_map = cluster_select_count or {}
         subcluster_count_map = subcluster_select_count or {}
@@ -3130,8 +3150,11 @@ class ActiveInferencePolicyEvaluatorV1:
                 break
         high_info_after_first_pass_gate_open = bool(
             self.high_info_focus_release_after_first_pass
-            and high_info_focus_priority_available
-            and int(packet.action_counter) >= int(high_info_release_action_counter)
+            and (
+                high_info_focus_active_present
+                or high_info_focus_priority_available
+            )
+            and int(global_action_counter) >= int(high_info_release_action_counter)
         )
         fixed_two_pass_suppressed_by_high_info = False
         sequence_causal_probe_applied = False
@@ -3143,6 +3166,7 @@ class ActiveInferencePolicyEvaluatorV1:
                 packet=packet,
                 entries=entries,
                 action_count_map=action_count_map,
+                global_action_counter=int(global_action_counter),
             )
         )
         if fixed_prepass_entry is not None and not high_info_after_first_pass_gate_open:
@@ -3419,14 +3443,14 @@ class ActiveInferencePolicyEvaluatorV1:
                 )
                 coverage_hard_prepass_active = bool(
                     coverage_goal_unmet
-                    and int(packet.action_counter) < int(self.coverage_prepass_steps)
+                    and int(global_action_counter) < int(self.coverage_prepass_steps)
                 )
                 periodic_window_active = False
                 if (
                     int(self.coverage_resweep_interval) > 0
                     and int(self.coverage_resweep_span) > 0
                 ):
-                    periodic_slot = int(packet.action_counter) % int(
+                    periodic_slot = int(global_action_counter) % int(
                         self.coverage_resweep_interval
                     )
                     periodic_window_active = bool(
@@ -4290,6 +4314,36 @@ class ActiveInferencePolicyEvaluatorV1:
                 candidate_high_info_rows = (
                     safe_high_info_rows if safe_high_info_rows else high_info_rows
                 )
+                high_info_bfs_next_region_key = "NA"
+                if candidate_high_info_rows:
+                    sample_features = candidate_high_info_rows[0]["features"]
+                    hi_current_region_key = str(
+                        sample_features.get("current_region_key", "NA")
+                    )
+                    hi_target_region_key = str(
+                        sample_features.get("target_region_key", "NA")
+                    )
+                    if (
+                        self._parse_region_key(hi_current_region_key) is not None
+                        and self._parse_region_key(hi_target_region_key) is not None
+                        and str(hi_current_region_key) != str(hi_target_region_key)
+                    ):
+                        sample_entry = candidate_high_info_rows[0]["entry"]
+                        region_graph_snapshot = sample_entry.candidate.metadata.get(
+                            "region_graph_snapshot_v1",
+                            {},
+                        )
+                        if not isinstance(region_graph_snapshot, dict):
+                            region_graph_snapshot = {}
+                        adjacency = self._region_graph_adjacency(region_graph_snapshot)
+                        if adjacency:
+                            high_info_bfs_next_region_key = str(
+                                self._bfs_next_region_key(
+                                    adjacency=adjacency,
+                                    start_region_key=str(hi_current_region_key),
+                                    goal_region_key=str(hi_target_region_key),
+                                )
+                            )
                 if len(candidate_high_info_rows) < len(high_info_rows):
                     high_info_focus_probe_reason = "active_blocked_edge_auto_skip"
                 best_high_info_score = min(
@@ -4329,6 +4383,15 @@ class ActiveInferencePolicyEvaluatorV1:
                     if seek_pool:
                         seek_pool.sort(
                             key=lambda row: (
+                                0
+                                if (
+                                    str(high_info_bfs_next_region_key) != "NA"
+                                    and str(
+                                        row["features"].get("predicted_region_key", "NA")
+                                    )
+                                    == str(high_info_bfs_next_region_key)
+                                )
+                                else 1,
                                 0 if bool(row["features"].get("reaches_target_region", False)) else 1,
                                 -int(row["features"].get("remaining_samples", 0)),
                                 int(row["features"].get("distance_after", 10**6)),
@@ -4341,13 +4404,25 @@ class ActiveInferencePolicyEvaluatorV1:
                             )
                         )
                         best_seek = seek_pool[0]
+                        best_seek_bfs_match = bool(
+                            str(high_info_bfs_next_region_key) != "NA"
+                            and str(best_seek["features"].get("predicted_region_key", "NA"))
+                            == str(high_info_bfs_next_region_key)
+                        )
                         seek_margin = float(max(self.sequence_probe_score_margin, 0.40))
-                        if bool(best_seek["features"].get("reaches_target_region", False)) or float(
-                            best_seek["score"]
-                        ) <= (best_high_info_score + seek_margin):
+                        if (
+                            bool(best_seek["features"].get("reaches_target_region", False))
+                            or best_seek_bfs_match
+                            or float(best_seek["score"])
+                            <= (best_high_info_score + seek_margin)
+                        ):
                             selected_entry = best_seek["entry"]
                             high_info_focus_probe_applied = True
-                            high_info_focus_probe_reason = "seek_target_priority"
+                            high_info_focus_probe_reason = (
+                                "seek_target_bfs_priority"
+                                if best_seek_bfs_match
+                                else "seek_target_priority"
+                            )
                 if not high_info_focus_probe_applied:
                     value_pool = [
                         row
@@ -4358,6 +4433,15 @@ class ActiveInferencePolicyEvaluatorV1:
                     if value_pool:
                         value_pool.sort(
                             key=lambda row: (
+                                0
+                                if (
+                                    str(high_info_bfs_next_region_key) != "NA"
+                                    and str(
+                                        row["features"].get("predicted_region_key", "NA")
+                                    )
+                                    == str(high_info_bfs_next_region_key)
+                                )
+                                else 1,
                                 -int(row["features"].get("remaining_samples", 0)),
                                 -float(row["features"].get("target_score", 0.0)),
                                 -float(row["features"].get("bonus_hint", 0.0)),
@@ -4369,14 +4453,25 @@ class ActiveInferencePolicyEvaluatorV1:
                             )
                         )
                         best_value = value_pool[0]
+                        best_value_bfs_match = bool(
+                            str(high_info_bfs_next_region_key) != "NA"
+                            and str(best_value["features"].get("predicted_region_key", "NA"))
+                            == str(high_info_bfs_next_region_key)
+                        )
                         value_margin = float(max(0.22, 0.75 * self.sequence_probe_score_margin))
                         if (
+                            best_value_bfs_match
+                            or
                             float(best_value["features"].get("target_score", 0.0)) >= 0.70
                             or float(best_value["score"]) <= (best_high_info_score + value_margin)
                         ):
                             selected_entry = best_value["entry"]
                             high_info_focus_probe_applied = True
-                            high_info_focus_probe_reason = "high_value_region_priority"
+                            high_info_focus_probe_reason = (
+                                "high_value_bfs_priority"
+                                if best_value_bfs_match
+                                else "high_value_region_priority"
+                            )
                 if high_info_focus_probe_applied:
                     least_tried_probe_applied = True
                     if selected_entry is not entries[0]:
@@ -4399,6 +4494,12 @@ class ActiveInferencePolicyEvaluatorV1:
                         ),
                         "predicted_region_key": str(
                             row["features"].get("predicted_region_key", "NA")
+                        ),
+                        "bfs_next_region_key": str(high_info_bfs_next_region_key),
+                        "bfs_next_match": bool(
+                            str(high_info_bfs_next_region_key) != "NA"
+                            and str(row["features"].get("predicted_region_key", "NA"))
+                            == str(high_info_bfs_next_region_key)
                         ),
                         "distance_before": int(row["features"].get("distance_before", 10**6)),
                         "distance_after": int(row["features"].get("distance_after", 10**6)),

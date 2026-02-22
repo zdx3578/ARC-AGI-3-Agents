@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import traceback
 import uuid
 from typing import Any
 
@@ -294,6 +295,10 @@ class ActiveInferenceEFE(Agent):
                 _env_float("ACTIVE_INFERENCE_HIGH_INFO_COUPLED_SCORE_FLOOR", 0.76),
             ),
         )
+        self.high_info_retrigger_cooldown_steps = max(
+            0,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_RETRIGGER_COOLDOWN_STEPS", 10),
+        )
         self.orientation_alignment_min_similarity = max(
             0.35,
             min(0.95, _env_float("ACTIVE_INFERENCE_ORIENTATION_MIN_SIMILARITY", 0.68)),
@@ -540,6 +545,11 @@ class ActiveInferenceEFE(Agent):
             "cross_region_key": "NA",
             "gate_region_key": "NA",
             "verify_action_ids": [],
+            "interaction_chain_active": False,
+            "interaction_chain_generation": 0,
+            "interaction_target_chain": [],
+            "interaction_target_index": 0,
+            "interaction_last_status": "idle",
             "last_status": "idle",
         }
 
@@ -1607,6 +1617,13 @@ class ActiveInferenceEFE(Agent):
                 if self._parse_region_key_v1(region_key) is None:
                     continue
                 hint = float(max(0.0, row.get("target_priority", row.get("salience", 0.0))))
+                target_kind = str(row.get("kind", ""))
+                kind_bonus = 0.0
+                if target_kind == "cross_like":
+                    kind_bonus = 0.22
+                elif target_kind == "salient":
+                    kind_bonus = 0.08
+                hint = float(min(1.0, hint + kind_bonus))
                 nav_region_hints[str(region_key)] = max(
                     float(nav_region_hints.get(str(region_key), 0.0)),
                     float(min(1.0, hint)),
@@ -1694,17 +1711,19 @@ class ActiveInferenceEFE(Agent):
             novelty = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 12.0)))
             nav_hint = float(max(0.0, min(1.0, nav_region_hints.get(str(region_key), 0.0))))
             support = float(1.0 - math.exp(-float(max(0, attempts)) / 4.0))
+            support_prior = float(min(0.90, 0.35 + (0.45 * nav_hint)))
             base = float(
-                (0.52 * info_score)
-                + (0.18 * coupling_score)
-                + (0.11 * cc_rate)
-                + (0.08 * strong_rate)
+                (0.46 * info_score)
+                + (0.16 * coupling_score)
+                + (0.10 * cc_rate)
+                + (0.07 * strong_rate)
                 + (0.07 * progress_rate)
-                + (0.04 * nav_hint)
+                + (0.14 * nav_hint)
             )
             base = float(base * (1.0 - (0.85 * ui_suppression)))
             base = float(base + (0.08 * novelty))
-            base = float((0.30 + (0.70 * support)) * base)
+            base = float(max(base, (0.18 * nav_hint * novelty)))
+            base = float(max(support_prior, (0.30 + (0.70 * support))) * base)
             if str(region_key) == str(fallback_key):
                 base = float(base + 0.05)
             return float(max(0.0, min(1.0, base)))
@@ -1732,11 +1751,16 @@ class ActiveInferenceEFE(Agent):
         secondary_region_score = 0.0
         pair_affinity_score = 0.0
         if self._parse_region_key_v1(primary_region_key) is not None:
-            secondary_candidates: list[tuple[float, int, int, str, float]] = []
+            secondary_candidates: list[tuple[float, int, int, str, float, int]] = []
             for region_key in candidate_region_keys:
                 key = str(region_key)
                 if self._parse_region_key_v1(key) is None or key == str(primary_region_key):
                     continue
+                row = row_by_region.get(key, {})
+                cc_rate = float(max(0.0, row.get("cc_count_change_rate", 0.0)))
+                strong_rate = float(max(0.0, row.get("strong_change_rate", 0.0)))
+                progress_rate = float(max(0.0, row.get("progress_rate", 0.0)))
+                structural_signal = float(max(cc_rate, strong_rate, progress_rate))
                 forward = float(
                     transition_pair_counts.get((str(primary_region_key), key), 0)
                 ) / float(max(1, transition_source_totals.get(str(primary_region_key), 0)))
@@ -1749,14 +1773,33 @@ class ActiveInferenceEFE(Agent):
                     max(0.0, 1.0 - min(1.0, float(max(0, distance - 1)) / 6.0))
                 )
                 base = float(_region_base_score(key))
+                attempts = int(max(0, row.get("attempts", 0)))
+                locality_penalty = 0.0
+                if distance <= 1 and structural_signal < 0.35:
+                    locality_penalty = float(
+                        min(
+                            0.30,
+                            (1.0 - structural_signal)
+                            * (0.10 + (0.03 * float(min(10, attempts)))),
+                        )
+                    )
+                stale_penalty = 0.0
+                if attempts >= 6 and progress_rate <= 0.0 and structural_signal < 0.20:
+                    stale_penalty = float(min(0.22, 0.04 * float(attempts - 5)))
+                far_structural_bonus = 0.0
+                if distance >= 2 and structural_signal >= 0.60:
+                    far_structural_bonus = 0.08
                 score = float(
-                    (0.62 * base)
-                    + (0.26 * pair_affinity)
+                    (0.50 * base)
+                    + (0.20 * pair_affinity)
                     + (0.08 * distance_term)
-                    + (0.04 * float(max(0.0, nav_region_hints.get(key, 0.0))))
+                    + (0.16 * structural_signal)
+                    + (0.08 * float(max(0.0, nav_region_hints.get(key, 0.0))))
+                    + float(far_structural_bonus)
+                    - float(locality_penalty)
+                    - float(stale_penalty)
                 )
                 visit_count = int(max(0, self._region_visit_counts.get(key, 0)))
-                attempts = int(max(0, row_by_region.get(key, {}).get("attempts", 0)))
                 secondary_candidates.append(
                     (
                         float(score),
@@ -1764,15 +1807,31 @@ class ActiveInferenceEFE(Agent):
                         int(visit_count),
                         str(key),
                         float(pair_affinity),
+                        int(distance),
                     )
                 )
             secondary_candidates.sort(
                 key=lambda item: (-float(item[0]), int(item[1]), int(item[2]), str(item[3]))
             )
-            if secondary_candidates and float(secondary_candidates[0][0]) >= 0.10:
-                secondary_region_key = str(secondary_candidates[0][3])
-                secondary_region_score = float(secondary_candidates[0][0])
-                pair_affinity_score = float(secondary_candidates[0][4])
+            if secondary_candidates and float(secondary_candidates[0][0]) >= 0.08:
+                chosen_secondary = secondary_candidates[0]
+                chosen_distance = int(chosen_secondary[5])
+                if chosen_distance <= 1:
+                    near_score = float(chosen_secondary[0])
+                    far_alternative = next(
+                        (
+                            row
+                            for row in secondary_candidates
+                            if int(row[5]) >= 2
+                            and float(row[0]) >= float(near_score - 0.08)
+                        ),
+                        None,
+                    )
+                    if far_alternative is not None:
+                        chosen_secondary = far_alternative
+                secondary_region_key = str(chosen_secondary[3])
+                secondary_region_score = float(chosen_secondary[0])
+                pair_affinity_score = float(chosen_secondary[4])
             elif fallback_key != "NA" and str(fallback_key) != str(primary_region_key):
                 secondary_region_key = str(fallback_key)
                 secondary_region_score = float(_region_base_score(secondary_region_key))
@@ -1997,6 +2056,9 @@ class ActiveInferenceEFE(Agent):
         coupled_regions = state.get("coupled_region_keys", [])
         if not isinstance(coupled_regions, list):
             coupled_regions = []
+        interaction_chain = state.get("interaction_target_chain", [])
+        if not isinstance(interaction_chain, list):
+            interaction_chain = []
         return {
             "schema_name": "active_inference_high_info_focus_state_v1",
             "schema_version": 1,
@@ -2037,6 +2099,13 @@ class ActiveInferenceEFE(Agent):
             "cross_region_key": str(state.get("cross_region_key", "NA")),
             "gate_region_key": str(state.get("gate_region_key", "NA")),
             "verify_action_ids": [int(v) for v in verify_action_ids],
+            "interaction_chain_active": bool(state.get("interaction_chain_active", False)),
+            "interaction_chain_generation": int(
+                max(0, state.get("interaction_chain_generation", 0))
+            ),
+            "interaction_target_chain": [str(v) for v in interaction_chain[:16]],
+            "interaction_target_index": int(max(0, state.get("interaction_target_index", 0))),
+            "interaction_last_status": str(state.get("interaction_last_status", "idle")),
             "last_status": str(state.get("last_status", "idle")),
         }
 
@@ -2514,6 +2583,13 @@ class ActiveInferenceEFE(Agent):
                 ),
             )
         )
+        interaction_chain_active = bool(state.get("interaction_chain_active", False))
+        if interaction_chain_active and bool(state.get("active", False)):
+            if action_id in (1, 2, 3, 4):
+                if reaches_target or moves_toward_target:
+                    bonus_hint += 0.14
+                if moves_away_target:
+                    penalty_hint += 0.18
         bonus_hint = float((0.75 + (0.25 * urgency)) * bonus_hint)
         return {
             "schema_name": "active_inference_high_info_focus_features_v1",
@@ -2538,6 +2614,7 @@ class ActiveInferenceEFE(Agent):
             "reaches_target_region": bool(reaches_target),
             "verify_action_ids": [int(v) for v in sorted(verify_action_set)],
             "verify_action_candidate": bool(verify_action_candidate),
+            "interaction_chain_active": bool(interaction_chain_active),
             "bonus_hint": float(max(0.0, bonus_hint)),
             "penalty_hint": float(max(0.0, penalty_hint)),
         }
@@ -2735,6 +2812,18 @@ class ActiveInferenceEFE(Agent):
         state["target_region_key_effective"] = str(effective_target_region_key)
 
         obs_change_type = str(getattr(causal_signature, "obs_change_type", ""))
+        changed_pixels = int(max(0, getattr(causal_signature, "changed_pixel_count", 0)))
+        level_delta_now = int(max(0, getattr(causal_signature, "level_delta", 0)))
+        verify_meaningful_event = bool(
+            level_delta_now > 0
+            or obs_change_type
+            in (
+                "CC_COUNT_CHANGE",
+                "GLOBAL_PATTERN_CHANGE",
+                "METADATA_PROGRESS_CHANGE",
+            )
+            or changed_pixels >= int(self.high_info_strong_change_pixels)
+        )
         in_trigger_region = bool(
             str(source_region_key) == str(effective_trigger_region_key)
             or str(nav_region_key) == str(effective_trigger_region_key)
@@ -2788,7 +2877,7 @@ class ActiveInferenceEFE(Agent):
             verified = bool(
                 in_target_region
                 and executed_action_id in set(int(v) for v in verify_action_ids)
-                and str(obs_change_type) != "NO_CHANGE"
+                and verify_meaningful_event
             )
             if verified:
                 state["active"] = False
@@ -2819,6 +2908,10 @@ class ActiveInferenceEFE(Agent):
             state["active"] = False
             state["stage"] = "idle"
             state["steps_remaining"] = 0
+            state["interaction_chain_active"] = False
+            state["interaction_target_chain"] = []
+            state["interaction_target_index"] = 0
+            state["interaction_last_status"] = "disabled"
             state["trigger_region_key_effective"] = str(
                 state.get("trigger_region_key", self.sequence_causal_trigger_region_key)
             )
@@ -2846,6 +2939,10 @@ class ActiveInferenceEFE(Agent):
             state["current_target_region_key"] = "NA"
             state["target_region_scores"] = {}
             state["target_required_samples"] = {}
+            state["interaction_chain_active"] = False
+            state["interaction_target_chain"] = []
+            state["interaction_target_index"] = 0
+            state["interaction_last_status"] = "timeout"
             state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
             state["last_status"] = "timeout"
 
@@ -2879,8 +2976,19 @@ class ActiveInferenceEFE(Agent):
             for (k, v) in target_required_samples.items()
             if self._parse_region_key_v1(str(k)) is not None
         }
+        interaction_target_chain = state.get("interaction_target_chain", [])
+        if not isinstance(interaction_target_chain, list):
+            interaction_target_chain = []
+        interaction_target_chain = [
+            str(v)
+            for v in interaction_target_chain
+            if self._parse_region_key_v1(str(v)) is not None
+        ]
+        interaction_target_index = int(max(0, state.get("interaction_target_index", 0)))
+        interaction_chain_active = bool(state.get("interaction_chain_active", False))
         min_samples_per_target = int(max(1, self.high_info_min_samples_per_target))
         coupled_min_samples = int(max(min_samples_per_target, self.high_info_coupled_min_samples))
+        coupled_progress_locked = bool(int(current_packet.levels_completed) <= 0)
         high_value_threshold = float(
             max(0.0, min(1.0, float(self.high_info_focus_min_trigger_score)))
         )
@@ -2937,21 +3045,79 @@ class ActiveInferenceEFE(Agent):
             current_region_key=str(source_region_key),
         )
         trigger_score = float(trigger_semantics.get("info_trigger_score", 0.0))
+        trigger_attempts = int(max(0, trigger_semantics.get("attempts", 0)))
+        source_visit_count = int(max(0, self._region_visit_counts.get(str(source_region_key), 0)))
+        source_in_coupled_region = bool(str(source_region_key) in coupled_region_keys)
+        coupled_probe_trigger = bool(
+            source_in_coupled_region
+            and source_visit_count >= int(max(2, coupled_min_samples - 1))
+            and (
+                str(obs_change_type) != "NO_CHANGE"
+                or int(changed_pixels) >= 2
+            )
+        )
+        level_delta_now = int(max(0, getattr(causal_signature, "level_delta", 0)))
+        trigger_reliable = bool(
+            trigger_attempts >= int(max(2, min_samples_per_target))
+            or (source_in_coupled_region and trigger_attempts >= 1)
+            or coupled_probe_trigger
+            or level_delta_now > 0
+            or strong_event
+        )
+        non_coupled_high_trigger_threshold = float(
+            max(self.high_info_focus_min_trigger_score, 0.62)
+        )
+        source_trigger_gate = bool(
+            source_in_coupled_region
+            or trigger_score >= non_coupled_high_trigger_threshold
+            or level_delta_now > 0
+            or obs_change_type == "METADATA_PROGRESS_CHANGE"
+            or obs_change_type == "CC_COUNT_CHANGE"
+            or obs_change_type == "GLOBAL_PATTERN_CHANGE"
+            or int(changed_pixels) >= int(self.high_info_strong_change_pixels)
+        )
         should_trigger = bool(
             (
                 strong_event
+                or coupled_probe_trigger
                 or (
-                    str(source_region_key) in coupled_region_keys
+                    source_in_coupled_region
                     and trigger_score >= 0.34
                 )
             )
+            and trigger_reliable
+            and source_trigger_gate
             and self._parse_region_key_v1(str(source_region_key)) is not None
             and (
                 trigger_score >= float(self.high_info_focus_min_trigger_score)
                 or obs_change_type == "CC_COUNT_CHANGE"
-                or str(source_region_key) in coupled_region_keys
+                or source_in_coupled_region
+                or coupled_probe_trigger
+                or int(changed_pixels) >= int(self.high_info_strong_change_pixels)
             )
         )
+        if should_trigger and bool(state.get("active", False)):
+            previous_trigger_counter = int(state.get("trigger_action_counter", -1))
+            previous_source_region_key = str(state.get("source_region_key", "NA"))
+            retrigger_cooldown = int(max(0, self.high_info_retrigger_cooldown_steps))
+            steps_since_trigger = (
+                int(current_counter - previous_trigger_counter)
+                if previous_trigger_counter >= 0
+                else 10**6
+            )
+            if (
+                retrigger_cooldown > 0
+                and str(previous_source_region_key) == str(source_region_key)
+                and steps_since_trigger < retrigger_cooldown
+            ):
+                should_trigger = False
+            elif (
+                retrigger_cooldown > 0
+                and steps_since_trigger < max(3, int(retrigger_cooldown // 2))
+                and (not strong_event)
+                and level_delta_now <= 0
+            ):
+                should_trigger = False
 
         def _collect_hot_targets(anchor_region_key: str) -> dict[str, float]:
             target_scores_local: dict[str, float] = {}
@@ -2971,9 +3137,36 @@ class ActiveInferenceEFE(Agent):
                 visit_count = int(self._region_visit_counts.get(region_key, 0))
                 novelty_bonus = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 10.0))) * 0.20
                 revisit_penalty = float(min(0.18, float(visit_count) / 20.0))
-                score = float(max(0.0, info_score + novelty_bonus - revisit_penalty))
+                stale_loop_penalty = 0.0
+                if coupled_progress_locked and region_key not in coupled_region_keys:
+                    progress_rate = float(max(0.0, row.get("progress_rate", 0.0)))
+                    coupling_score = float(max(0.0, row.get("coupling_signal_score", 0.0)))
+                    if (
+                        visit_count >= 8
+                        and info_score <= 0.58
+                        and coupling_score <= 0.52
+                        and progress_rate <= 0.0
+                    ):
+                        stale_loop_penalty = float(min(0.34, 0.04 * float(visit_count - 7)))
+                score = float(
+                    max(
+                        0.0,
+                        info_score + novelty_bonus - revisit_penalty - stale_loop_penalty,
+                    )
+                )
                 if region_key == str(anchor_region_key) and strong_event:
-                    score = float(max(score, 0.62))
+                    anchor_sample_count = int(
+                        max(0, target_sample_counts.get(str(region_key), 0))
+                    )
+                    anchor_required_samples = int(_required_samples(str(region_key)))
+                    if anchor_sample_count < anchor_required_samples:
+                        anchor_floor = 0.62
+                        if (
+                            int(source_visit_count) >= int(max(4, coupled_min_samples + 1))
+                            and coupled_progress_locked
+                        ):
+                            anchor_floor = 0.48
+                        score = float(max(score, anchor_floor))
                 target_scores_local[region_key] = max(
                     float(target_scores_local.get(region_key, 0.0)),
                     float(score),
@@ -3076,11 +3269,64 @@ class ActiveInferenceEFE(Agent):
                 return []
             coupled_head = [key for key in queue if key in coupled_region_keys]
             non_coupled = [key for key in queue if key not in coupled_region_keys]
-            queue = coupled_head + non_coupled
+            if coupled_progress_locked and coupled_head and non_coupled:
+                high_non_coupled = [
+                    str(key)
+                    for key in non_coupled
+                    if float(target_scores_raw.get(str(key), 0.0))
+                    >= float(max(0.58, high_value_threshold))
+                ]
+                reordered: list[str] = []
+                reordered.append(str(coupled_head[0]))
+                if high_non_coupled:
+                    first_high = str(high_non_coupled[0])
+                    if first_high not in reordered:
+                        reordered.append(first_high)
+                for key in list(coupled_head[1:]) + list(high_non_coupled[1:]) + list(non_coupled):
+                    skey = str(key)
+                    if skey not in reordered:
+                        reordered.append(skey)
+                queue = list(reordered)
+            else:
+                queue = coupled_head + non_coupled
             max_targets = int(max(self.high_info_focus_max_targets, len(coupled_head)))
             if max_targets > 0:
                 queue = queue[:max_targets]
             return list(queue)
+
+        def _build_interaction_chain(
+            queue_keys: list[str],
+            *,
+            source_key: str,
+        ) -> list[str]:
+            normalized: list[str] = []
+            for region_key in queue_keys:
+                key = str(region_key)
+                if self._parse_region_key_v1(key) is None:
+                    continue
+                if key in normalized:
+                    continue
+                normalized.append(str(key))
+            preferred = [key for key in normalized if str(key) != str(source_key)]
+            if preferred:
+                normalized = list(preferred)
+            max_region_count = int(max(2, min(5, max(2, self.high_info_focus_max_targets))))
+            normalized = normalized[:max_region_count]
+            if not normalized:
+                return []
+            if len(normalized) == 1:
+                return [str(normalized[0]), str(normalized[0])]
+            chain: list[str] = []
+            # Pairwise mutual coverage among top high-info regions.
+            for idx, left in enumerate(normalized):
+                for right in normalized[idx + 1 :]:
+                    chain.extend([str(left), str(right), str(right), str(left)])
+            deduped: list[str] = []
+            for key in chain:
+                if not deduped or str(deduped[-1]) != str(key):
+                    deduped.append(str(key))
+            max_chain_len = int(max(4, min(24, 4 * max_region_count)))
+            return deduped[:max_chain_len]
 
         if should_trigger:
             was_active_before_trigger = bool(state.get("active", False))
@@ -3145,6 +3391,31 @@ class ActiveInferenceEFE(Agent):
             state["coupled_region_keys"] = [
                 str(v) for v in sorted(coupled_region_keys)
             ]
+            seed_queue = _rank_queue(
+                score_memory,
+                anchor_region_key=str(source_region_key),
+                completed_recent=set(),
+                sample_counts=target_sample_counts,
+            )
+            interaction_chain = _build_interaction_chain(
+                list(seed_queue),
+                source_key=str(source_region_key),
+            )
+            interaction_chain_active = bool(len(interaction_chain) >= 2)
+            interaction_target_chain = list(interaction_chain)
+            interaction_target_index = 0
+            state["interaction_chain_active"] = bool(interaction_chain_active)
+            if interaction_chain_active:
+                state["interaction_chain_generation"] = int(
+                    max(0, state.get("interaction_chain_generation", 0)) + 1
+                )
+                state["interaction_target_chain"] = list(interaction_chain)
+                state["interaction_target_index"] = 0
+                state["interaction_last_status"] = "armed"
+            else:
+                state["interaction_target_chain"] = []
+                state["interaction_target_index"] = 0
+                state["interaction_last_status"] = "insufficient_chain"
             state["last_status"] = (
                 "retriggered_chain" if was_active_before_trigger else "triggered"
             )
@@ -3159,6 +3430,9 @@ class ActiveInferenceEFE(Agent):
             state["cross_region_key"] = str(primary_coupled_region_key)
             state["gate_region_key"] = str(secondary_coupled_region_key)
             state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
+            state["interaction_chain_active"] = bool(interaction_chain_active)
+            state["interaction_target_chain"] = list(interaction_target_chain[:16])
+            state["interaction_target_index"] = int(max(0, interaction_target_index))
             return
 
         if not score_memory:
@@ -3180,6 +3454,10 @@ class ActiveInferenceEFE(Agent):
             state["current_target_region_key"] = "NA"
             state["target_region_queue"] = []
             state["target_region_scores"] = {}
+            state["interaction_chain_active"] = False
+            state["interaction_target_chain"] = []
+            state["interaction_target_index"] = 0
+            state["interaction_last_status"] = "completed"
             state["completion_count"] = int(state.get("completion_count", 0) + 1)
             state["last_status"] = "completed"
             state["completed_target_regions"] = list(completed_regions[-16:])
@@ -3191,6 +3469,20 @@ class ActiveInferenceEFE(Agent):
             state["gate_region_key"] = str(secondary_coupled_region_key)
             state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
             return
+
+        if interaction_chain_active and interaction_target_chain:
+            interaction_target_index = int(
+                max(0, min(len(interaction_target_chain) - 1, interaction_target_index))
+            )
+            interaction_target_key = str(interaction_target_chain[interaction_target_index])
+            if self._parse_region_key_v1(interaction_target_key) is not None:
+                queue = [str(interaction_target_key)] + [
+                    str(v) for v in queue if str(v) != str(interaction_target_key)
+                ]
+                state["interaction_chain_active"] = True
+                state["interaction_target_chain"] = list(interaction_target_chain[:16])
+                state["interaction_target_index"] = int(interaction_target_index)
+                state["interaction_last_status"] = "tracking"
 
         deadline = int(state.get("deadline_action_counter", current_counter))
         state["steps_remaining"] = int(max(0, deadline - current_counter))
@@ -3210,6 +3502,9 @@ class ActiveInferenceEFE(Agent):
         state["cross_region_key"] = str(primary_coupled_region_key)
         state["gate_region_key"] = str(secondary_coupled_region_key)
         state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
+        state["interaction_chain_active"] = bool(interaction_chain_active)
+        state["interaction_target_chain"] = list(interaction_target_chain[:16])
+        state["interaction_target_index"] = int(max(0, interaction_target_index))
         state["stage"] = "seek"
         in_target_region = bool(str(nav_region_key) == str(target_region_key))
         if in_target_region:
@@ -3244,6 +3539,34 @@ class ActiveInferenceEFE(Agent):
                     score_memory[str(target_region_key)] = float(
                         max(0.56, float(score_memory.get(str(target_region_key), 0.0)))
                     )
+            next_interaction_target_key = "NA"
+            if (
+                remaining_samples <= 0
+                and interaction_chain_active
+                and interaction_target_chain
+            ):
+                interaction_target_index = int(
+                    max(0, min(len(interaction_target_chain) - 1, interaction_target_index))
+                )
+                chain_target_key = str(interaction_target_chain[interaction_target_index])
+                if str(chain_target_key) == str(target_region_key):
+                    if int(interaction_target_index + 1) < int(len(interaction_target_chain)):
+                        interaction_target_index = int(interaction_target_index + 1)
+                        next_interaction_target_key = str(
+                            interaction_target_chain[interaction_target_index]
+                        )
+                        state["interaction_chain_active"] = True
+                        state["interaction_target_chain"] = list(interaction_target_chain[:16])
+                        state["interaction_target_index"] = int(interaction_target_index)
+                        state["interaction_last_status"] = "advance"
+                    else:
+                        interaction_chain_active = False
+                        interaction_target_chain = []
+                        interaction_target_index = 0
+                        state["interaction_chain_active"] = False
+                        state["interaction_target_chain"] = []
+                        state["interaction_target_index"] = 0
+                        state["interaction_last_status"] = "completed"
             refreshed_queue = _rank_queue(
                 score_memory,
                 anchor_region_key=str(nav_region_key),
@@ -3252,12 +3575,23 @@ class ActiveInferenceEFE(Agent):
             )
             if remaining_samples <= 0:
                 refreshed_queue = [str(v) for v in refreshed_queue if str(v) != str(target_region_key)]
+            if self._parse_region_key_v1(str(next_interaction_target_key)) is not None:
+                refreshed_queue = [str(next_interaction_target_key)] + [
+                    str(v)
+                    for v in refreshed_queue
+                    if str(v) != str(next_interaction_target_key)
+                ]
             if refreshed_queue:
                 state["target_region_queue"] = list(refreshed_queue)
                 state["current_target_region_key"] = str(refreshed_queue[0])
                 state["target_region_scores"] = dict(score_memory)
                 state["target_sample_counts"] = dict(target_sample_counts)
                 state["target_required_samples"] = dict(target_required_samples)
+                state["interaction_chain_active"] = bool(interaction_chain_active)
+                state["interaction_target_chain"] = list(interaction_target_chain[:16])
+                state["interaction_target_index"] = int(max(0, interaction_target_index))
+                if not bool(state.get("interaction_chain_active", False)):
+                    state["interaction_last_status"] = "inactive"
                 state["last_status"] = (
                     "target_sampled"
                     if remaining_samples <= 0
@@ -3272,6 +3606,10 @@ class ActiveInferenceEFE(Agent):
                 state["target_region_scores"] = {}
                 state["target_sample_counts"] = dict(target_sample_counts)
                 state["target_required_samples"] = dict(target_required_samples)
+                state["interaction_chain_active"] = False
+                state["interaction_target_chain"] = []
+                state["interaction_target_index"] = 0
+                state["interaction_last_status"] = "completed"
                 state["completion_count"] = int(state.get("completion_count", 0) + 1)
                 state["last_status"] = "completed"
 
@@ -4260,6 +4598,12 @@ class ActiveInferenceEFE(Agent):
                 int(self._last_known_agent_pos_region[1]),
             )
             payload["current_region_source"] = "last_known_region"
+        if current_region is None and self._latest_observed_agent_pos_region is not None:
+            current_region = (
+                int(self._latest_observed_agent_pos_region[0]),
+                int(self._latest_observed_agent_pos_region[1]),
+            )
+            payload["current_region_source"] = "latest_observed_region"
         if current_region is None:
             payload["reason"] = "unknown_current_region"
             return payload
@@ -5108,6 +5452,14 @@ class ActiveInferenceEFE(Agent):
                 "reason": "peripheral_ui_motion",
                 "peripheral_ui_candidate": True,
                 "peripheral_ui_likelihood": float(peripheral_ui_score),
+                "agent_pos_xy": {
+                    "x": int(getattr(current, "centroid_x", -1)),
+                    "y": int(getattr(current, "centroid_y", -1)),
+                },
+                "agent_pos_region": {
+                    "x": int(max(0, min(7, int(getattr(current, "centroid_x", -1)) // 8))),
+                    "y": int(max(0, min(7, int(getattr(current, "centroid_y", -1)) // 8))),
+                },
                 "candidate_centroid_xy": {
                     "x": int(getattr(current, "centroid_x", -1)),
                     "y": int(getattr(current, "centroid_y", -1)),
@@ -5147,7 +5499,7 @@ class ActiveInferenceEFE(Agent):
             "direction_alignment": float(best_metrics.get("direction_alignment", 0.0)),
             "projection_error": float(best_metrics.get("projection_error", 0.0)),
             "peripheral_ui_candidate": False,
-            "peripheral_ui_likelihood": float(peripheral_ui_likelihood),
+            "peripheral_ui_likelihood": float(peripheral_ui_score),
             "tracked_pair_source": (
                 "tracked_first_pass"
                 if tracked_previous_nodes and str(previous.digest) == tracked_digest
@@ -5541,9 +5893,15 @@ class ActiveInferenceEFE(Agent):
                     },
                 )
         except Exception as exc:
+            tb = exc.__traceback__
+            while tb is not None and tb.tb_next is not None:
+                tb = tb.tb_next
+            location = "unknown"
+            if tb is not None and tb.tb_frame is not None:
+                location = f"{tb.tb_frame.f_code.co_name}:{int(tb.tb_lineno)}"
             diagnostics.finish_rejected(
                 "causal_update",
-                f"causal_update_error::{type(exc).__name__}",
+                f"causal_update_error::{type(exc).__name__}::{location}::{str(exc)[:120]}",
             )
             self._latest_navigation_state_estimate = {}
             self._latest_transition_record = {}
@@ -6000,9 +6358,22 @@ class ActiveInferenceEFE(Agent):
                             "bottleneck_stage_v1": diagnostics.bottleneck_stage(),
                         }
                 except Exception as exc:
+                    error_location = "NA"
+                    try:
+                        tb = traceback.extract_tb(exc.__traceback__)
+                        if tb:
+                            last = tb[-1]
+                            error_location = f"{os.path.basename(last.filename)}:{int(last.lineno)}"
+                    except Exception:
+                        error_location = "NA"
                     diagnostics.finish_rejected(
                         "candidate_generation",
-                        f"candidate_generation_error::{type(exc).__name__}",
+                        (
+                            "candidate_generation_error::"
+                            f"{type(exc).__name__}::"
+                            f"{error_location}::"
+                            f"{str(exc)[:120]}"
+                        ),
                     )
                     action = GameAction.RESET
                     action.reasoning = self._reasoning_for_failure(
