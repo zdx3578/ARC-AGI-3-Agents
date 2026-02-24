@@ -605,6 +605,8 @@ class ActiveInferenceEFE(Agent):
             "current_target_region_key": "NA",
             "target_miss_streak": 0,
             "target_region_queue": [],
+            "pending_region_queue": [],
+            "pending_region_scores": {},
             "target_region_scores": {},
             "target_required_samples": {},
             "target_sample_counts": {},
@@ -2644,6 +2646,12 @@ class ActiveInferenceEFE(Agent):
         queue = state.get("target_region_queue", [])
         if not isinstance(queue, list):
             queue = []
+        pending_queue = state.get("pending_region_queue", [])
+        if not isinstance(pending_queue, list):
+            pending_queue = []
+        pending_scores = state.get("pending_region_scores", {})
+        if not isinstance(pending_scores, dict):
+            pending_scores = {}
         completed = state.get("completed_target_regions", [])
         if not isinstance(completed, list):
             completed = []
@@ -2716,6 +2724,14 @@ class ActiveInferenceEFE(Agent):
             "current_target_region_key": str(state.get("current_target_region_key", "NA")),
             "target_miss_streak": int(max(0, state.get("target_miss_streak", 0))),
             "target_region_queue": [str(v) for v in queue[:8]],
+            "pending_region_queue": [str(v) for v in pending_queue[:16]],
+            "pending_region_scores": {
+                str(k): float(v)
+                for (k, v) in sorted(
+                    pending_scores.items(),
+                    key=lambda item: (-float(item[1]), str(item[0])),
+                )[:16]
+            },
             "target_region_scores": {
                 str(k): float(v)
                 for (k, v) in sorted(scores.items(), key=lambda item: str(item[0]))[:16]
@@ -3928,6 +3944,8 @@ class ActiveInferenceEFE(Agent):
             state["interaction_target_chain"] = []
             state["interaction_target_index"] = 0
             state["interaction_last_status"] = "disabled"
+            state["pending_region_queue"] = []
+            state["pending_region_scores"] = {}
             state["chain_lock_active"] = False
             state["chain_lock_window_steps"] = int(self.high_info_chain_lock_window_steps)
             state["chain_lock_steps_remaining"] = 0
@@ -3962,6 +3980,8 @@ class ActiveInferenceEFE(Agent):
             state["steps_remaining"] = 0
             state["target_miss_streak"] = 0
             state["target_region_queue"] = []
+            state["pending_region_queue"] = []
+            state["pending_region_scores"] = {}
             state["current_target_region_key"] = "NA"
             state["target_region_scores"] = {}
             state["target_required_samples"] = {}
@@ -4084,6 +4104,22 @@ class ActiveInferenceEFE(Agent):
                 continue
             deduped_priority_subqueue.append(key)
         priority_subqueue_keys = list(deduped_priority_subqueue)
+        pending_region_queue = state.get("pending_region_queue", [])
+        if not isinstance(pending_region_queue, list):
+            pending_region_queue = []
+        pending_region_queue = [
+            str(v)
+            for v in pending_region_queue
+            if self._parse_region_key_v1(str(v)) is not None
+        ][:64]
+        pending_region_scores = state.get("pending_region_scores", {})
+        if not isinstance(pending_region_scores, dict):
+            pending_region_scores = {}
+        pending_region_scores = {
+            str(k): float(max(0.0, v))
+            for (k, v) in pending_region_scores.items()
+            if self._parse_region_key_v1(str(k)) is not None and float(v) > 0.0
+        }
         priority_subqueue_active = bool(
             state.get("priority_subqueue_active", False)
             and bool(priority_subqueue_keys)
@@ -4163,6 +4199,41 @@ class ActiveInferenceEFE(Agent):
                 chain_lock_last_status = str(status)
             else:
                 _disable_chain_lock(status)
+
+        def _enqueue_pending_regions(
+            region_keys: list[str],
+            *,
+            score_hint: dict[str, float] | None = None,
+        ) -> None:
+            nonlocal pending_region_queue
+            nonlocal pending_region_scores
+            lock_key = str(chain_lock_target_region_key)
+            hint = score_hint if isinstance(score_hint, dict) else {}
+            for region_key in region_keys:
+                key = str(region_key)
+                if self._parse_region_key_v1(key) is None:
+                    continue
+                if key == lock_key:
+                    continue
+                if key not in pending_region_queue:
+                    pending_region_queue.append(str(key))
+                score_value = float(max(0.0, hint.get(str(key), 0.0)))
+                if score_value <= 0.0:
+                    score_value = float(max(0.0, pending_region_scores.get(str(key), 0.0)))
+                if score_value > 0.0:
+                    pending_region_scores[str(key)] = float(
+                        max(float(pending_region_scores.get(str(key), 0.0)), score_value)
+                    )
+
+        def _flush_pending_regions_to_state() -> None:
+            state["pending_region_queue"] = [str(v) for v in pending_region_queue[:64]]
+            state["pending_region_scores"] = {
+                str(k): float(v)
+                for (k, v) in sorted(
+                    pending_region_scores.items(),
+                    key=lambda item: (-float(item[1]), str(item[0])),
+                )[:64]
+            }
 
         if (
             self._parse_region_key_v1(str(chain_lock_target_region_key)) is None
@@ -5425,6 +5496,8 @@ class ActiveInferenceEFE(Agent):
             state["chain_lock_last_status"] = str(chain_lock_last_status)
             state["priority_subqueue_active"] = bool(priority_subqueue_active)
             state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
+            state["pending_region_queue"] = []
+            state["pending_region_scores"] = {}
             state["last_status"] = (
                 "retriggered_chain_focus_reset"
                 if simultaneous_focus_reset
@@ -5570,6 +5643,8 @@ class ActiveInferenceEFE(Agent):
                         state["chain_lock_last_status"] = str(chain_lock_last_status)
                         state["priority_subqueue_active"] = False
                         state["priority_subqueue_keys"] = []
+                        state["pending_region_queue"] = []
+                        state["pending_region_scores"] = {}
                         state["last_status"] = "idle_rearm"
                         return
             state["target_region_scores"] = dict(score_memory)
@@ -5642,6 +5717,8 @@ class ActiveInferenceEFE(Agent):
             state["chain_lock_last_status"] = str(chain_lock_last_status)
             state["priority_subqueue_active"] = bool(priority_subqueue_active)
             state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
+            state["pending_region_queue"] = []
+            state["pending_region_scores"] = {}
             return
 
         if not score_memory:
@@ -5656,6 +5733,32 @@ class ActiveInferenceEFE(Agent):
             completed_recent=completed_recent,
             sample_counts=target_sample_counts,
         )
+
+        def _commit_lock_hard_active_v1() -> bool:
+            return bool(
+                target_commit_active
+                and chain_lock_active
+                and chain_lock_steps_remaining > 0
+                and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
+            )
+
+        def _force_hard_lock_queue_v1(status: str) -> bool:
+            nonlocal queue
+            nonlocal target_miss_streak
+            if not _commit_lock_hard_active_v1():
+                return False
+            lock_key = str(chain_lock_target_region_key)
+            deferred = [str(v) for v in queue if str(v) != str(lock_key)]
+            if deferred:
+                _enqueue_pending_regions(
+                    deferred,
+                    score_hint={str(k): float(v) for (k, v) in score_memory.items()},
+                )
+            queue = [str(lock_key)]
+            target_miss_streak = 0
+            state["last_status"] = str(status)
+            return True
+
         if (
             chain_lock_active
             and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
@@ -5663,6 +5766,7 @@ class ActiveInferenceEFE(Agent):
         ):
             queue = [str(chain_lock_target_region_key)] + [str(v) for v in queue]
             state["last_status"] = "chain_lock_reinjected_target"
+        _force_hard_lock_queue_v1("target_commit_hard_lock")
         if queue and (strong_event or int(changed_pixels) >= int(self.high_info_simultaneous_min_total_pixels)):
             source_change_magnitude = float(
                 max(0.0, min(1.0, region_change_magnitude_effective.get(str(source_region_key), 0.0)))
@@ -5702,29 +5806,40 @@ class ActiveInferenceEFE(Agent):
                             : int(max(1, min(3, self.high_info_focus_max_targets)))
                         ]
                     ]
-                    priority_subqueue_active = bool(event_priority_window)
-                    priority_subqueue_keys = list(event_priority_window)
-                    if (
-                        chain_lock_active
-                        and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
-                    ):
-                        locked_key = str(chain_lock_target_region_key)
-                        queue = [str(locked_key)] + [
-                            str(v)
-                            for v in event_priority_window
-                            if str(v) != str(locked_key)
-                        ] + [
-                            str(v)
-                            for v in queue
-                            if str(v) not in set(event_priority_window)
-                            and str(v) != str(locked_key)
-                        ]
-                        state["last_status"] = "event_change_queued_under_lock"
+                    if _commit_lock_hard_active_v1():
+                        _enqueue_pending_regions(
+                            [str(v) for v in event_priority_window],
+                            score_hint={
+                                str(k): float(max(0.0, region_change_magnitude_effective.get(str(k), 0.0)))
+                                for k in event_priority_window
+                            },
+                        )
+                        state["last_status"] = "target_commit_pending_event_priority"
                     else:
-                        queue = list(event_priority_window) + [
-                            str(v) for v in queue if str(v) not in set(event_priority_window)
-                        ]
-                        state["last_status"] = "event_change_priority_lock"
+                        priority_subqueue_active = bool(event_priority_window)
+                        priority_subqueue_keys = list(event_priority_window)
+                        if (
+                            chain_lock_active
+                            and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
+                        ):
+                            locked_key = str(chain_lock_target_region_key)
+                            queue = [str(locked_key)] + [
+                                str(v)
+                                for v in event_priority_window
+                                if str(v) != str(locked_key)
+                            ] + [
+                                str(v)
+                                for v in queue
+                                if str(v) not in set(event_priority_window)
+                                and str(v) != str(locked_key)
+                            ]
+                            state["last_status"] = "event_change_queued_under_lock"
+                        else:
+                            queue = list(event_priority_window) + [
+                                str(v) for v in queue if str(v) not in set(event_priority_window)
+                            ]
+                            state["last_status"] = "event_change_priority_lock"
+        _force_hard_lock_queue_v1("target_commit_hard_lock")
         if not queue:
             state["active"] = False
             state["stage"] = "idle"
@@ -5732,6 +5847,8 @@ class ActiveInferenceEFE(Agent):
             state["target_miss_streak"] = 0
             state["current_target_region_key"] = "NA"
             state["target_region_queue"] = []
+            state["pending_region_queue"] = []
+            state["pending_region_scores"] = {}
             state["target_region_scores"] = {}
             state["simultaneous_changed_region_keys"] = []
             state["simultaneous_reachable_region_keys"] = []
@@ -5774,7 +5891,7 @@ class ActiveInferenceEFE(Agent):
             state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
             return
 
-        if interaction_chain_active and interaction_target_chain:
+        if (not _commit_lock_hard_active_v1()) and interaction_chain_active and interaction_target_chain:
             interaction_target_index = int(
                 max(0, min(len(interaction_target_chain) - 1, interaction_target_index))
             )
@@ -5798,7 +5915,7 @@ class ActiveInferenceEFE(Agent):
                 state["interaction_target_index"] = int(interaction_target_index)
                 state["interaction_last_status"] = "tracking"
 
-        if priority_subqueue_active and priority_subqueue_keys:
+        if (not _commit_lock_hard_active_v1()) and priority_subqueue_active and priority_subqueue_keys:
             refreshed_priority_subqueue: list[str] = []
             for region_key in priority_subqueue_keys:
                 key = str(region_key)
@@ -5826,6 +5943,7 @@ class ActiveInferenceEFE(Agent):
                 state["last_status"] = "priority_subqueue_tracking"
             else:
                 state["last_status"] = "priority_subqueue_completed"
+        _force_hard_lock_queue_v1("target_commit_hard_lock")
 
         reachable_diff_priority_active = False
         reachable_diff_priority_key = "NA"
@@ -5874,7 +5992,8 @@ class ActiveInferenceEFE(Agent):
                             interaction_target_index = int(idx)
                             break
                     state["interaction_target_index"] = int(max(0, interaction_target_index))
-                state["last_status"] = "reachable_diff_priority_override"
+                    state["last_status"] = "reachable_diff_priority_override"
+        _force_hard_lock_queue_v1("target_commit_hard_lock")
 
         previous_target_region_key = str(state.get("current_target_region_key", "NA"))
         target_region_key = str(queue[0])
@@ -5909,14 +6028,39 @@ class ActiveInferenceEFE(Agent):
                     if chain_lock_steps_remaining <= 0:
                         _disable_chain_lock("window_expired")
                     elif int(target_miss_streak) >= int(chain_lock_miss_limit):
-                        _disable_chain_lock("miss_limit")
+                        if target_commit_active:
+                            chain_lock_last_status = "tracking_commit_hold"
+                        else:
+                            _disable_chain_lock("miss_limit")
                     else:
                         chain_lock_last_status = "tracking"
                 else:
                     chain_lock_last_status = "in_target"
+        hard_commit_mode = _commit_lock_hard_active_v1()
+        if (not hard_commit_mode) and pending_region_queue:
+            pending_order = sorted(
+                [str(v) for v in pending_region_queue if self._parse_region_key_v1(str(v)) is not None],
+                key=lambda key: (
+                    -float(max(0.0, pending_region_scores.get(str(key), 0.0))),
+                    int(
+                        self._region_route_distance_v1(
+                            region_adjacency,
+                            start_region_key=str(anchor_key),
+                            goal_region_key=str(key),
+                        )
+                    ),
+                    str(key),
+                ),
+            )
+            if pending_order:
+                queue = list(pending_order) + [str(v) for v in queue if str(v) not in set(pending_order)]
+                state["last_status"] = "pending_queue_merged"
+            pending_region_queue = []
+            pending_region_scores = {}
         miss_streak_limit = int(max(12, 2 * int(self.high_info_focus_window_steps)))
         if (
             (not chain_lock_active)
+            and (not hard_commit_mode)
             and (not reachable_diff_priority_active)
             and int(target_miss_streak) >= int(miss_streak_limit)
             and len(queue) > 1
@@ -5956,6 +6100,9 @@ class ActiveInferenceEFE(Agent):
                             interaction_target_index = int(idx)
                             break
                 state["interaction_target_index"] = int(max(0, interaction_target_index))
+        _force_hard_lock_queue_v1("target_commit_hard_lock")
+        if queue:
+            target_region_key = str(queue[0])
 
         deadline = int(state.get("deadline_action_counter", current_counter))
         state["steps_remaining"] = int(max(0, deadline - current_counter))
@@ -5963,6 +6110,7 @@ class ActiveInferenceEFE(Agent):
         state["current_target_region_key"] = str(target_region_key)
         state["target_region_queue"] = list(queue)
         state["target_region_scores"] = dict(score_memory)
+        _flush_pending_regions_to_state()
         state["completed_target_regions"] = list(completed_regions[-16:])
         state["target_sample_counts"] = dict(target_sample_counts)
         state["target_required_samples"] = dict(target_required_samples)
@@ -6043,6 +6191,7 @@ class ActiveInferenceEFE(Agent):
             and str(nav_region_key) != str(target_region_key)
             and (not simultaneous_subcycle_active)
             and (not chain_lock_active)
+            and (not hard_commit_mode)
             and (not reachable_diff_priority_active)
         ):
             nav_required_samples = int(_required_samples(str(nav_region_key)))
@@ -6070,6 +6219,9 @@ class ActiveInferenceEFE(Agent):
                 state["interaction_target_index"] = int(max(0, interaction_target_index))
             state["current_target_region_key"] = str(target_region_key)
             state["target_region_queue"] = list(queue)
+        _force_hard_lock_queue_v1("target_commit_hard_lock")
+        if queue:
+            target_region_key = str(queue[0])
 
         in_target_region = bool(str(nav_region_key) == str(target_region_key))
         if in_target_region:
@@ -6190,12 +6342,23 @@ class ActiveInferenceEFE(Agent):
                     refreshed_queue = [str(chain_lock_target_region_key)] + [
                         str(v) for v in refreshed_queue
                     ]
+            if _commit_lock_hard_active_v1():
+                lock_key = str(chain_lock_target_region_key)
+                deferred_refresh = [str(v) for v in refreshed_queue if str(v) != str(lock_key)]
+                if deferred_refresh:
+                    _enqueue_pending_regions(
+                        deferred_refresh,
+                        score_hint={str(k): float(v) for (k, v) in score_memory.items()},
+                    )
+                refreshed_queue = [str(lock_key)]
+                state["last_status"] = "target_commit_hard_lock"
             if refreshed_queue:
                 state["target_region_queue"] = list(refreshed_queue)
                 state["current_target_region_key"] = str(refreshed_queue[0])
                 state["target_region_scores"] = dict(score_memory)
                 state["target_sample_counts"] = dict(target_sample_counts)
                 state["target_required_samples"] = dict(target_required_samples)
+                _flush_pending_regions_to_state()
                 state["interaction_chain_active"] = bool(interaction_chain_active)
                 state["interaction_target_chain"] = list(interaction_target_chain[:16])
                 state["interaction_target_index"] = int(max(0, interaction_target_index))
@@ -6224,6 +6387,8 @@ class ActiveInferenceEFE(Agent):
                 state["target_miss_streak"] = 0
                 state["current_target_region_key"] = "NA"
                 state["target_region_queue"] = []
+                state["pending_region_queue"] = []
+                state["pending_region_scores"] = {}
                 state["target_region_scores"] = {}
                 state["target_sample_counts"] = dict(target_sample_counts)
                 state["target_required_samples"] = dict(target_required_samples)
