@@ -162,3 +162,47 @@
 1. “短窗口链路锁定 + secondary 去漂移”是正向改动，保留。
 2. 全屏 flash 过滤方案当前不是稳健改进，已回退。
 3. 现阶段主阻塞仍是“到过 `2:4` 后，`N` 步内未形成到 `4:1` 的稳定验证链”，且 `high_value_detour_priority / blocked_seek_chain_override` 仍偏高。
+
+## 9. 2026-02-24 增量实验记录（外循环探索 + 内循环利用）
+
+### 9.1 本次改动
+
+1. 在 `policy.select_action` 的简化管线中固定为四层顺序：
+   - `prepass_fixed_two_pass`（外循环全量覆盖）
+   - `high_info_reachable_max_diff`（覆盖后的高信息利用）
+   - `sequence_verify/seek`
+   - `fallback_argmin`
+2. 新增周期控制字段（仅诊断，不耦合具体区域）：
+   - `prepass_cycle_active`
+   - `prepass_cycle_step`
+   - `prepass_cycle_length`
+   - `prepass_exploit_window_steps`
+   - `prepass_cycle_total_steps`
+3. 采用“周期 prepass”机制：
+   - prepass 阶段按 deterministic serpentine 执行
+   - exploit 窗口中释放 high_info/sequence
+   - 全流程不写死任何具体 region 地址
+
+### 9.2 运行命令
+
+1. `OPERATION_MODE=offline ENVIRONMENTS_DIR=environment_files ACTIVE_INFERENCE_MAX_ACTIONS=500 uv run main.py --agent=activeinferenceefe --game=ls20 --tags=local,simple4layer_cycle500`
+
+### 9.3 关键结果（事实）
+
+1. 录制文件：
+   - `recordings/ls20-cb3b57cc.activeinferenceefe.80.4fb8dd98-bbf3-449d-82bf-e67e57855a84.recording.jsonl`
+2. trace 文件：
+   - `recordings/active_inference_traces/ls20-cb3b57cc.activeinferenceefe.1771908000.6be4a578b1c3.trace.jsonl`
+3. 总结果：
+   - `levels_completed=0`
+   - `resets=3`
+4. 选择层级命中统计（504 次决策）：
+   - `prepass_fixed_two_pass=308`
+   - `high_info_reachable_max_diff=15`
+   - `sequence=0`
+   - `fallback_argmin=175`
+
+### 9.4 结论
+
+1. 框架形态已落地为“探索外循环 + 利用内窗口”，执行顺序符合预期。
+2. 当前失败主因不是分支缺失，而是 exploit 窗口内 high_info/sequence 命中不足，fallback 仍过高。

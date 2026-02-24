@@ -4978,6 +4978,33 @@ class ActiveInferenceEFE(Agent):
             else:
                 queue = coupled_head + non_coupled
             max_targets = int(max(self.high_info_focus_max_targets, len(coupled_head)))
+            # Hard priority: when simultaneous reachable regions are present,
+            # force the highest-diff reachable region to the front.
+            reachable_diff_candidates = [
+                str(region_key)
+                for region_key in simultaneous_reachable_region_keys
+                if self._parse_region_key_v1(str(region_key)) is not None
+                and str(region_key) not in simultaneous_unreachable_set
+                and int(max(0, region_recent_change_pixels.get(str(region_key), 0))) > 0
+                and _reachable_or_frontier_region_v1(str(region_key))
+            ]
+            if reachable_diff_candidates:
+                reachable_diff_candidates.sort(
+                    key=lambda key: (
+                        -int(max(0, region_recent_change_pixels.get(str(key), 0))),
+                        -float(max(0.0, region_change_magnitude_effective.get(str(key), 0.0))),
+                        int(
+                            self._region_route_distance_v1(
+                                region_adjacency,
+                                start_region_key=str(anchor_region_key),
+                                goal_region_key=str(key),
+                            )
+                        ),
+                        str(key),
+                    )
+                )
+                forced_head = str(reachable_diff_candidates[0])
+                queue = [forced_head] + [str(v) for v in queue if str(v) != forced_head]
             if max_targets > 0:
                 queue = queue[:max_targets]
             return list(queue)
@@ -5648,6 +5675,54 @@ class ActiveInferenceEFE(Agent):
             else:
                 state["last_status"] = "priority_subqueue_completed"
 
+        reachable_diff_priority_active = False
+        reachable_diff_priority_key = "NA"
+        final_reachable_diff_candidates = [
+            str(region_key)
+            for region_key in simultaneous_reachable_region_keys
+            if self._parse_region_key_v1(str(region_key)) is not None
+            and str(region_key) not in simultaneous_unreachable_set
+            and int(max(0, region_recent_change_pixels.get(str(region_key), 0))) > 0
+            and _reachable_or_frontier_region_v1(str(region_key))
+        ]
+        if final_reachable_diff_candidates:
+            anchor_for_override = str(nav_region_key)
+            if self._parse_region_key_v1(anchor_for_override) is None:
+                anchor_for_override = str(source_region_key)
+            final_reachable_diff_candidates.sort(
+                key=lambda key: (
+                    -int(max(0, region_recent_change_pixels.get(str(key), 0))),
+                    -float(max(0.0, region_change_magnitude_effective.get(str(key), 0.0))),
+                    int(
+                        self._region_route_distance_v1(
+                            region_adjacency,
+                            start_region_key=str(anchor_for_override),
+                            goal_region_key=str(key),
+                        )
+                    ),
+                    str(key),
+                )
+            )
+            forced_final_key = str(final_reachable_diff_candidates[0])
+            reachable_diff_priority_active = True
+            reachable_diff_priority_key = str(forced_final_key)
+            if queue and str(queue[0]) != str(forced_final_key):
+                queue = [str(forced_final_key)] + [
+                    str(v) for v in queue if str(v) != str(forced_final_key)
+                ]
+                if (
+                    chain_lock_active
+                    and str(chain_lock_target_region_key) != str(forced_final_key)
+                ):
+                    _disable_chain_lock("reachable_diff_priority")
+                if interaction_chain_active and interaction_target_chain:
+                    for idx, chain_key in enumerate(interaction_target_chain):
+                        if str(chain_key) == str(forced_final_key):
+                            interaction_target_index = int(idx)
+                            break
+                    state["interaction_target_index"] = int(max(0, interaction_target_index))
+                state["last_status"] = "reachable_diff_priority_override"
+
         previous_target_region_key = str(state.get("current_target_region_key", "NA"))
         target_region_key = str(queue[0])
         target_miss_streak = int(max(0, state.get("target_miss_streak", 0)))
@@ -5687,6 +5762,7 @@ class ActiveInferenceEFE(Agent):
         miss_streak_limit = int(max(12, 2 * int(self.high_info_focus_window_steps)))
         if (
             (not chain_lock_active)
+            and (not reachable_diff_priority_active)
             and int(target_miss_streak) >= int(miss_streak_limit)
             and len(queue) > 1
         ):
@@ -5797,6 +5873,8 @@ class ActiveInferenceEFE(Agent):
         state["chain_lock_last_status"] = str(chain_lock_last_status)
         state["priority_subqueue_active"] = bool(priority_subqueue_active)
         state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
+        state["reachable_diff_priority_active"] = bool(reachable_diff_priority_active)
+        state["reachable_diff_priority_key"] = str(reachable_diff_priority_key)
         state["stage"] = "seek"
         opportunistic_target_key = "NA"
         nav_region_valid = self._parse_region_key_v1(str(nav_region_key)) is not None
@@ -5807,6 +5885,7 @@ class ActiveInferenceEFE(Agent):
             and str(nav_region_key) != str(target_region_key)
             and (not simultaneous_subcycle_active)
             and (not chain_lock_active)
+            and (not reachable_diff_priority_active)
         ):
             nav_required_samples = int(_required_samples(str(nav_region_key)))
             nav_sample_count = int(max(0, target_sample_counts.get(str(nav_region_key), 0)))

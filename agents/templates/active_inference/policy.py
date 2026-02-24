@@ -69,6 +69,7 @@ class ActiveInferencePolicyEvaluatorV1:
         sequence_causal_bonus_weight: float = 0.55,
         sequence_causal_penalty_weight: float = 0.35,
         hierarchy_weight_overrides: dict[str, dict[str, float]] | None = None,
+        simplified_selection_pipeline: bool = True,
     ) -> None:
         self.explore_steps = int(max(1, explore_steps))
         self.exploit_entropy_threshold = float(max(0.0, exploit_entropy_threshold))
@@ -150,6 +151,7 @@ class ActiveInferencePolicyEvaluatorV1:
         self.sequence_causal_bonus_weight = float(max(0.0, sequence_causal_bonus_weight))
         self.sequence_causal_penalty_weight = float(max(0.0, sequence_causal_penalty_weight))
         self.hierarchy_weight_overrides = hierarchy_weight_overrides or {}
+        self.simplified_selection_pipeline = bool(simplified_selection_pipeline)
 
     @staticmethod
     def _clamp01(value: float) -> float:
@@ -3371,6 +3373,498 @@ class ActiveInferencePolicyEvaluatorV1:
 
         return rollout_scores
 
+    def _select_action_simple_pipeline_v1(
+        self,
+        *,
+        packet: ObservationPacketV1,
+        entries: list[FreeEnergyLedgerEntryV1],
+        selection_score_by_candidate: dict[str, float],
+        selection_metric: str,
+        rollout_applied: bool,
+        rollout_skip_reason: str,
+        phase: str,
+        remaining_budget: int,
+        global_action_counter: int,
+        best_score: float,
+        second_score: float,
+        tie_group_size: int,
+        early_probe_budget_remaining: int,
+        no_change_streak: int,
+        stagnation_streak: int,
+        action_count_map: dict[int, int],
+        candidate_count_map: dict[str, int],
+        cluster_count_map: dict[str, int],
+        subcluster_count_map: dict[str, int],
+        cluster_id_by_candidate_id: dict[str, str],
+        subcluster_id_by_candidate_id: dict[str, str],
+    ) -> tuple[FreeEnergyLedgerEntryV1, dict[str, Any]]:
+        selected_entry = entries[0]
+        tie_breaker_rule_applied = "fallback_argmin"
+        high_info_focus_probe_applied = False
+        high_info_focus_probe_reason = "inactive"
+        high_info_focus_active_present = False
+        high_info_focus_priority_available = False
+        high_info_focus_hard_priority_available = False
+        high_info_focus_reachable_max_diff_region = "NA"
+        high_info_focus_target_region = "NA"
+        high_info_focus_status = "inactive"
+        high_info_focus_probe_candidates: list[dict[str, Any]] = []
+
+        sequence_causal_probe_applied = False
+        sequence_causal_probe_reason = "inactive"
+        sequence_causal_probe_candidates: list[dict[str, Any]] = []
+
+        fixed_two_pass_traversal_applied = False
+        fixed_two_pass_suppressed_by_high_info = False
+        coverage_region_probe_applied = False
+        coverage_sweep_active = False
+        coverage_sweep_reason = "inactive"
+        coverage_hard_prepass_active = False
+        coverage_prepass_goal_kind = "none"
+        coverage_prepass_goal_region = {"x": -1, "y": -1}
+        coverage_prepass_bfs_applied = False
+        coverage_prepass_bfs_next_region_key = "NA"
+
+        prepass_cycle_length = int(max(1, self._serpentine_prepass_length()))
+        prepass_exploit_window_steps = int(max(1, self.coverage_resweep_interval))
+        prepass_cycle_total_steps = int(
+            prepass_cycle_length + prepass_exploit_window_steps
+        )
+        prepass_cycle_step = int(global_action_counter) % int(prepass_cycle_total_steps)
+        prepass_stage_active = bool(prepass_cycle_step < prepass_cycle_length)
+        prepass_local_counter = int(prepass_cycle_step if prepass_stage_active else prepass_cycle_length)
+
+        fixed_prepass_entry, fixed_two_pass_traversal_v1 = (
+            self._select_fixed_two_pass_traversal_entry(
+                packet=packet,
+                entries=entries,
+                action_count_map=action_count_map,
+                global_action_counter=int(prepass_local_counter),
+            )
+        )
+        if not prepass_stage_active:
+            fixed_prepass_entry = None
+            fixed_two_pass_traversal_v1 = {
+                **dict(fixed_two_pass_traversal_v1),
+                "enabled": False,
+                "mode": "cycle_exploit_window",
+                "prepass_complete": True,
+                "global_action_counter": int(global_action_counter),
+            }
+        fixed_prepass_pending = bool(prepass_stage_active and fixed_prepass_entry is not None)
+        high_info_release_action_counter = int(self.high_info_focus_release_action_counter)
+        if high_info_release_action_counter < 0:
+            high_info_release_action_counter = int(self._serpentine_prepass_length())
+        high_info_prepass_gate_open = bool(
+            (not prepass_stage_active)
+            and (
+                (not self.high_info_focus_release_after_first_pass)
+                or int(global_action_counter) >= int(high_info_release_action_counter)
+                or (not fixed_prepass_pending)
+            )
+        )
+
+        high_info_rows: list[dict[str, Any]] = []
+        for entry in entries:
+            focus = self._candidate_high_info_focus_features(entry.candidate)
+            if not (bool(focus.get("enabled", False)) and bool(focus.get("active", False))):
+                continue
+            high_info_focus_active_present = True
+            score = float(
+                selection_score_by_candidate.get(
+                    entry.candidate.candidate_id,
+                    entry.total_efe,
+                )
+            )
+            row = {
+                "entry": entry,
+                "features": focus,
+                "score": score,
+            }
+            high_info_rows.append(row)
+            if (
+                bool(focus.get("verify_action_candidate", False))
+                or bool(focus.get("reaches_target_region", False))
+                or bool(focus.get("moves_toward_target_region", False))
+            ):
+                high_info_focus_priority_available = True
+
+        high_info_hard_rows = [
+            row
+            for row in high_info_rows
+            if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+            and bool(row["features"].get("target_is_reachable_simultaneous", False))
+            and not bool(row["features"].get("target_is_unreachable_simultaneous", False))
+            and int(max(0, row["features"].get("target_recent_change_pixels", 0))) > 0
+        ]
+        high_info_focus_hard_priority_available = bool(high_info_hard_rows)
+
+        if prepass_stage_active and fixed_prepass_entry is not None:
+            selected_entry = fixed_prepass_entry
+            fixed_two_pass_traversal_applied = True
+            coverage_region_probe_applied = True
+            coverage_sweep_active = True
+            coverage_hard_prepass_active = True
+            coverage_sweep_reason = "fixed_two_pass_prepass"
+            coverage_prepass_goal_kind = str(fixed_two_pass_traversal_v1.get("mode", "two_pass"))
+            coverage_prepass_bfs_applied = bool(
+                str(fixed_two_pass_traversal_v1.get("mode", "")) == "bfs_two_pass"
+            )
+            coverage_prepass_bfs_next_region_key = str(
+                fixed_two_pass_traversal_v1.get("next_region_key", "NA")
+            )
+            goal_region_key = str(fixed_two_pass_traversal_v1.get("goal_region_key", "NA"))
+            goal_parsed = self._parse_region_key(goal_region_key)
+            if goal_parsed is not None:
+                gx, gy = goal_parsed
+                coverage_prepass_goal_region = {"x": int(gx), "y": int(gy)}
+            tie_breaker_rule_applied = "prepass_fixed_two_pass"
+        elif high_info_hard_rows and high_info_prepass_gate_open:
+            high_info_hard_rows.sort(
+                key=lambda row: (
+                    -int(max(0, row["features"].get("target_recent_change_pixels", 0))),
+                    -float(max(0.0, row["features"].get("target_change_magnitude", 0.0))),
+                    -float(max(0.0, row["features"].get("target_change_delta", 0.0))),
+                    0 if bool(row["features"].get("reaches_target_region", False)) else 1,
+                    0 if bool(row["features"].get("moves_toward_target_region", False)) else 1,
+                    int(row["features"].get("distance_after", 10**6)),
+                    float(row["score"]),
+                    int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                    int(row["entry"].candidate.action_id),
+                    str(row["entry"].candidate.candidate_id),
+                )
+            )
+            selected_entry = high_info_hard_rows[0]["entry"]
+            high_info_focus_probe_applied = True
+            high_info_focus_probe_reason = "reachable_max_diff_priority"
+            high_info_focus_status = "reachable_max_diff_priority"
+            high_info_focus_reachable_max_diff_region = str(
+                high_info_hard_rows[0]["features"].get("target_region_key", "NA")
+            )
+            high_info_focus_target_region = str(high_info_focus_reachable_max_diff_region)
+            tie_breaker_rule_applied = "high_info_reachable_max_diff"
+        elif high_info_hard_rows and (not high_info_prepass_gate_open):
+            high_info_focus_probe_reason = "suppressed_by_prepass"
+            high_info_focus_status = "suppressed_by_prepass"
+
+        sequence_rows: list[dict[str, Any]] = []
+        if self.sequence_causal_term_enabled:
+            for entry in entries:
+                seq = self._candidate_sequence_causal_features(entry.candidate)
+                if not (bool(seq.get("enabled", False)) and bool(seq.get("active", False))):
+                    continue
+                score = float(
+                    selection_score_by_candidate.get(
+                        entry.candidate.candidate_id,
+                        entry.total_efe,
+                    )
+                )
+                sequence_rows.append(
+                    {
+                        "entry": entry,
+                        "features": seq,
+                        "score": score,
+                    }
+                )
+
+        if (not fixed_two_pass_traversal_applied) and (not high_info_focus_probe_applied) and sequence_rows:
+            verify_rows = [
+                row
+                for row in sequence_rows
+                if bool(row["features"].get("verify_action_candidate", False))
+            ]
+            seek_rows = [
+                row
+                for row in sequence_rows
+                if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                and (
+                    bool(row["features"].get("reaches_target", False))
+                    or bool(row["features"].get("advances_to_target", False))
+                )
+            ]
+            if verify_rows:
+                verify_rows.sort(
+                    key=lambda row: (
+                        -float(max(0.0, row["features"].get("bonus_hint", 0.0))),
+                        float(row["score"]),
+                        int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                        int(row["entry"].candidate.action_id),
+                        str(row["entry"].candidate.candidate_id),
+                    )
+                )
+                selected_entry = verify_rows[0]["entry"]
+                sequence_causal_probe_applied = True
+                sequence_causal_probe_reason = "verify_action_priority"
+                tie_breaker_rule_applied = "sequence_verify"
+            elif seek_rows:
+                seek_rows.sort(
+                    key=lambda row: (
+                        0 if bool(row["features"].get("reaches_target", False)) else 1,
+                        int(row["features"].get("predicted_distance_to_target", 10**6)),
+                        -float(max(0.0, row["features"].get("bonus_hint", 0.0))),
+                        float(row["score"]),
+                        int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                        int(row["entry"].candidate.action_id),
+                        str(row["entry"].candidate.candidate_id),
+                    )
+                )
+                selected_entry = seek_rows[0]["entry"]
+                sequence_causal_probe_applied = True
+                sequence_causal_probe_reason = "seek_target_priority"
+                tie_breaker_rule_applied = "sequence_seek"
+
+        if high_info_focus_probe_applied and fixed_prepass_pending:
+            fixed_two_pass_suppressed_by_high_info = True
+
+        if (
+            (not high_info_focus_probe_applied)
+            and (not sequence_causal_probe_applied)
+            and (not fixed_two_pass_traversal_applied)
+            and int(tie_group_size) > 1
+        ):
+            tie_candidates = [
+                entry
+                for entry in entries
+                if abs(
+                    float(
+                        selection_score_by_candidate.get(
+                            entry.candidate.candidate_id,
+                            entry.total_efe,
+                        )
+                    )
+                    - float(best_score)
+                )
+                <= float(self.tie_epsilon)
+            ]
+            if tie_candidates:
+                tie_candidates.sort(
+                    key=lambda entry: (
+                        int(action_count_map.get(int(entry.candidate.action_id), 0)),
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_action_visit_count",
+                                0,
+                            )
+                        ),
+                        int(
+                            self._candidate_transition_stats(entry.candidate).get(
+                                "state_visit_count",
+                                0,
+                            )
+                        ),
+                        float(
+                            selection_score_by_candidate.get(
+                                entry.candidate.candidate_id,
+                                entry.total_efe,
+                            )
+                        ),
+                        int(entry.candidate.action_id),
+                        str(entry.candidate.candidate_id),
+                    )
+                )
+                selected_entry = tie_candidates[0]
+                tie_breaker_rule_applied = "fallback_tie_least_used"
+
+        if (
+            not high_info_focus_probe_applied
+            and not sequence_causal_probe_applied
+            and not fixed_two_pass_traversal_applied
+            and str(tie_breaker_rule_applied) == "fallback_argmin"
+        ):
+            tie_breaker_rule_applied = "fallback_argmin"
+
+        for row in high_info_rows[:12]:
+            high_info_focus_probe_candidates.append(
+                {
+                    "candidate_id": str(row["entry"].candidate.candidate_id),
+                    "action_id": int(row["entry"].candidate.action_id),
+                    "score": float(row["score"]),
+                    "target_region_key": str(
+                        row["features"].get("target_region_key", "NA")
+                    ),
+                    "target_recent_change_pixels": int(
+                        max(0, row["features"].get("target_recent_change_pixels", 0))
+                    ),
+                    "target_is_reachable_simultaneous": bool(
+                        row["features"].get("target_is_reachable_simultaneous", False)
+                    ),
+                    "moves_toward_target_region": bool(
+                        row["features"].get("moves_toward_target_region", False)
+                    ),
+                    "reaches_target_region": bool(
+                        row["features"].get("reaches_target_region", False)
+                    ),
+                    "distance_after": int(row["features"].get("distance_after", 10**6)),
+                }
+            )
+
+        for row in sequence_rows[:12]:
+            sequence_causal_probe_candidates.append(
+                {
+                    "candidate_id": str(row["entry"].candidate.candidate_id),
+                    "action_id": int(row["entry"].candidate.action_id),
+                    "score": float(row["score"]),
+                    "stage": str(row["features"].get("stage", "idle")),
+                    "verify_action_candidate": bool(
+                        row["features"].get("verify_action_candidate", False)
+                    ),
+                    "advances_to_target": bool(
+                        row["features"].get("advances_to_target", False)
+                    ),
+                    "reaches_target": bool(
+                        row["features"].get("reaches_target", False)
+                    ),
+                    "predicted_distance_to_target": int(
+                        row["features"].get("predicted_distance_to_target", 10**6)
+                    ),
+                    "bonus_hint": float(max(0.0, row["features"].get("bonus_hint", 0.0))),
+                }
+            )
+
+        high_info_after_first_pass_gate_open = bool(
+            self.high_info_focus_release_after_first_pass
+            and high_info_focus_hard_priority_available
+            and bool(high_info_prepass_gate_open)
+            and not bool(fixed_prepass_pending)
+        )
+
+        selected_action_usage_count = int(
+            action_count_map.get(int(selected_entry.candidate.action_id), 0)
+        )
+        selected_cluster_id = str(
+            cluster_id_by_candidate_id.get(
+                str(selected_entry.candidate.candidate_id),
+                self._candidate_cluster_id(selected_entry.candidate),
+            )
+        )
+        selected_cluster_usage_count = int(cluster_count_map.get(selected_cluster_id, 0))
+        selected_subcluster_id = str(
+            subcluster_id_by_candidate_id.get(
+                str(selected_entry.candidate.candidate_id),
+                self._candidate_subcluster_id(selected_entry.candidate),
+            )
+        )
+        selected_subcluster_usage_count = int(
+            subcluster_count_map.get(selected_subcluster_id, 0)
+        )
+        selected_candidate_usage_count = int(
+            candidate_count_map.get(str(selected_entry.candidate.candidate_id), 0)
+        )
+        selected_transition_stats = self._candidate_transition_stats(selected_entry.candidate)
+
+        diagnostics: dict[str, Any] = {
+            "selection_metric": str(selection_metric),
+            "best_score": float(best_score),
+            "second_best_score": float(second_score),
+            "selected_score": float(
+                selection_score_by_candidate.get(
+                    selected_entry.candidate.candidate_id,
+                    selected_entry.total_efe,
+                )
+            ),
+            "best_vs_second_best_delta_total_efe": float(second_score - best_score),
+            "tie_group_size": int(tie_group_size),
+            "tie_epsilon": float(self.tie_epsilon),
+            "tie_breaker_rule_applied": str(tie_breaker_rule_applied),
+            "rollout_applied": bool(rollout_applied),
+            "rollout_skip_reason": str(rollout_skip_reason),
+            "rollout_max_candidates": int(self.rollout_max_candidates),
+            "rollout_only_in_exploit": bool(self.rollout_only_in_exploit),
+            "remaining_budget": int(remaining_budget),
+            "phase": str(phase),
+            "early_probe_budget_remaining": int(max(0, int(early_probe_budget_remaining))),
+            "early_probe_applied": False,
+            "least_tried_probe_applied": False,
+            "exploit_action6_bucket_probe_applied": False,
+            "near_tie_probe_applied": False,
+            "stagnation_streak": int(stagnation_streak),
+            "no_change_streak": int(no_change_streak),
+            "sequence_causal_term_enabled": bool(self.sequence_causal_term_enabled),
+            "high_info_focus_active_present": bool(high_info_focus_active_present),
+            "high_info_focus_priority_available": bool(high_info_focus_priority_available),
+            "high_info_focus_hard_priority_available": bool(
+                high_info_focus_hard_priority_available
+            ),
+            "high_info_after_first_pass_gate_open": bool(high_info_after_first_pass_gate_open),
+            "high_info_release_action_counter": int(high_info_release_action_counter),
+            "fixed_two_pass_suppressed_by_high_info": bool(
+                fixed_two_pass_suppressed_by_high_info
+            ),
+            "high_info_focus_probe_applied": bool(high_info_focus_probe_applied),
+            "high_info_focus_probe_reason": str(high_info_focus_probe_reason),
+            "high_info_focus_reachable_max_diff_region": str(
+                high_info_focus_reachable_max_diff_region
+            ),
+            "high_info_focus_queue_head": str(high_info_focus_reachable_max_diff_region),
+            "high_info_focus_target_region": str(high_info_focus_target_region),
+            "high_info_focus_status": str(high_info_focus_status),
+            "high_info_focus_probe_candidates": list(high_info_focus_probe_candidates),
+            "sequence_causal_probe_applied": bool(sequence_causal_probe_applied),
+            "sequence_causal_probe_reason": str(sequence_causal_probe_reason),
+            "sequence_causal_probe_candidates": list(sequence_causal_probe_candidates),
+            "coverage_region_probe_applied": bool(coverage_region_probe_applied),
+            "coverage_sweep_active": bool(coverage_sweep_active),
+            "coverage_sweep_reason": str(coverage_sweep_reason),
+            "coverage_known_region_count": int(
+                max(0, fixed_two_pass_traversal_v1.get("known_region_count", 0))
+            ),
+            "coverage_min_region_visit_count": int(
+                max(0, fixed_two_pass_traversal_v1.get("min_region_visit_count", 0))
+            ),
+            "coverage_regions_visited_at_least_twice": int(
+                max(0, fixed_two_pass_traversal_v1.get("regions_visited_at_least_target", 0))
+            ),
+            "coverage_target_region_count": int(self.coverage_sweep_target_regions),
+            "coverage_sweep_min_region_visits": int(self.coverage_sweep_min_region_visits),
+            "coverage_prepass_passes": int(self.coverage_prepass_passes),
+            "coverage_prepass_steps": int(self.coverage_prepass_steps),
+            "prepass_cycle_active": bool(prepass_stage_active),
+            "prepass_cycle_step": int(prepass_cycle_step),
+            "prepass_cycle_length": int(prepass_cycle_length),
+            "prepass_exploit_window_steps": int(prepass_exploit_window_steps),
+            "prepass_cycle_total_steps": int(prepass_cycle_total_steps),
+            "coverage_hard_prepass_active": bool(coverage_hard_prepass_active),
+            "coverage_prepass_goal_kind": str(coverage_prepass_goal_kind),
+            "coverage_prepass_goal_region": {
+                "x": int(coverage_prepass_goal_region.get("x", -1)),
+                "y": int(coverage_prepass_goal_region.get("y", -1)),
+            },
+            "coverage_prepass_bfs_applied": bool(coverage_prepass_bfs_applied),
+            "coverage_prepass_bfs_next_region_key": str(coverage_prepass_bfs_next_region_key),
+            "fixed_two_pass_traversal_applied": bool(fixed_two_pass_traversal_applied),
+            "fixed_two_pass_traversal_v1": dict(fixed_two_pass_traversal_v1),
+            "fixed_prepass_pending": bool(fixed_prepass_pending),
+            "direction_sequence_probe_applied": False,
+            "navigation_stagnation_probe_applied": False,
+            "action6_only_stagnation_probe_applied": False,
+            "selected_action_usage_count_before": int(selected_action_usage_count),
+            "selected_cluster_id": str(selected_cluster_id),
+            "selected_cluster_usage_count_before": int(selected_cluster_usage_count),
+            "selected_subcluster_id": str(selected_subcluster_id),
+            "selected_subcluster_usage_count_before": int(selected_subcluster_usage_count),
+            "selected_candidate_usage_count_before": int(selected_candidate_usage_count),
+            "selected_state_visit_count_before": int(
+                selected_transition_stats.get("state_visit_count", 0)
+            ),
+            "selected_state_action_visit_count_before": int(
+                selected_transition_stats.get("state_action_visit_count", 0)
+            ),
+            "selected_state_outgoing_edge_count_before": int(
+                selected_transition_stats.get("state_outgoing_edge_count", 0)
+            ),
+            "tie_probe_candidates": [],
+            "near_tie_probe_candidates": [],
+            "action6_only_probe_candidates": [],
+            "navigation_probe_candidates": [],
+            "direction_sequence_probe_candidates": [],
+            "coverage_region_probe_candidates": [],
+            "early_probe_candidates": [],
+            "navigation_actions_available": [int(v) for v in packet.available_actions if int(v) in (1, 2, 3, 4)],
+            "navigation_usage_gap": 0,
+            "navigation_stagnated": False,
+        }
+        return selected_entry, diagnostics
+
     def select_action(
         self,
         *,
@@ -3601,6 +4095,36 @@ class ActiveInferencePolicyEvaluatorV1:
         sequence_causal_probe_applied = False
         sequence_causal_probe_reason = "inactive"
         sequence_causal_probe_candidates: list[dict[str, Any]] = []
+
+        if self.simplified_selection_pipeline:
+            selected_entry, simplified_diagnostics = self._select_action_simple_pipeline_v1(
+                packet=packet,
+                entries=entries,
+                selection_score_by_candidate=selection_score_by_candidate,
+                selection_metric=str(selection_metric),
+                rollout_applied=bool(rollout_applied),
+                rollout_skip_reason=str(rollout_skip_reason),
+                phase=str(phase),
+                remaining_budget=int(remaining_budget),
+                global_action_counter=int(global_action_counter),
+                best_score=float(best_score),
+                second_score=float(second_score),
+                tie_group_size=int(tie_group_size),
+                early_probe_budget_remaining=int(early_probe_budget_remaining),
+                no_change_streak=int(no_change_streak),
+                stagnation_streak=int(stagnation_streak),
+                action_count_map=action_count_map,
+                candidate_count_map=candidate_count_map,
+                cluster_count_map=cluster_count_map,
+                subcluster_count_map=subcluster_count_map,
+                cluster_id_by_candidate_id=cluster_id_by_candidate_id,
+                subcluster_id_by_candidate_id=subcluster_id_by_candidate_id,
+            )
+            if selected_entry is not entries[0]:
+                entries.remove(selected_entry)
+                entries.insert(0, selected_entry)
+            entries[0].witness["selection_diagnostics_v1"] = dict(simplified_diagnostics)
+            return entries[0].candidate, entries
 
         fixed_prepass_entry, fixed_two_pass_traversal_v1 = (
             self._select_fixed_two_pass_traversal_entry(
