@@ -15,6 +15,8 @@
 2. 禁止游戏耦合写死，优先做可泛化、可审计机制。
 3. 每次无效运行都要回到日志与代码机制层定位根因。
 4. 版本管理要完整：关键改动要提交，能追溯“改了什么、为何改、效果如何”。
+5. 硬约束：源码中禁止写死任何具体 region 地址（如 `"4:2"` / `"1:4"`）。
+6. region 表示统一为 `row:col`（行:列），不再使用 `line` 别名。
 
 ### 2.2 探索流程要求
 
@@ -101,6 +103,7 @@
 3. 负优化实验可以在工作区尝试，但不进入基线 commit。
 4. 保留“成功样本 trace + 最新失败样本 trace”作为对照对。
 5. 合并前至少做一次 A/B 对比，关注：`levels_completed`、链路命中率、循环占比。
+6. 提交前必须运行：`python tools/check_no_hardcoded_region_keys.py`，若检测到字面量 region 地址则禁止提交。
 
 ## 7. 下阶段待办（按优先级）
 
@@ -109,3 +112,52 @@
 3. 增加链路指标：`trigger->verify` 在 N 步窗口的成功率与复现次数。
 4. 将该指标写入 `selection_diagnostics_v1`，作为提交门槛的一部分。
 
+## 8. 2026-02-22 增量实验记录（本次会话）
+
+### 8.1 改动项（解耦机制）
+
+1. 新增“短窗口链路锁定”状态（仅在 `interaction_chain_active` 生效）：
+   - 状态字段：`chain_lock_active/target/steps/window/miss_limit/status`
+   - 透传到 `high_info_focus_state_v1` 与 `high_info_focus_features_v1`
+2. 在 `policy` 高信息选择器中加入 `chain_lock_window_priority`：
+   - 锁定窗口内优先选择“到达/靠近锁定目标”的导航候选
+   - 保留原有 fallback（seek/value/blocked revalidation）不写死对象标签
+3. 动态耦合对去漂移（secondary 选择）：
+   - 对“低结构证据 + 低亲和 + 低语义锚点”的 secondary 区域增加惩罚
+   - 提高 secondary 入选阈值（从 `0.08` 到 `0.16`）
+4. 负优化试验已回退：
+   - “非进度全屏 flash 强过滤”在 v3 引入副作用，已撤销，不进入基线
+
+### 8.2 运行命令
+
+1. 基线对照（长跑）  
+   `ACTIVE_INFERENCE_MAX_ACTIONS=3000 ... --tags=local,chain_lock_v1_3000_silent`
+2. v2（去漂移后）  
+   `ACTIVE_INFERENCE_MAX_ACTIONS=1200 ... --tags=local,chain_lock_v2_1200`
+3. v3（全屏 flash 过滤试验，负优化，已回退）  
+   `ACTIVE_INFERENCE_MAX_ACTIONS=1200 ... --tags=local,chain_lock_v3_1200`
+4. 回退后快测  
+   `ACTIVE_INFERENCE_MAX_ACTIONS=300 ... --tags=local,chain_lock_v2b_300`
+
+### 8.3 关键结果（事实）
+
+1. `v1_3000`（trace: `1771765821.a99946967888`）
+   - `max_level=0`
+   - `gate_top` 主要漂移到 `3:5`（`1517` 次）
+   - `target_top` 中 `3:5` 高占比（`559`），`4:1` 命中仅 `3`
+2. `v2_1200`（trace: `1771766654.f59dddbd7801`）
+   - `max_level=0`
+   - `cross_top` 稳定到 `2:4`（`994`），`gate_top` 稳定到 `4:1`（`936`）
+   - `3:5` 从主 gate 漂移位显著下降（`target_top: 49`）
+3. `v3_1200`（trace: `1771767020.53006026904f`，已回退）
+   - `max_level=0`
+   - `blocked_seek_chain_override` 抬升，`chain_lock_window_priority` 下降
+   - 目标过度偏到 `4:1`，链路往返能力变差
+4. 回退后 `v2b_300`（trace: `1771767253.4fda0127f799`）
+   - `cross_top: 4:1`、`gate_top: 2:4`，与 v2 的“去漂移”方向一致
+
+### 8.4 当前结论
+
+1. “短窗口链路锁定 + secondary 去漂移”是正向改动，保留。
+2. 全屏 flash 过滤方案当前不是稳健改进，已回退。
+3. 现阶段主阻塞仍是“到过 `2:4` 后，`N` 步内未形成到 `4:1` 的稳定验证链”，且 `high_value_detour_priority / blocked_seek_chain_override` 仍偏高。

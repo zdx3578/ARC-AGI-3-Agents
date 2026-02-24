@@ -258,12 +258,12 @@ class ActiveInferenceEFE(Agent):
             ),
         )
         self.sequence_causal_trigger_region_key = str(
-            os.getenv("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TRIGGER_REGION", "2:4").strip()
-            or "2:4"
+            os.getenv("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TRIGGER_REGION", "NA").strip()
+            or "NA"
         )
         self.sequence_causal_target_region_key = str(
-            os.getenv("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TARGET_REGION", "4:1").strip()
-            or "4:1"
+            os.getenv("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TARGET_REGION", "NA").strip()
+            or "NA"
         )
         self.high_info_focus_window_steps = max(
             4,
@@ -945,7 +945,10 @@ class ActiveInferenceEFE(Agent):
                     "label": str(label),
                     "kind": str(kind),
                     "digest": str(digest),
-                    "region_key": f"{int(max(0, min(7, int(x) // 8)))}:{int(max(0, min(7, int(y) // 8)))}",
+                    "region_key": self._region_key_from_xy_v1(
+                        int(max(0, min(7, int(x) // 8))),
+                        int(max(0, min(7, int(y) // 8))),
+                    ),
                     "patch_context_v1": self._patch_context_v1(
                         packet.frame,
                         x=int(x),
@@ -1646,14 +1649,23 @@ class ActiveInferenceEFE(Agent):
     @staticmethod
     def _parse_region_key_v1(region_key: str) -> tuple[int, int] | None:
         try:
-            sx, sy = str(region_key).split(":", 1)
-            rx = int(sx)
-            ry = int(sy)
+            srow, scol = str(region_key).split(":", 1)
+            row = int(srow)
+            col = int(scol)
         except Exception:
             return None
-        if rx < 0 or ry < 0:
+        if row < 0 or col < 0:
             return None
-        return (int(rx), int(ry))
+        # Region keys are stored as row:col. Internal geometry keeps (x, y)=(col, row).
+        return (int(col), int(row))
+
+    @staticmethod
+    def _region_key_from_xy_v1(region_x: int, region_y: int) -> str:
+        col = int(region_x)
+        row = int(region_y)
+        if col < 0 or row < 0:
+            return "NA"
+        return f"{int(row)}:{int(col)}"
 
     @classmethod
     def _region_key_from_region_payload_v1(
@@ -1666,7 +1678,7 @@ class ActiveInferenceEFE(Agent):
         ry = int(payload.get("y", -1))
         if rx < 0 or ry < 0:
             return "NA"
-        region_key = f"{int(rx)}:{int(ry)}"
+        region_key = cls._region_key_from_xy_v1(int(rx), int(ry))
         return str(region_key) if cls._parse_region_key_v1(region_key) is not None else "NA"
 
     def _high_info_coupled_regions_v1(
@@ -1692,7 +1704,10 @@ class ActiveInferenceEFE(Agent):
                 y = int(row.get("y", -1))
                 if x < 0 or y < 0:
                     continue
-                region_key = f"{int(max(0, min(7, x // 8)))}:{int(max(0, min(7, y // 8)))}"
+                region_key = self._region_key_from_xy_v1(
+                    int(max(0, min(7, x // 8))),
+                    int(max(0, min(7, y // 8))),
+                )
                 if self._parse_region_key_v1(region_key) is None:
                     continue
                 hint = float(max(0.0, row.get("target_priority", row.get("salience", 0.0))))
@@ -1807,7 +1822,7 @@ class ActiveInferenceEFE(Agent):
                 ny = int(ry + dy)
                 if nx < 0 or ny < 0 or nx > 7 or ny > 7:
                     continue
-                frontier_keys.add(f"{int(nx)}:{int(ny)}")
+                frontier_keys.add(self._region_key_from_xy_v1(int(nx), int(ny)))
         if self._parse_region_key_v1(str(fallback_key)) is not None:
             frontier_keys.add(str(fallback_key))
 
@@ -2284,7 +2299,7 @@ class ActiveInferenceEFE(Agent):
                     continue
                 rx = int(max(0, min(7, int(x) // 8)))
                 ry = int(max(0, min(7, int(y) // 8)))
-                region_key = f"{int(rx)}:{int(ry)}"
+                region_key = self._region_key_from_xy_v1(int(rx), int(ry))
                 diff_counts[str(region_key)] = int(diff_counts.get(str(region_key), 0) + 1)
         rows = sorted(diff_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))
         if int(max_regions) > 0:
@@ -2442,10 +2457,10 @@ class ActiveInferenceEFE(Agent):
             rx = int(region.get("x", -1))
             ry = int(region.get("y", -1))
             if rx >= 0 and ry >= 0:
-                latest_key = f"{int(rx)}:{int(ry)}"
+                latest_key = self._region_key_from_xy_v1(int(rx), int(ry))
                 if self._last_known_agent_pos_region is not None:
                     last_rx, last_ry = self._last_known_agent_pos_region
-                    last_key = f"{int(last_rx)}:{int(last_ry)}"
+                    last_key = self._region_key_from_xy_v1(int(last_rx), int(last_ry))
                     if not self._region_step_plausible_v1(
                         str(last_key),
                         str(latest_key),
@@ -2453,7 +2468,7 @@ class ActiveInferenceEFE(Agent):
                     ):
                         if self._latest_observed_agent_pos_region is not None:
                             orx, ory = self._latest_observed_agent_pos_region
-                            observed_key = f"{int(orx)}:{int(ory)}"
+                            observed_key = self._region_key_from_xy_v1(int(orx), int(ory))
                             if self._region_step_plausible_v1(
                                 str(last_key),
                                 str(observed_key),
@@ -2464,10 +2479,10 @@ class ActiveInferenceEFE(Agent):
                 return str(latest_key)
         if self._latest_observed_agent_pos_region is not None:
             rx, ry = self._latest_observed_agent_pos_region
-            return f"{int(rx)}:{int(ry)}"
+            return self._region_key_from_xy_v1(int(rx), int(ry))
         if self._last_known_agent_pos_region is not None:
             rx, ry = self._last_known_agent_pos_region
-            return f"{int(rx)}:{int(ry)}"
+            return self._region_key_from_xy_v1(int(rx), int(ry))
         return "NA"
 
     def _update_observed_agent_region_from_representation_v1(
@@ -2558,18 +2573,18 @@ class ActiveInferenceEFE(Agent):
             "schema_name": "active_inference_sequence_causal_state_v1",
             "schema_version": 1,
             "enabled": bool(state.get("enabled", False)),
-            "trigger_region_key": str(state.get("trigger_region_key", "2:4")),
-            "target_region_key": str(state.get("target_region_key", "4:1")),
+            "trigger_region_key": str(state.get("trigger_region_key", "NA")),
+            "target_region_key": str(state.get("target_region_key", "NA")),
             "trigger_region_key_effective": str(
                 state.get(
                     "trigger_region_key_effective",
-                    state.get("trigger_region_key", "2:4"),
+                    state.get("trigger_region_key", "NA"),
                 )
             ),
             "target_region_key_effective": str(
                 state.get(
                     "target_region_key_effective",
-                    state.get("target_region_key", "4:1"),
+                    state.get("target_region_key", "NA"),
                 )
             ),
             "window_steps": int(state.get("window_steps", 0)),
@@ -3574,13 +3589,13 @@ class ActiveInferenceEFE(Agent):
         trigger_region_key = str(
             state.get(
                 "trigger_region_key_effective",
-                state.get("trigger_region_key", "2:4"),
+                state.get("trigger_region_key", "NA"),
             )
         )
         target_region_key = str(
             state.get(
                 "target_region_key_effective",
-                state.get("target_region_key", "4:1"),
+                state.get("target_region_key", "NA"),
             )
         )
         current_region_key = self._current_region_key_v1()
@@ -3720,8 +3735,8 @@ class ActiveInferenceEFE(Agent):
                 state["steps_remaining"] = 0
                 state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
                 state["last_status"] = "seek_timeout"
-        trigger_region_key = str(state.get("trigger_region_key", "2:4"))
-        target_region_key = str(state.get("target_region_key", "4:1"))
+        trigger_region_key = str(state.get("trigger_region_key", "NA"))
+        target_region_key = str(state.get("target_region_key", "NA"))
         source_region_key = "NA"
         if transition_record is not None:
             action_context = transition_record.action_context
@@ -3733,7 +3748,7 @@ class ActiveInferenceEFE(Agent):
             nav_rx = int(nav_region.get("x", -1))
             nav_ry = int(nav_region.get("y", -1))
             if nav_rx >= 0 and nav_ry >= 0:
-                nav_region_key = f"{nav_rx}:{nav_ry}"
+                nav_region_key = self._region_key_from_xy_v1(int(nav_rx), int(nav_ry))
 
         coupled_info = self._high_info_coupled_regions_v1(
             fallback_source_region_key=str(source_region_key),
@@ -4125,7 +4140,7 @@ class ActiveInferenceEFE(Agent):
                 ny = int(ry + dy)
                 if nx < 0 or ny < 0 or nx > 7 or ny > 7:
                     continue
-                reachable_or_frontier_set.add(f"{int(nx)}:{int(ny)}")
+                reachable_or_frontier_set.add(self._region_key_from_xy_v1(int(nx), int(ny)))
         if self._parse_region_key_v1(str(source_region_key)) is not None:
             reachable_or_frontier_set.add(str(source_region_key))
         if self._parse_region_key_v1(str(nav_region_key)) is not None:
@@ -4758,7 +4773,7 @@ class ActiveInferenceEFE(Agent):
                     bbox_bonus = float(min(0.22, float(changed_pixels) / 1024.0))
                     for ry in range(min_ry, max_ry + 1):
                         for rx in range(min_rx, max_rx + 1):
-                            key = f"{int(rx)}:{int(ry)}"
+                            key = self._region_key_from_xy_v1(int(rx), int(ry))
                             if not _reachable_or_frontier_region_v1(str(key)):
                                 continue
                             row_bias = 0.06 if int(ry) <= 2 else 0.0
@@ -6286,7 +6301,7 @@ class ActiveInferenceEFE(Agent):
         if isinstance(cross_target, dict):
             cross_rx = int(max(0, min(7, int(cross_target.get("centroid_x", -1)) // 8)))
             cross_ry = int(max(0, min(7, int(cross_target.get("centroid_y", -1)) // 8)))
-            cross_region_key = f"{cross_rx}:{cross_ry}"
+            cross_region_key = self._region_key_from_xy_v1(int(cross_rx), int(cross_ry))
             cross_like_enabled = True
             cross_like_target_region = {"x": int(cross_rx), "y": int(cross_ry)}
             cross_like_target_region_visit_count = int(
@@ -6303,7 +6318,7 @@ class ActiveInferenceEFE(Agent):
         if isinstance(gate_target, dict):
             gate_rx = int(max(0, min(7, int(gate_target.get("centroid_x", -1)) // 8)))
             gate_ry = int(max(0, min(7, int(gate_target.get("centroid_y", -1)) // 8)))
-            gate_region_key = f"{gate_rx}:{gate_ry}"
+            gate_region_key = self._region_key_from_xy_v1(int(gate_rx), int(gate_ry))
             gate_like_enabled = True
             gate_like_target_region = {"x": int(gate_rx), "y": int(gate_ry)}
             gate_like_target_region_visit_count = int(
@@ -6377,7 +6392,7 @@ class ActiveInferenceEFE(Agent):
         current_region_key = "NA"
         if self._last_known_agent_pos_region is not None:
             rx, ry = self._last_known_agent_pos_region
-            current_region_key = f"{int(rx)}:{int(ry)}"
+            current_region_key = self._region_key_from_xy_v1(int(rx), int(ry))
 
         edges: list[dict[str, Any]] = []
         for region_action_key, target_histogram in self._region_action_transition_counts.items():
@@ -6417,11 +6432,14 @@ class ActiveInferenceEFE(Agent):
             parsed = self._parse_region_key_v1(str(region_key))
             if parsed is None:
                 continue
-            known_region_keys.add(f"{int(parsed[0])}:{int(parsed[1])}")
+            known_region_keys.add(self._region_key_from_xy_v1(int(parsed[0]), int(parsed[1])))
         parsed_current_region = self._parse_region_key_v1(str(current_region_key))
         if parsed_current_region is not None:
             known_region_keys.add(
-                f"{int(parsed_current_region[0])}:{int(parsed_current_region[1])}"
+                self._region_key_from_xy_v1(
+                    int(parsed_current_region[0]),
+                    int(parsed_current_region[1]),
+                )
             )
         for region_action_key in self._region_action_transition_counts.keys():
             try:
@@ -6431,7 +6449,7 @@ class ActiveInferenceEFE(Agent):
             parsed = self._parse_region_key_v1(str(source_region_key))
             if parsed is None:
                 continue
-            known_region_keys.add(f"{int(parsed[0])}:{int(parsed[1])}")
+            known_region_keys.add(self._region_key_from_xy_v1(int(parsed[0]), int(parsed[1])))
         for edge_key in self._edge_attempt_counts.keys():
             edge_token = str(edge_key)
             if not edge_token.startswith("region=") or "|action=" not in edge_token:
@@ -6441,7 +6459,7 @@ class ActiveInferenceEFE(Agent):
             parsed = self._parse_region_key_v1(str(region_key))
             if parsed is None:
                 continue
-            known_region_keys.add(f"{int(parsed[0])}:{int(parsed[1])}")
+            known_region_keys.add(self._region_key_from_xy_v1(int(parsed[0]), int(parsed[1])))
 
         activity_edges: list[dict[str, Any]] = []
         activity_status_histogram: dict[str, int] = {}
@@ -6641,7 +6659,10 @@ class ActiveInferenceEFE(Agent):
             payload["scope"] = "global+navigate_local"
             payload["tracked_token_before"] = str(tracked_token_before or "NA")
             payload["action_region_before"] = (
-                f"{self._last_known_agent_pos_region[0]}:{self._last_known_agent_pos_region[1]}"
+                self._region_key_from_xy_v1(
+                    int(self._last_known_agent_pos_region[0]),
+                    int(self._last_known_agent_pos_region[1]),
+                )
                 if self._last_known_agent_pos_region is not None
                 else "NA"
             )
@@ -7018,7 +7039,7 @@ class ActiveInferenceEFE(Agent):
         coarse_x = int(feature.get("coarse_region_x", -1))
         coarse_y = int(feature.get("coarse_region_y", -1))
         return (
-            f"hit={hit}|boundary={boundary}|dist={dist_bucket}|region={coarse_x}:{coarse_y}"
+            f"hit={hit}|boundary={boundary}|dist={dist_bucket}|region={coarse_y}:{coarse_x}"
         )
 
     def _candidate_cluster_id(self, candidate: ActionCandidateV1 | None) -> str:
@@ -7066,9 +7087,9 @@ class ActiveInferenceEFE(Agent):
         revisit_count_current = 0
         if self._last_known_agent_pos_region is not None:
             rx, ry = self._last_known_agent_pos_region
-            region_key = f"{rx}:{ry}"
+            region_key = self._region_key_from_xy_v1(int(rx), int(ry))
             revisit_count_current = int(self._region_visit_counts.get(region_key, 0))
-            edge_key = f"region={rx}:{ry}|action={int(action_id)}"
+            edge_key = f"region={str(region_key)}|action={int(action_id)}"
             edge_attempts = int(self._edge_attempt_counts.get(edge_key, 0))
             edge_blocked = int(self._blocked_edge_counts.get(edge_key, 0))
             edge_blocked_rate = float(edge_blocked / float(max(1, edge_attempts)))
@@ -7176,7 +7197,7 @@ class ActiveInferenceEFE(Agent):
 
         current_rx, current_ry = current_region
         payload["current_region"] = {"x": int(current_rx), "y": int(current_ry)}
-        current_region_key = f"{current_rx}:{current_ry}"
+        current_region_key = self._region_key_from_xy_v1(int(current_rx), int(current_ry))
         payload["current_region_key"] = str(current_region_key)
         payload["current_region_visit_count"] = int(
             self._region_visit_counts.get(current_region_key, 0)
@@ -7229,11 +7250,10 @@ class ActiveInferenceEFE(Agent):
                 payload["empirical_transition_confidence"] = float(
                     max(0.0, min(1.0, confidence))
                 )
-                try:
-                    target_rx_raw, target_ry_raw = str(empirical_target_key).split(":", 1)
-                    target_rx = int(target_rx_raw)
-                    target_ry = int(target_ry_raw)
-                except Exception:
+                parsed_target = self._parse_region_key_v1(str(empirical_target_key))
+                if parsed_target is not None:
+                    target_rx, target_ry = int(parsed_target[0]), int(parsed_target[1])
+                else:
                     target_rx = -1
                     target_ry = -1
                 payload["empirical_transition_target"] = {
@@ -7260,11 +7280,10 @@ class ActiveInferenceEFE(Agent):
                         frontier_count = int(candidate_count)
                         frontier_visit = int(candidate_visit)
                 if frontier_key != "NA":
-                    try:
-                        frontier_rx_raw, frontier_ry_raw = str(frontier_key).split(":", 1)
-                        frontier_rx = int(frontier_rx_raw)
-                        frontier_ry = int(frontier_ry_raw)
-                    except Exception:
+                    parsed_frontier = self._parse_region_key_v1(str(frontier_key))
+                    if parsed_frontier is not None:
+                        frontier_rx, frontier_ry = int(parsed_frontier[0]), int(parsed_frontier[1])
+                    else:
                         frontier_rx = -1
                         frontier_ry = -1
                     payload["empirical_transition_frontier_key"] = str(frontier_key)
@@ -7327,7 +7346,7 @@ class ActiveInferenceEFE(Agent):
             and empirical_target_ry >= 0
         ):
             payload["predicted_region_source"] = "posterior_expected_delta"
-        predicted_region_key = f"{predicted_rx}:{predicted_ry}"
+        predicted_region_key = self._region_key_from_xy_v1(int(predicted_rx), int(predicted_ry))
         payload["predicted_region"] = {"x": int(predicted_rx), "y": int(predicted_ry)}
         payload["predicted_region_key"] = str(predicted_region_key)
         payload["predicted_region_visit_count"] = int(
@@ -7345,7 +7364,7 @@ class ActiveInferenceEFE(Agent):
         payload["confidence"] = float(
             max(0.0, min(1.0, max(float(dominant_prob), float(empirical_confidence))))
         )
-        edge_key = f"region={current_rx}:{current_ry}|action={int(action_id)}"
+        edge_key = f"region={str(current_region_key)}|action={int(action_id)}"
         edge_attempts = int(self._edge_attempt_counts.get(edge_key, 0))
         edge_blocked = int(self._blocked_edge_counts.get(edge_key, 0))
         payload["edge_attempts"] = int(edge_attempts)
@@ -7435,7 +7454,7 @@ class ActiveInferenceEFE(Agent):
                 and self._last_known_agent_pos_region is not None
             ):
                 rx, ry = self._last_known_agent_pos_region
-                edge_source_region_key = f"{rx}:{ry}"
+                edge_source_region_key = self._region_key_from_xy_v1(int(rx), int(ry))
             if self._parse_region_key_v1(str(edge_source_region_key)) is not None:
                 edge_key = f"region={str(edge_source_region_key)}|action={action_id}"
                 self._edge_attempt_counts[edge_key] = int(
@@ -7509,7 +7528,7 @@ class ActiveInferenceEFE(Agent):
                     rx = int(region.get("x", -1))
                     ry = int(region.get("y", -1))
                     if rx >= 0 and ry >= 0:
-                        target_region_key = f"{rx}:{ry}"
+                        target_region_key = self._region_key_from_xy_v1(int(rx), int(ry))
                         plausible_transition = True
                         if self._parse_region_key_v1(str(edge_source_region_key)) is not None:
                             plausible_transition = bool(

@@ -182,14 +182,23 @@ class ActiveInferencePolicyEvaluatorV1:
     @staticmethod
     def _parse_region_key(region_key: str) -> tuple[int, int] | None:
         try:
-            sx, sy = str(region_key).split(":", 1)
-            rx = int(sx)
-            ry = int(sy)
+            srow, scol = str(region_key).split(":", 1)
+            row = int(srow)
+            col = int(scol)
         except Exception:
             return None
-        if rx < 0 or ry < 0:
+        if row < 0 or col < 0:
             return None
-        return (int(rx), int(ry))
+        # Region keys are stored as row:col. Internal geometry keeps (x, y)=(col, row).
+        return (int(col), int(row))
+
+    @staticmethod
+    def _region_key_from_xy(region_x: int, region_y: int) -> str:
+        col = int(region_x)
+        row = int(region_y)
+        if col < 0 or row < 0:
+            return "NA"
+        return f"{int(row)}:{int(col)}"
 
     @classmethod
     def _region_distance_from_keys(
@@ -837,7 +846,7 @@ class ActiveInferencePolicyEvaluatorV1:
         cross_rx = int(cross_region.get("x", -1))
         cross_ry = int(cross_region.get("y", -1))
         cross_region_key = (
-            f"{cross_rx}:{cross_ry}"
+            self._region_key_from_xy(int(cross_rx), int(cross_ry))
             if cross_rx >= 0 and cross_ry >= 0
             else "NA"
         )
@@ -2505,8 +2514,8 @@ class ActiveInferencePolicyEvaluatorV1:
             "enabled": bool(raw.get("enabled", False)),
             "active": bool(raw.get("active", False)),
             "stage": str(raw.get("stage", "idle")),
-            "trigger_region_key": str(raw.get("trigger_region_key", "2:4")),
-            "target_region_key": str(raw.get("target_region_key", "4:1")),
+            "trigger_region_key": str(raw.get("trigger_region_key", "NA")),
+            "target_region_key": str(raw.get("target_region_key", "NA")),
             "current_region_key": str(raw.get("current_region_key", "NA")),
             "predicted_region_key": str(raw.get("predicted_region_key", "NA")),
             "steps_remaining": int(max(0, raw.get("steps_remaining", 0))),
@@ -4062,7 +4071,7 @@ class ActiveInferencePolicyEvaluatorV1:
                         cross_rx = int(cross_region.get("x", -1))
                         cross_ry = int(cross_region.get("y", -1))
                         cross_region_key = (
-                            f"{cross_rx}:{cross_ry}"
+                            self._region_key_from_xy(int(cross_rx), int(cross_ry))
                             if cross_rx >= 0 and cross_ry >= 0
                             else "NA"
                         )
