@@ -4439,6 +4439,10 @@ class ActiveInferenceEFE(Agent):
                 and int(changed_pixels) < int(self.high_info_simultaneous_min_total_pixels)
             ):
                 should_trigger = False
+        if should_trigger and bool(state.get("active", False)) and bool(target_commit_active):
+            # Commit window: keep the current high-value target fixed.
+            # New evidence is still collected into the queue via region-change bookkeeping.
+            should_trigger = False
 
         simultaneous_info = self._simultaneous_changed_region_info_v1(
             transition_record=transition_record,
