@@ -276,9 +276,20 @@ class ActiveInferenceEFE(Agent):
                 max(3, int(self.high_info_focus_window_steps // 3)),
             ),
         )
+        self.high_info_target_commit_window_steps = max(
+            2,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_TARGET_COMMIT_WINDOW_STEPS", 10),
+        )
         self.high_info_chain_lock_miss_limit = max(
             1,
             _env_int("ACTIVE_INFERENCE_HIGH_INFO_CHAIN_LOCK_MISS_LIMIT", 3),
+        )
+        self.high_info_target_commit_miss_limit = max(
+            1,
+            _env_int(
+                "ACTIVE_INFERENCE_HIGH_INFO_TARGET_COMMIT_MISS_LIMIT",
+                max(4, int(self.high_info_target_commit_window_steps)),
+            ),
         )
         self.high_info_focus_max_targets = max(
             1,
@@ -618,6 +629,9 @@ class ActiveInferenceEFE(Agent):
             "chain_lock_steps_remaining": 0,
             "chain_lock_target_region_key": "NA",
             "chain_lock_miss_limit": int(self.high_info_chain_lock_miss_limit),
+            "target_commit_active": False,
+            "target_commit_window_steps": int(self.high_info_target_commit_window_steps),
+            "target_commit_miss_limit": int(self.high_info_target_commit_miss_limit),
             "chain_lock_last_status": "idle",
             "interaction_chain_active": False,
             "interaction_chain_generation": 0,
@@ -2781,6 +2795,25 @@ class ActiveInferenceEFE(Agent):
                 state.get("chain_lock_target_region_key", "NA")
             ),
             "chain_lock_miss_limit": int(max(1, state.get("chain_lock_miss_limit", 1))),
+            "target_commit_active": bool(state.get("target_commit_active", False)),
+            "target_commit_window_steps": int(
+                max(
+                    1,
+                    state.get(
+                        "target_commit_window_steps",
+                        self.high_info_target_commit_window_steps,
+                    ),
+                )
+            ),
+            "target_commit_miss_limit": int(
+                max(
+                    1,
+                    state.get(
+                        "target_commit_miss_limit",
+                        self.high_info_target_commit_miss_limit,
+                    ),
+                )
+            ),
             "chain_lock_last_status": str(state.get("chain_lock_last_status", "idle")),
             "interaction_chain_active": bool(state.get("interaction_chain_active", False)),
             "interaction_chain_generation": int(
@@ -3427,9 +3460,9 @@ class ActiveInferenceEFE(Agent):
             max(1, state.get("chain_lock_window_steps", self.high_info_chain_lock_window_steps))
         )
         chain_lock_steps_remaining = int(max(0, state.get("chain_lock_steps_remaining", 0)))
+        target_commit_active = bool(state.get("target_commit_active", False))
         chain_lock_active = bool(
             state.get("chain_lock_active", False)
-            and interaction_chain_active
             and bool(state.get("active", False))
             and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
             and chain_lock_steps_remaining > 0
@@ -3575,6 +3608,7 @@ class ActiveInferenceEFE(Agent):
             "chain_lock_steps_remaining": int(chain_lock_steps_remaining),
             "chain_lock_target_region_key": str(chain_lock_target_region_key),
             "chain_lock_target_match": bool(chain_lock_target_match),
+            "target_commit_active": bool(target_commit_active),
             "bonus_hint": float(max(0.0, bonus_hint)),
             "penalty_hint": float(max(0.0, penalty_hint)),
         }
@@ -3891,6 +3925,9 @@ class ActiveInferenceEFE(Agent):
             state["chain_lock_steps_remaining"] = 0
             state["chain_lock_target_region_key"] = "NA"
             state["chain_lock_miss_limit"] = int(self.high_info_chain_lock_miss_limit)
+            state["target_commit_active"] = False
+            state["target_commit_window_steps"] = int(self.high_info_target_commit_window_steps)
+            state["target_commit_miss_limit"] = int(self.high_info_target_commit_miss_limit)
             state["chain_lock_last_status"] = "disabled"
             state["trigger_region_key_effective"] = str(
                 state.get("trigger_region_key", self.sequence_causal_trigger_region_key)
@@ -3942,6 +3979,9 @@ class ActiveInferenceEFE(Agent):
             state["chain_lock_steps_remaining"] = 0
             state["chain_lock_target_region_key"] = "NA"
             state["chain_lock_miss_limit"] = int(self.high_info_chain_lock_miss_limit)
+            state["target_commit_active"] = False
+            state["target_commit_window_steps"] = int(self.high_info_target_commit_window_steps)
+            state["target_commit_miss_limit"] = int(self.high_info_target_commit_miss_limit)
             state["chain_lock_last_status"] = "timeout"
             state["priority_subqueue_active"] = False
             state["priority_subqueue_keys"] = []
@@ -4046,48 +4086,81 @@ class ActiveInferenceEFE(Agent):
         chain_lock_miss_limit = int(
             max(1, state.get("chain_lock_miss_limit", self.high_info_chain_lock_miss_limit))
         )
+        target_commit_window_steps = int(
+            max(
+                1,
+                state.get(
+                    "target_commit_window_steps",
+                    self.high_info_target_commit_window_steps,
+                ),
+            )
+        )
+        target_commit_miss_limit = int(
+            max(
+                1,
+                state.get(
+                    "target_commit_miss_limit",
+                    self.high_info_target_commit_miss_limit,
+                ),
+            )
+        )
         chain_lock_active = bool(state.get("chain_lock_active", False))
         chain_lock_steps_remaining = int(max(0, state.get("chain_lock_steps_remaining", 0)))
         chain_lock_target_region_key = str(state.get("chain_lock_target_region_key", "NA"))
         chain_lock_last_status = str(state.get("chain_lock_last_status", "idle"))
+        target_commit_active = bool(state.get("target_commit_active", False))
 
         def _disable_chain_lock(status: str) -> None:
             nonlocal chain_lock_active
             nonlocal chain_lock_steps_remaining
             nonlocal chain_lock_target_region_key
             nonlocal chain_lock_last_status
+            nonlocal chain_lock_miss_limit
+            nonlocal target_commit_active
             chain_lock_active = False
             chain_lock_steps_remaining = 0
             chain_lock_target_region_key = "NA"
+            chain_lock_miss_limit = int(max(1, self.high_info_chain_lock_miss_limit))
+            target_commit_active = False
             chain_lock_last_status = str(status)
 
-        def _arm_chain_lock(target_region_key: str, status: str) -> None:
+        def _arm_chain_lock(
+            target_region_key: str,
+            status: str,
+            *,
+            focus_commit: bool = False,
+        ) -> None:
             nonlocal chain_lock_active
             nonlocal chain_lock_steps_remaining
             nonlocal chain_lock_target_region_key
             nonlocal chain_lock_last_status
+            nonlocal chain_lock_miss_limit
+            nonlocal target_commit_active
             key = str(target_region_key)
-            if (
-                interaction_chain_active
-                and self._parse_region_key_v1(key) is not None
-                and bool(state.get("active", False))
-            ):
+            if self._parse_region_key_v1(key) is not None and bool(state.get("active", False)):
                 chain_lock_active = True
-                chain_lock_steps_remaining = int(chain_lock_window_steps)
+                if focus_commit:
+                    chain_lock_steps_remaining = int(
+                        max(chain_lock_window_steps, target_commit_window_steps)
+                    )
+                    chain_lock_miss_limit = int(
+                        max(chain_lock_miss_limit, target_commit_miss_limit)
+                    )
+                    target_commit_active = True
+                else:
+                    chain_lock_steps_remaining = int(chain_lock_window_steps)
+                    chain_lock_miss_limit = int(max(1, chain_lock_miss_limit))
+                    target_commit_active = False
                 chain_lock_target_region_key = str(key)
                 chain_lock_last_status = str(status)
             else:
                 _disable_chain_lock(status)
 
         if (
-            not interaction_chain_active
-            or self._parse_region_key_v1(str(chain_lock_target_region_key)) is None
+            self._parse_region_key_v1(str(chain_lock_target_region_key)) is None
             or chain_lock_steps_remaining <= 0
         ):
-            if not interaction_chain_active:
-                _disable_chain_lock("inactive")
-            else:
-                chain_lock_active = False
+            _disable_chain_lock("inactive")
         min_samples_per_target = int(max(1, self.high_info_min_samples_per_target))
         coupled_min_samples = int(max(min_samples_per_target, self.high_info_coupled_min_samples))
         coupled_progress_locked = bool(int(current_packet.levels_completed) <= 0)
@@ -5277,6 +5350,13 @@ class ActiveInferenceEFE(Agent):
                     list(seed_queue),
                     source_key=str(source_region_key),
                 )
+            primary_seed_target = str(seed_queue[0]) if seed_queue else "NA"
+            if self._parse_region_key_v1(str(primary_seed_target)) is not None:
+                _arm_chain_lock(
+                    str(primary_seed_target),
+                    "focus_commit_armed",
+                    focus_commit=True,
+                )
             interaction_chain_active = bool(len(interaction_chain) >= 2)
             interaction_target_chain = list(interaction_chain)
             interaction_target_index = 0
@@ -5288,17 +5368,18 @@ class ActiveInferenceEFE(Agent):
                 state["interaction_target_chain"] = list(interaction_chain)
                 state["interaction_target_index"] = 0
                 state["interaction_last_status"] = "armed"
-                _arm_chain_lock(str(interaction_chain[0]), "armed")
             else:
                 state["interaction_target_chain"] = []
                 state["interaction_target_index"] = 0
                 state["interaction_last_status"] = "insufficient_chain"
-                _disable_chain_lock("insufficient_chain")
             state["chain_lock_active"] = bool(chain_lock_active)
             state["chain_lock_window_steps"] = int(chain_lock_window_steps)
             state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
             state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
             state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+            state["target_commit_active"] = bool(target_commit_active)
+            state["target_commit_window_steps"] = int(target_commit_window_steps)
+            state["target_commit_miss_limit"] = int(target_commit_miss_limit)
             state["chain_lock_last_status"] = str(chain_lock_last_status)
             state["priority_subqueue_active"] = bool(priority_subqueue_active)
             state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
@@ -5427,10 +5508,11 @@ class ActiveInferenceEFE(Agent):
                             if interaction_chain_active
                             else "rearm_single"
                         )
-                        if interaction_chain_active and rearm_chain:
-                            _arm_chain_lock(str(rearm_chain[0]), "rearm_armed")
-                        else:
-                            _disable_chain_lock("rearm_single")
+                        _arm_chain_lock(
+                            str(rearm_queue[0]),
+                            "rearm_focus_commit",
+                            focus_commit=True,
+                        )
                         state["chain_lock_active"] = bool(chain_lock_active)
                         state["chain_lock_window_steps"] = int(chain_lock_window_steps)
                         state["chain_lock_steps_remaining"] = int(
@@ -5440,6 +5522,9 @@ class ActiveInferenceEFE(Agent):
                             chain_lock_target_region_key
                         )
                         state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+                        state["target_commit_active"] = bool(target_commit_active)
+                        state["target_commit_window_steps"] = int(target_commit_window_steps)
+                        state["target_commit_miss_limit"] = int(target_commit_miss_limit)
                         state["chain_lock_last_status"] = str(chain_lock_last_status)
                         state["priority_subqueue_active"] = False
                         state["priority_subqueue_keys"] = []
@@ -5509,6 +5594,9 @@ class ActiveInferenceEFE(Agent):
             state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
             state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
             state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+            state["target_commit_active"] = bool(target_commit_active)
+            state["target_commit_window_steps"] = int(target_commit_window_steps)
+            state["target_commit_miss_limit"] = int(target_commit_miss_limit)
             state["chain_lock_last_status"] = str(chain_lock_last_status)
             state["priority_subqueue_active"] = bool(priority_subqueue_active)
             state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
@@ -5526,6 +5614,13 @@ class ActiveInferenceEFE(Agent):
             completed_recent=completed_recent,
             sample_counts=target_sample_counts,
         )
+        if (
+            chain_lock_active
+            and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
+            and str(chain_lock_target_region_key) not in set(str(v) for v in queue)
+        ):
+            queue = [str(chain_lock_target_region_key)] + [str(v) for v in queue]
+            state["last_status"] = "chain_lock_reinjected_target"
         if queue and (strong_event or int(changed_pixels) >= int(self.high_info_simultaneous_min_total_pixels)):
             source_change_magnitude = float(
                 max(0.0, min(1.0, region_change_magnitude_effective.get(str(source_region_key), 0.0)))
@@ -5565,17 +5660,29 @@ class ActiveInferenceEFE(Agent):
                             : int(max(1, min(3, self.high_info_focus_max_targets)))
                         ]
                     ]
-                    queue = list(event_priority_window) + [
-                        str(v) for v in queue if str(v) not in set(event_priority_window)
-                    ]
                     priority_subqueue_active = bool(event_priority_window)
                     priority_subqueue_keys = list(event_priority_window)
                     if (
                         chain_lock_active
-                        and str(chain_lock_target_region_key) not in set(event_priority_window)
+                        and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
                     ):
-                        _disable_chain_lock("event_change_priority")
-                    state["last_status"] = "event_change_priority_lock"
+                        locked_key = str(chain_lock_target_region_key)
+                        queue = [str(locked_key)] + [
+                            str(v)
+                            for v in event_priority_window
+                            if str(v) != str(locked_key)
+                        ] + [
+                            str(v)
+                            for v in queue
+                            if str(v) not in set(event_priority_window)
+                            and str(v) != str(locked_key)
+                        ]
+                        state["last_status"] = "event_change_queued_under_lock"
+                    else:
+                        queue = list(event_priority_window) + [
+                            str(v) for v in queue if str(v) not in set(event_priority_window)
+                        ]
+                        state["last_status"] = "event_change_priority_lock"
         if not queue:
             state["active"] = False
             state["stage"] = "idle"
@@ -5607,6 +5714,9 @@ class ActiveInferenceEFE(Agent):
             state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
             state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
             state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+            state["target_commit_active"] = bool(target_commit_active)
+            state["target_commit_window_steps"] = int(target_commit_window_steps)
+            state["target_commit_miss_limit"] = int(target_commit_miss_limit)
             state["chain_lock_last_status"] = str(chain_lock_last_status)
             state["priority_subqueue_active"] = False
             state["priority_subqueue_keys"] = []
@@ -5629,7 +5739,7 @@ class ActiveInferenceEFE(Agent):
             interaction_target_key = str(interaction_target_chain[interaction_target_index])
             if self._parse_region_key_v1(interaction_target_key) is not None:
                 if (
-                    chain_lock_active
+                    (not chain_lock_active)
                     and str(chain_lock_target_region_key) != str(interaction_target_key)
                 ):
                     _arm_chain_lock(str(interaction_target_key), "retarget")
@@ -5707,21 +5817,29 @@ class ActiveInferenceEFE(Agent):
             reachable_diff_priority_active = True
             reachable_diff_priority_key = str(forced_final_key)
             if queue and str(queue[0]) != str(forced_final_key):
-                queue = [str(forced_final_key)] + [
-                    str(v) for v in queue if str(v) != str(forced_final_key)
-                ]
                 if (
                     chain_lock_active
+                    and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
                     and str(chain_lock_target_region_key) != str(forced_final_key)
                 ):
-                    _disable_chain_lock("reachable_diff_priority")
-                if interaction_chain_active and interaction_target_chain:
-                    for idx, chain_key in enumerate(interaction_target_chain):
-                        if str(chain_key) == str(forced_final_key):
-                            interaction_target_index = int(idx)
-                            break
-                    state["interaction_target_index"] = int(max(0, interaction_target_index))
-                state["last_status"] = "reachable_diff_priority_override"
+                    locked_key = str(chain_lock_target_region_key)
+                    queue = [str(locked_key), str(forced_final_key)] + [
+                        str(v)
+                        for v in queue
+                        if str(v) not in {str(locked_key), str(forced_final_key)}
+                    ]
+                    state["last_status"] = "reachable_diff_queued_under_lock"
+                else:
+                    queue = [str(forced_final_key)] + [
+                        str(v) for v in queue if str(v) != str(forced_final_key)
+                    ]
+                    if interaction_chain_active and interaction_target_chain:
+                        for idx, chain_key in enumerate(interaction_target_chain):
+                            if str(chain_key) == str(forced_final_key):
+                                interaction_target_index = int(idx)
+                                break
+                        state["interaction_target_index"] = int(max(0, interaction_target_index))
+                    state["last_status"] = "reachable_diff_priority_override"
 
         previous_target_region_key = str(state.get("current_target_region_key", "NA"))
         target_region_key = str(queue[0])
@@ -5746,9 +5864,11 @@ class ActiveInferenceEFE(Agent):
                         queue = [str(locked_target_key)] + [
                             str(v) for v in queue if str(v) != str(locked_target_key)
                         ]
-                        target_region_key = str(locked_target_key)
-                        target_miss_streak = 0
-                        state["last_status"] = "chain_lock_retarget"
+                    else:
+                        queue = [str(locked_target_key)] + [str(v) for v in queue]
+                    target_region_key = str(locked_target_key)
+                    target_miss_streak = 0
+                    state["last_status"] = "chain_lock_retarget"
                 if str(nav_region_key) != str(locked_target_key):
                     chain_lock_steps_remaining = int(max(0, chain_lock_steps_remaining - 1))
                     if chain_lock_steps_remaining <= 0:
@@ -5870,6 +5990,9 @@ class ActiveInferenceEFE(Agent):
         state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
         state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
         state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+        state["target_commit_active"] = bool(target_commit_active)
+        state["target_commit_window_steps"] = int(target_commit_window_steps)
+        state["target_commit_miss_limit"] = int(target_commit_miss_limit)
         state["chain_lock_last_status"] = str(chain_lock_last_status)
         state["priority_subqueue_active"] = bool(priority_subqueue_active)
         state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
@@ -5954,6 +6077,7 @@ class ActiveInferenceEFE(Agent):
                 remaining_samples <= 0
                 and interaction_chain_active
                 and interaction_target_chain
+                and (not target_commit_active)
             ):
                 interaction_target_index = int(
                     max(0, min(len(interaction_target_chain) - 1, interaction_target_index))
@@ -6020,11 +6144,17 @@ class ActiveInferenceEFE(Agent):
             if (
                 chain_lock_active
                 and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
-                and str(chain_lock_target_region_key) in set(str(v) for v in refreshed_queue)
             ):
-                refreshed_queue = [str(chain_lock_target_region_key)] + [
-                    str(v) for v in refreshed_queue if str(v) != str(chain_lock_target_region_key)
-                ]
+                if str(chain_lock_target_region_key) in set(str(v) for v in refreshed_queue):
+                    refreshed_queue = [str(chain_lock_target_region_key)] + [
+                        str(v)
+                        for v in refreshed_queue
+                        if str(v) != str(chain_lock_target_region_key)
+                    ]
+                else:
+                    refreshed_queue = [str(chain_lock_target_region_key)] + [
+                        str(v) for v in refreshed_queue
+                    ]
             if refreshed_queue:
                 state["target_region_queue"] = list(refreshed_queue)
                 state["current_target_region_key"] = str(refreshed_queue[0])
@@ -6039,6 +6169,9 @@ class ActiveInferenceEFE(Agent):
                 state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
                 state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
                 state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+                state["target_commit_active"] = bool(target_commit_active)
+                state["target_commit_window_steps"] = int(target_commit_window_steps)
+                state["target_commit_miss_limit"] = int(target_commit_miss_limit)
                 state["chain_lock_last_status"] = str(chain_lock_last_status)
                 state["priority_subqueue_active"] = bool(priority_subqueue_active)
                 state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
@@ -6075,6 +6208,9 @@ class ActiveInferenceEFE(Agent):
                 state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
                 state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
                 state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+                state["target_commit_active"] = bool(target_commit_active)
+                state["target_commit_window_steps"] = int(target_commit_window_steps)
+                state["target_commit_miss_limit"] = int(target_commit_miss_limit)
                 state["chain_lock_last_status"] = str(chain_lock_last_status)
                 state["priority_subqueue_active"] = False
                 state["priority_subqueue_keys"] = []
