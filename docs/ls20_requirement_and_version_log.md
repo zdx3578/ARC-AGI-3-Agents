@@ -206,3 +206,42 @@
 
 1. 框架形态已落地为“探索外循环 + 利用内窗口”，执行顺序符合预期。
 2. 当前失败主因不是分支缺失，而是 exploit 窗口内 high_info/sequence 命中不足，fallback 仍过高。
+
+## 10. 2026-02-24 新颖性探索-利用硬规则增量
+
+### 10.1 本次改动
+
+1. 新增新颖性协议状态与统计（`novelty_signature_stats`）：
+   - 记录 `source/related`、触发次数、平均变化量、progress 命中。
+2. 新增新颖性触发后重采样机制：
+   - 触发后提高 `source/related` 目标采样要求与分数下限。
+3. 新增 prepass 硬门控释放：
+   - 当 `high_info_focus_state_v1` 处于 `novelty/commit/chain_lock/priority_subqueue` 活跃状态时，释放 prepass 抢占。
+4. 新增 `high_info_seek` 分支：
+   - 在无 reachable-diff 硬条件时，仍按“到达/靠近当前高信息目标”选择 1..4。
+5. 新增新颖性轮转规则：
+   - source 达标后，强制轮转到 related 队列，不允许继续 source 过采样。
+6. 修复 chain lock 计时：
+   - 锁窗口每步递减，避免“已在目标时无限持锁”。
+7. 新增 related 目标淘汰：
+   - related 长期不可达时自动降权并移出当前 novelty 子循环。
+
+### 10.2 运行命令
+
+1. `ACTIVE_INFERENCE_MAX_ACTIONS=300 ... --tags=local,novelty_protocol_v5_seek_gate_300`
+2. `ACTIVE_INFERENCE_MAX_ACTIONS=300 ... --tags=local,novelty_protocol_v7_lock_decay_300`
+
+### 10.3 关键结果（事实）
+
+1. `v5`（trace: `1771923728.681e693df015`）：
+   - `rule_top`: `high_info_seek=115`, `high_info_reachable_max_diff=34`, `prepass_fixed_two_pass=3`
+   - novelty 活跃阶段几乎不再被 prepass 抢占。
+2. `v7`（trace: `1771923907.c703e116c183`）：
+   - `rule_top`: `high_info_seek=107`, `high_info_reachable_max_diff=102`, `prepass_fixed_two_pass=11`
+   - novelty 触发 80 步；多条链路实现 `source+related` 同时达标（如 `src=5:4|rel=5:5`, `src=3:4|rel=2:4`）。
+   - 仍未通关（`levels_completed=0`），动作生存长度提升到 `230`。
+
+### 10.4 当前结论
+
+1. “发现新颖性 -> 持续利用 -> 统计规律 -> 跟进相关区”主机制已落地并在日志中可证。
+2. 仍存在部分 related 区域长期未达标（尤其 `0:3/0:4/0:5` 类），说明可达性语义仍有误报，需要下一轮专门修复“地图内可达目标筛选”。

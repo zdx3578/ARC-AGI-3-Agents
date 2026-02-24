@@ -2609,6 +2609,14 @@ class ActiveInferencePolicyEvaluatorV1:
                 raw.get("chain_lock_target_region_key", "NA")
             ),
             "chain_lock_target_match": bool(raw.get("chain_lock_target_match", False)),
+            "target_commit_active": bool(raw.get("target_commit_active", False)),
+            "novelty_protocol_active": bool(raw.get("novelty_protocol_active", False)),
+            "novelty_source_region_key": str(raw.get("novelty_source_region_key", "NA")),
+            "target_is_novelty_source": bool(raw.get("target_is_novelty_source", False)),
+            "target_is_novelty_related": bool(raw.get("target_is_novelty_related", False)),
+            "novelty_related_region_count": int(
+                max(0, raw.get("novelty_related_region_count", 0))
+            ),
             "verify_action_ids": [
                 int(v)
                 for v in verify_action_ids
@@ -3441,6 +3449,32 @@ class ActiveInferencePolicyEvaluatorV1:
         prepass_cycle_step = int(min(max(0, int(global_action_counter)), prepass_cycle_length))
         prepass_exploit_window_steps = 0
         prepass_cycle_total_steps = int(prepass_cycle_length)
+        high_info_state_active = False
+        high_info_state_novelty_active = False
+        high_info_state_commit_active = False
+        high_info_state_chain_lock_active = False
+        high_info_state_priority_subqueue_active = False
+        if entries:
+            meta0 = getattr(entries[0].candidate, "metadata", {})
+            if isinstance(meta0, dict):
+                high_info_state_raw = meta0.get("high_info_focus_state_v1", {})
+                if isinstance(high_info_state_raw, dict):
+                    high_info_state_active = bool(
+                        high_info_state_raw.get("enabled", False)
+                        and high_info_state_raw.get("active", False)
+                    )
+                    high_info_state_novelty_active = bool(
+                        high_info_state_raw.get("novelty_protocol_active", False)
+                    )
+                    high_info_state_commit_active = bool(
+                        high_info_state_raw.get("target_commit_active", False)
+                    )
+                    high_info_state_chain_lock_active = bool(
+                        high_info_state_raw.get("chain_lock_active", False)
+                    )
+                    high_info_state_priority_subqueue_active = bool(
+                        high_info_state_raw.get("priority_subqueue_active", False)
+                    )
 
         high_info_rows: list[dict[str, Any]] = []
         for entry in entries:
@@ -3479,15 +3513,75 @@ class ActiveInferencePolicyEvaluatorV1:
             ):
                 high_info_focus_priority_available = True
 
+        def _high_info_hard_priority_row(row: dict[str, Any]) -> bool:
+            features = row.get("features", {})
+            if not isinstance(features, dict):
+                return False
+            entry_obj = row.get("entry")
+            if not isinstance(entry_obj, FreeEnergyLedgerEntryV1):
+                return False
+            if int(entry_obj.candidate.action_id) not in (1, 2, 3, 4):
+                return False
+            if not bool(features.get("target_is_reachable_simultaneous", False)):
+                return False
+            if bool(features.get("target_is_unreachable_simultaneous", False)):
+                return False
+            has_fresh_diff = int(max(0, features.get("target_recent_change_pixels", 0))) > 0
+            in_novelty_cycle = bool(
+                features.get("novelty_protocol_active", False)
+                and (
+                    features.get("target_is_novelty_source", False)
+                    or features.get("target_is_novelty_related", False)
+                )
+            )
+            in_commit_cycle = bool(features.get("target_commit_active", False))
+            has_remaining_samples = int(max(0, features.get("remaining_samples", 0))) > 0
+            return bool(
+                has_fresh_diff or in_novelty_cycle or in_commit_cycle or has_remaining_samples
+            )
+
         high_info_hard_rows = [
             row
             for row in high_info_rows
+            if _high_info_hard_priority_row(row)
+        ]
+        high_info_seek_rows = [
+            row
+            for row in high_info_rows
             if int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
-            and bool(row["features"].get("target_is_reachable_simultaneous", False))
-            and not bool(row["features"].get("target_is_unreachable_simultaneous", False))
-            and int(max(0, row["features"].get("target_recent_change_pixels", 0))) > 0
+            and bool(
+                row["features"].get("reaches_target_region", False)
+                or row["features"].get("moves_toward_target_region", False)
+                or int(max(0, row["features"].get("remaining_samples", 0))) > 0
+            )
         ]
         high_info_focus_hard_priority_available = bool(high_info_hard_rows)
+        high_info_force_prepass_release = bool(
+            fixed_prepass_entry is not None
+            and (
+                (
+                    bool(high_info_state_active)
+                    and (
+                        bool(high_info_state_novelty_active)
+                        or bool(high_info_state_commit_active)
+                        or bool(high_info_state_chain_lock_active)
+                        or bool(high_info_state_priority_subqueue_active)
+                    )
+                )
+                or any(
+                    bool(row["features"].get("novelty_protocol_active", False))
+                    or bool(row["features"].get("target_commit_active", False))
+                    or bool(row["features"].get("chain_lock_active", False))
+                    for row in high_info_hard_rows
+                )
+            )
+        )
+        if high_info_force_prepass_release:
+            fixed_prepass_entry = None
+            fixed_prepass_pending = False
+            high_info_prepass_gate_open = True
+            prepass_stage_active = False
+            fixed_two_pass_suppressed_by_high_info = True
 
         if fixed_prepass_entry is not None:
             selected_entry = fixed_prepass_entry
@@ -3533,6 +3627,27 @@ class ActiveInferencePolicyEvaluatorV1:
             )
             high_info_focus_target_region = str(high_info_focus_reachable_max_diff_region)
             tie_breaker_rule_applied = "high_info_reachable_max_diff"
+        elif high_info_seek_rows and high_info_prepass_gate_open:
+            high_info_seek_rows.sort(
+                key=lambda row: (
+                    0 if bool(row["features"].get("reaches_target_region", False)) else 1,
+                    0 if bool(row["features"].get("moves_toward_target_region", False)) else 1,
+                    int(row["features"].get("distance_after", 10**6)),
+                    -float(max(0.0, row["features"].get("bonus_hint", 0.0))),
+                    float(row["score"]),
+                    int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                    int(row["entry"].candidate.action_id),
+                    str(row["entry"].candidate.candidate_id),
+                )
+            )
+            selected_entry = high_info_seek_rows[0]["entry"]
+            high_info_focus_probe_applied = True
+            high_info_focus_probe_reason = "seek_target_priority"
+            high_info_focus_status = "seek_target_priority"
+            high_info_focus_target_region = str(
+                high_info_seek_rows[0]["features"].get("target_region_key", "NA")
+            )
+            tie_breaker_rule_applied = "high_info_seek"
         elif high_info_hard_rows and (not high_info_prepass_gate_open):
             high_info_focus_probe_reason = "suppressed_by_prepass"
             high_info_focus_status = "suppressed_by_prepass"
@@ -3777,6 +3892,14 @@ class ActiveInferencePolicyEvaluatorV1:
             ),
             "high_info_after_first_pass_gate_open": bool(high_info_after_first_pass_gate_open),
             "high_info_release_action_counter": int(high_info_release_action_counter),
+            "high_info_state_active": bool(high_info_state_active),
+            "high_info_state_novelty_active": bool(high_info_state_novelty_active),
+            "high_info_state_commit_active": bool(high_info_state_commit_active),
+            "high_info_state_chain_lock_active": bool(high_info_state_chain_lock_active),
+            "high_info_state_priority_subqueue_active": bool(
+                high_info_state_priority_subqueue_active
+            ),
+            "high_info_force_prepass_release": bool(high_info_force_prepass_release),
             "fixed_two_pass_suppressed_by_high_info": bool(
                 fixed_two_pass_suppressed_by_high_info
             ),

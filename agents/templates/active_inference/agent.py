@@ -359,6 +359,26 @@ class ActiveInferenceEFE(Agent):
             1,
             _env_int("ACTIVE_INFERENCE_HIGH_INFO_REACHABILITY_GRAPH_MIN_REGIONS", 6),
         )
+        self.high_info_novelty_protocol_enabled = _env_bool(
+            "ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_PROTOCOL_ENABLED",
+            True,
+        )
+        self.high_info_novelty_retrigger_extra_samples = max(
+            0,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_RETRIGGER_EXTRA_SAMPLES", 2),
+        )
+        self.high_info_novelty_related_extra_samples = max(
+            0,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_RELATED_EXTRA_SAMPLES", 1),
+        )
+        self.high_info_novelty_max_related_targets = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_MAX_RELATED_TARGETS", 3),
+        )
+        self.high_info_novelty_stats_max_entries = max(
+            4,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_STATS_MAX_ENTRIES", 24),
+        )
         self.orientation_alignment_min_similarity = max(
             0.35,
             min(0.95, _env_float("ACTIVE_INFERENCE_ORIENTATION_MIN_SIMILARITY", 0.68)),
@@ -646,6 +666,13 @@ class ActiveInferenceEFE(Agent):
             "interaction_last_status": "idle",
             "priority_subqueue_active": False,
             "priority_subqueue_keys": [],
+            "novelty_protocol_active": False,
+            "novelty_source_region_key": "NA",
+            "novelty_related_region_keys": [],
+            "last_novelty_signature": "NA",
+            "novelty_trigger_count": 0,
+            "novelty_last_action_counter": -1,
+            "novelty_signature_stats": {},
             "last_status": "idle",
         }
 
@@ -2685,6 +2712,32 @@ class ActiveInferenceEFE(Agent):
         priority_subqueue = state.get("priority_subqueue_keys", [])
         if not isinstance(priority_subqueue, list):
             priority_subqueue = []
+        novelty_related_region_keys = state.get("novelty_related_region_keys", [])
+        if not isinstance(novelty_related_region_keys, list):
+            novelty_related_region_keys = []
+        novelty_signature_stats = state.get("novelty_signature_stats", {})
+        if not isinstance(novelty_signature_stats, dict):
+            novelty_signature_stats = {}
+        novelty_signature_stats_sanitized: dict[str, dict[str, Any]] = {}
+        for signature_raw, entry_raw in novelty_signature_stats.items():
+            if not isinstance(entry_raw, dict):
+                continue
+            signature = str(signature_raw)
+            source_region_key = str(entry_raw.get("source_region_key", "NA"))
+            related_region_keys = entry_raw.get("related_region_keys", [])
+            if not isinstance(related_region_keys, list):
+                related_region_keys = []
+            novelty_signature_stats_sanitized[signature] = {
+                "count": int(max(0, entry_raw.get("count", 0))),
+                "progress_hits": int(max(0, entry_raw.get("progress_hits", 0))),
+                "avg_changed_pixels": float(max(0.0, entry_raw.get("avg_changed_pixels", 0.0))),
+                "avg_simultaneous_pixels": float(
+                    max(0.0, entry_raw.get("avg_simultaneous_pixels", 0.0))
+                ),
+                "source_region_key": str(source_region_key),
+                "related_region_keys": [str(v) for v in related_region_keys[:8]],
+                "last_action_counter": int(entry_raw.get("last_action_counter", -1)),
+            }
         region_recent_change_pixels = state.get("region_recent_change_pixels", {})
         if not isinstance(region_recent_change_pixels, dict):
             region_recent_change_pixels = {}
@@ -2848,6 +2901,23 @@ class ActiveInferenceEFE(Agent):
             "interaction_last_status": str(state.get("interaction_last_status", "idle")),
             "priority_subqueue_active": bool(state.get("priority_subqueue_active", False)),
             "priority_subqueue_keys": [str(v) for v in priority_subqueue[:16]],
+            "novelty_protocol_active": bool(state.get("novelty_protocol_active", False)),
+            "novelty_source_region_key": str(state.get("novelty_source_region_key", "NA")),
+            "novelty_related_region_keys": [str(v) for v in novelty_related_region_keys[:16]],
+            "last_novelty_signature": str(state.get("last_novelty_signature", "NA")),
+            "novelty_trigger_count": int(max(0, state.get("novelty_trigger_count", 0))),
+            "novelty_last_action_counter": int(state.get("novelty_last_action_counter", -1)),
+            "novelty_signature_stats": {
+                str(k): dict(v)
+                for (k, v) in sorted(
+                    novelty_signature_stats_sanitized.items(),
+                    key=lambda item: (
+                        -int(item[1].get("count", 0)),
+                        -int(item[1].get("last_action_counter", -1)),
+                        str(item[0]),
+                    ),
+                )[:16]
+            },
             "last_status": str(state.get("last_status", "idle")),
         }
 
@@ -3485,6 +3555,24 @@ class ActiveInferenceEFE(Agent):
         )
         chain_lock_steps_remaining = int(max(0, state.get("chain_lock_steps_remaining", 0)))
         target_commit_active = bool(state.get("target_commit_active", False))
+        novelty_protocol_active = bool(state.get("novelty_protocol_active", False))
+        novelty_source_region_key = str(state.get("novelty_source_region_key", "NA"))
+        novelty_related_region_keys = state.get("novelty_related_region_keys", [])
+        if not isinstance(novelty_related_region_keys, list):
+            novelty_related_region_keys = []
+        novelty_related_region_set = {
+            str(v)
+            for v in novelty_related_region_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        }
+        target_is_novelty_source = bool(
+            self._parse_region_key_v1(str(target_region_key)) is not None
+            and str(target_region_key) == str(novelty_source_region_key)
+        )
+        target_is_novelty_related = bool(
+            self._parse_region_key_v1(str(target_region_key)) is not None
+            and str(target_region_key) in novelty_related_region_set
+        )
         chain_lock_active = bool(
             state.get("chain_lock_active", False)
             and bool(state.get("active", False))
@@ -3633,6 +3721,11 @@ class ActiveInferenceEFE(Agent):
             "chain_lock_target_region_key": str(chain_lock_target_region_key),
             "chain_lock_target_match": bool(chain_lock_target_match),
             "target_commit_active": bool(target_commit_active),
+            "novelty_protocol_active": bool(novelty_protocol_active),
+            "novelty_source_region_key": str(novelty_source_region_key),
+            "target_is_novelty_source": bool(target_is_novelty_source),
+            "target_is_novelty_related": bool(target_is_novelty_related),
+            "novelty_related_region_count": int(len(novelty_related_region_set)),
             "bonus_hint": float(max(0.0, bonus_hint)),
             "penalty_hint": float(max(0.0, penalty_hint)),
         }
@@ -3955,6 +4048,13 @@ class ActiveInferenceEFE(Agent):
             state["target_commit_window_steps"] = int(self.high_info_target_commit_window_steps)
             state["target_commit_miss_limit"] = int(self.high_info_target_commit_miss_limit)
             state["chain_lock_last_status"] = "disabled"
+            state["novelty_protocol_active"] = False
+            state["novelty_source_region_key"] = "NA"
+            state["novelty_related_region_keys"] = []
+            state["last_novelty_signature"] = "NA"
+            state["novelty_trigger_count"] = 0
+            state["novelty_last_action_counter"] = -1
+            state["novelty_signature_stats"] = {}
             state["trigger_region_key_effective"] = str(
                 state.get("trigger_region_key", self.sequence_causal_trigger_region_key)
             )
@@ -4013,6 +4113,9 @@ class ActiveInferenceEFE(Agent):
             state["chain_lock_last_status"] = "timeout"
             state["priority_subqueue_active"] = False
             state["priority_subqueue_keys"] = []
+            state["novelty_protocol_active"] = False
+            state["novelty_source_region_key"] = "NA"
+            state["novelty_related_region_keys"] = []
             state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
             state["last_status"] = "timeout"
 
@@ -4120,6 +4223,51 @@ class ActiveInferenceEFE(Agent):
             for (k, v) in pending_region_scores.items()
             if self._parse_region_key_v1(str(k)) is not None and float(v) > 0.0
         }
+        novelty_protocol_active = bool(state.get("novelty_protocol_active", False))
+        novelty_source_region_key = str(state.get("novelty_source_region_key", "NA"))
+        if self._parse_region_key_v1(novelty_source_region_key) is None:
+            novelty_source_region_key = "NA"
+        novelty_related_region_keys = state.get("novelty_related_region_keys", [])
+        if not isinstance(novelty_related_region_keys, list):
+            novelty_related_region_keys = []
+        novelty_related_region_keys = [
+            str(v)
+            for v in novelty_related_region_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        ][:16]
+        last_novelty_signature = str(state.get("last_novelty_signature", "NA"))
+        novelty_trigger_count = int(max(0, state.get("novelty_trigger_count", 0)))
+        novelty_last_action_counter = int(state.get("novelty_last_action_counter", -1))
+        novelty_signature_stats_raw = state.get("novelty_signature_stats", {})
+        if not isinstance(novelty_signature_stats_raw, dict):
+            novelty_signature_stats_raw = {}
+        novelty_signature_stats: dict[str, dict[str, Any]] = {}
+        for signature_raw, entry_raw in novelty_signature_stats_raw.items():
+            if not isinstance(entry_raw, dict):
+                continue
+            signature = str(signature_raw)
+            source_key = str(entry_raw.get("source_region_key", "NA"))
+            if self._parse_region_key_v1(source_key) is None:
+                source_key = "NA"
+            related_keys_raw = entry_raw.get("related_region_keys", [])
+            if not isinstance(related_keys_raw, list):
+                related_keys_raw = []
+            related_keys = [
+                str(v)
+                for v in related_keys_raw
+                if self._parse_region_key_v1(str(v)) is not None
+            ][:8]
+            novelty_signature_stats[signature] = {
+                "count": int(max(0, entry_raw.get("count", 0))),
+                "progress_hits": int(max(0, entry_raw.get("progress_hits", 0))),
+                "avg_changed_pixels": float(max(0.0, entry_raw.get("avg_changed_pixels", 0.0))),
+                "avg_simultaneous_pixels": float(
+                    max(0.0, entry_raw.get("avg_simultaneous_pixels", 0.0))
+                ),
+                "source_region_key": str(source_key),
+                "related_region_keys": list(related_keys),
+                "last_action_counter": int(entry_raw.get("last_action_counter", -1)),
+            }
         priority_subqueue_active = bool(
             state.get("priority_subqueue_active", False)
             and bool(priority_subqueue_keys)
@@ -4234,6 +4382,83 @@ class ActiveInferenceEFE(Agent):
                     key=lambda item: (-float(item[1]), str(item[0])),
                 )[:64]
             }
+
+        def _flush_novelty_regions_to_state() -> None:
+            state["novelty_protocol_active"] = bool(novelty_protocol_active)
+            state["novelty_source_region_key"] = str(novelty_source_region_key)
+            state["novelty_related_region_keys"] = [
+                str(v) for v in novelty_related_region_keys[:16]
+            ]
+            state["last_novelty_signature"] = str(last_novelty_signature)
+            state["novelty_trigger_count"] = int(max(0, novelty_trigger_count))
+            state["novelty_last_action_counter"] = int(novelty_last_action_counter)
+            state["novelty_signature_stats"] = {
+                str(k): dict(v)
+                for (k, v) in sorted(
+                    novelty_signature_stats.items(),
+                    key=lambda item: (
+                        -int(item[1].get("count", 0)),
+                        -int(item[1].get("last_action_counter", -1)),
+                        str(item[0]),
+                    ),
+                )[: int(max(4, self.high_info_novelty_stats_max_entries))]
+            }
+
+        def _compact_novelty_stats_v1() -> None:
+            nonlocal novelty_signature_stats
+            novelty_signature_stats = {
+                str(k): dict(v)
+                for (k, v) in sorted(
+                    novelty_signature_stats.items(),
+                    key=lambda item: (
+                        -int(item[1].get("count", 0)),
+                        -int(item[1].get("last_action_counter", -1)),
+                        str(item[0]),
+                    ),
+                )[: int(max(4, self.high_info_novelty_stats_max_entries))]
+            }
+
+        def _record_novelty_pattern_v1(
+            signature: str,
+            *,
+            source_region_key_for_stats: str,
+            related_region_keys_for_stats: list[str],
+            changed_pixels_for_stats: int,
+            simultaneous_pixels_for_stats: int,
+            progress_hit: bool,
+        ) -> None:
+            nonlocal novelty_signature_stats
+            key = str(signature)
+            previous = novelty_signature_stats.get(str(key), {})
+            prev_count = int(max(0, previous.get("count", 0)))
+            count_now = int(prev_count + 1)
+            prev_avg_changed = float(max(0.0, previous.get("avg_changed_pixels", 0.0)))
+            prev_avg_sim = float(max(0.0, previous.get("avg_simultaneous_pixels", 0.0)))
+            avg_changed_now = float(
+                ((prev_avg_changed * float(prev_count)) + float(max(0, changed_pixels_for_stats)))
+                / float(max(1, count_now))
+            )
+            avg_sim_now = float(
+                ((prev_avg_sim * float(prev_count)) + float(max(0, simultaneous_pixels_for_stats)))
+                / float(max(1, count_now))
+            )
+            progress_hits_now = int(max(0, previous.get("progress_hits", 0))) + (
+                1 if bool(progress_hit) else 0
+            )
+            novelty_signature_stats[str(key)] = {
+                "count": int(count_now),
+                "progress_hits": int(progress_hits_now),
+                "avg_changed_pixels": float(avg_changed_now),
+                "avg_simultaneous_pixels": float(avg_sim_now),
+                "source_region_key": str(source_region_key_for_stats),
+                "related_region_keys": [
+                    str(v)
+                    for v in related_region_keys_for_stats
+                    if self._parse_region_key_v1(str(v)) is not None
+                ][:8],
+                "last_action_counter": int(current_counter),
+            }
+            _compact_novelty_stats_v1()
 
         if (
             self._parse_region_key_v1(str(chain_lock_target_region_key)) is None
@@ -4569,6 +4794,79 @@ class ActiveInferenceEFE(Agent):
             simultaneous_reachable_set = set(simultaneous_reachable_region_keys)
             simultaneous_unknown_set = set(simultaneous_unknown_region_keys)
             simultaneous_unreachable_set = set(simultaneous_unreachable_region_keys)
+        novelty_related_region_candidates: list[str] = []
+        if self.high_info_novelty_protocol_enabled:
+            novelty_related_region_candidates = [
+                str(region_key)
+                for region_key in simultaneous_reachable_region_keys
+                if self._parse_region_key_v1(str(region_key)) is not None
+                and str(region_key) != str(source_region_key)
+                and not (
+                    str(region_key) in simultaneous_unreachable_set
+                    and bool(reachability_graph_ready)
+                )
+            ]
+            if not novelty_related_region_candidates:
+                novelty_related_region_candidates = [
+                    str(region_key)
+                    for region_key in simultaneous_changed_region_keys
+                    if self._parse_region_key_v1(str(region_key)) is not None
+                    and str(region_key) != str(source_region_key)
+                    and not (
+                        str(region_key) in simultaneous_unreachable_set
+                        and bool(reachability_graph_ready)
+                    )
+                ]
+            novelty_related_region_candidates = sorted(
+                list(dict.fromkeys(novelty_related_region_candidates)),
+                key=lambda key: (
+                    -int(max(0, region_recent_change_pixels.get(str(key), 0))),
+                    -float(max(0.0, region_change_magnitude_now.get(str(key), 0.0))),
+                    -float(max(0.0, region_change_delta_now.get(str(key), 0.0))),
+                    int(
+                        self._region_route_distance_v1(
+                            region_adjacency,
+                            start_region_key=str(source_region_key),
+                            goal_region_key=str(key),
+                        )
+                    ),
+                    str(key),
+                ),
+            )[: int(max(1, self.high_info_novelty_max_related_targets))]
+        active_novelty_related_targets: list[str] = [
+            str(v)
+            for v in novelty_related_region_candidates
+            if self._parse_region_key_v1(str(v)) is not None
+            and str(v) != str(source_region_key)
+            and not (
+                str(v) in simultaneous_unreachable_set
+                and bool(reachability_graph_ready)
+            )
+        ][: int(max(1, self.high_info_novelty_max_related_targets))]
+        novelty_event_detected = bool(
+            self.high_info_novelty_protocol_enabled
+            and should_trigger
+            and self._parse_region_key_v1(str(source_region_key)) is not None
+            and bool(active_novelty_related_targets)
+            and (
+                len(simultaneous_changed_region_keys) >= 2
+                or len(active_novelty_related_targets) >= 2
+                or int(level_delta_now) > 0
+                or bool(str(obs_change_type) in ("GLOBAL_PATTERN_CHANGE", "CC_COUNT_CHANGE"))
+            )
+            and int(max(changed_pixels, simultaneous_changed_total_pixels))
+            >= int(self.high_info_simultaneous_min_total_pixels)
+        )
+        novelty_signature = "NA"
+        if novelty_event_detected:
+            novelty_signature = str(
+                "src="
+                + str(source_region_key)
+                + "|evt="
+                + str(obs_change_type)
+                + "|rel="
+                + ",".join(str(v) for v in active_novelty_related_targets[:3])
+            )
         simultaneous_focus_candidates = [
             str(v)
             for v in simultaneous_changed_region_keys
@@ -5264,6 +5562,71 @@ class ActiveInferenceEFE(Agent):
                     float(merged_scores.get(str(region_key), 0.0)),
                     float(new_score),
                 )
+            if novelty_event_detected:
+                novelty_protocol_active = True
+                novelty_source_region_key = str(source_region_key)
+                novelty_related_region_keys = list(active_novelty_related_targets)
+                last_novelty_signature = str(novelty_signature)
+                novelty_trigger_count = int(novelty_trigger_count + 1)
+                novelty_last_action_counter = int(current_counter)
+                _record_novelty_pattern_v1(
+                    str(novelty_signature),
+                    source_region_key_for_stats=str(source_region_key),
+                    related_region_keys_for_stats=list(active_novelty_related_targets),
+                    changed_pixels_for_stats=int(changed_pixels),
+                    simultaneous_pixels_for_stats=int(
+                        max(simultaneous_pixels_now, simultaneous_changed_total_pixels)
+                    ),
+                    progress_hit=bool(level_delta_now > 0),
+                )
+                source_sample_count = int(max(0, target_sample_counts.get(str(source_region_key), 0)))
+                source_required = int(
+                    max(
+                        _required_samples(str(source_region_key)),
+                        source_sample_count + int(1 + self.high_info_novelty_retrigger_extra_samples),
+                    )
+                )
+                target_required_samples[str(source_region_key)] = int(
+                    max(
+                        target_required_samples.get(str(source_region_key), 0),
+                        source_required,
+                    )
+                )
+                merged_scores[str(source_region_key)] = max(
+                    float(merged_scores.get(str(source_region_key), 0.0)),
+                    0.98,
+                )
+                for idx, region_key in enumerate(active_novelty_related_targets):
+                    related_key = str(region_key)
+                    related_sample_count = int(max(0, target_sample_counts.get(str(related_key), 0)))
+                    related_required = int(
+                        max(
+                            _required_samples(str(related_key)),
+                            related_sample_count + int(1 + self.high_info_novelty_related_extra_samples),
+                        )
+                    )
+                    target_required_samples[str(related_key)] = int(
+                        max(
+                            target_required_samples.get(str(related_key), 0),
+                            related_required,
+                        )
+                    )
+                    novelty_related_floor = float(max(0.82, 0.94 - (0.06 * float(idx))))
+                    merged_scores[str(related_key)] = max(
+                        float(merged_scores.get(str(related_key), 0.0)),
+                        float(novelty_related_floor),
+                    )
+                novelty_chain_keys = [
+                    str(source_region_key),
+                    *[str(v) for v in active_novelty_related_targets],
+                ]
+                if len(novelty_chain_keys) >= 2:
+                    priority_subqueue_active = True
+                    priority_subqueue_keys = list(novelty_chain_keys[:16])
+                    interaction_chain_active = True
+                    interaction_target_chain = list(novelty_chain_keys[:16])
+                    interaction_target_index = 0
+                    state["interaction_last_status"] = "novelty_armed"
             focus_lock_active = bool(
                 simultaneous_focus_reset
                 or (
@@ -5272,6 +5635,8 @@ class ActiveInferenceEFE(Agent):
                     and int(changed_pixels) >= int(self.high_info_simultaneous_min_total_pixels)
                 )
             )
+            if novelty_event_detected:
+                focus_lock_active = True
             focus_lock_keys: set[str] = set()
             if simultaneous_changed_set:
                 ordered_simultaneous = [
@@ -5645,6 +6010,7 @@ class ActiveInferenceEFE(Agent):
                         state["priority_subqueue_keys"] = []
                         state["pending_region_queue"] = []
                         state["pending_region_scores"] = {}
+                        _flush_novelty_regions_to_state()
                         state["last_status"] = "idle_rearm"
                         return
             state["target_region_scores"] = dict(score_memory)
@@ -5719,10 +6085,45 @@ class ActiveInferenceEFE(Agent):
             state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
             state["pending_region_queue"] = []
             state["pending_region_scores"] = {}
+            _flush_novelty_regions_to_state()
             return
 
         if not score_memory:
             score_memory = _collect_hot_targets(str(source_region_key))
+        if novelty_protocol_active:
+            protocol_order = [
+                str(v)
+                for v in [str(novelty_source_region_key)] + list(novelty_related_region_keys)
+                if self._parse_region_key_v1(str(v)) is not None
+            ]
+            protocol_pending: list[str] = []
+            for idx, region_key in enumerate(protocol_order):
+                sample_count = int(max(0, target_sample_counts.get(str(region_key), 0)))
+                required_samples = int(
+                    max(
+                        1,
+                        target_required_samples.get(str(region_key), _required_samples(str(region_key))),
+                    )
+                )
+                if sample_count >= required_samples:
+                    continue
+                protocol_pending.append(str(region_key))
+                protocol_floor = float(max(0.74, 0.95 - (0.08 * float(idx))))
+                score_memory[str(region_key)] = max(
+                    float(score_memory.get(str(region_key), 0.0)),
+                    float(protocol_floor),
+                )
+            if protocol_pending:
+                priority_subqueue_active = True
+                priority_subqueue_keys = list(protocol_pending[:16])
+                _enqueue_pending_regions(
+                    list(protocol_pending),
+                    score_hint={str(k): float(v) for (k, v) in score_memory.items()},
+                )
+            else:
+                novelty_protocol_active = False
+                novelty_source_region_key = "NA"
+                novelty_related_region_keys = []
         completed_recent = set(str(v) for v in completed_regions[-8:])
         anchor_key = str(nav_region_key)
         if self._parse_region_key_v1(anchor_key) is None:
@@ -5889,6 +6290,10 @@ class ActiveInferenceEFE(Agent):
             state["cross_region_key"] = str(primary_coupled_region_key)
             state["gate_region_key"] = str(secondary_coupled_region_key)
             state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
+            novelty_protocol_active = False
+            novelty_source_region_key = "NA"
+            novelty_related_region_keys = []
+            _flush_novelty_regions_to_state()
             return
 
         if (not _commit_lock_hard_active_v1()) and interaction_chain_active and interaction_target_chain:
@@ -6008,6 +6413,43 @@ class ActiveInferenceEFE(Agent):
             target_miss_streak = 0
         elif str(target_region_key) != str(previous_target_region_key):
             target_miss_streak = 0
+        novelty_related_set = {
+            str(v)
+            for v in novelty_related_region_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        }
+        novelty_drop_miss_limit = int(max(4, min(10, self.high_info_chain_lock_miss_limit)))
+        if (
+            novelty_protocol_active
+            and str(target_region_key) in novelty_related_set
+            and str(nav_region_key) != str(target_region_key)
+            and int(target_miss_streak) >= int(novelty_drop_miss_limit)
+        ):
+            dropped_key = str(target_region_key)
+            novelty_related_region_keys = [
+                str(v) for v in novelty_related_region_keys if str(v) != str(dropped_key)
+            ]
+            priority_subqueue_keys = [
+                str(v) for v in priority_subqueue_keys if str(v) != str(dropped_key)
+            ]
+            pending_region_queue = [
+                str(v) for v in pending_region_queue if str(v) != str(dropped_key)
+            ]
+            pending_region_scores.pop(str(dropped_key), None)
+            if str(dropped_key) in score_memory:
+                score_memory[str(dropped_key)] = float(
+                    min(float(score_memory.get(str(dropped_key), 0.0)), 0.02)
+                )
+            queue = [str(v) for v in queue if str(v) != str(dropped_key)]
+            target_miss_streak = 0
+            if not novelty_related_region_keys:
+                novelty_protocol_active = False
+                novelty_source_region_key = "NA"
+            state["last_status"] = "novelty_drop_unreachable_related"
+            if queue:
+                target_region_key = str(queue[0])
+            else:
+                target_region_key = "NA"
         if chain_lock_active:
             if self._parse_region_key_v1(str(chain_lock_target_region_key)) is None:
                 _disable_chain_lock("invalid_target")
@@ -6023,11 +6465,12 @@ class ActiveInferenceEFE(Agent):
                     target_region_key = str(locked_target_key)
                     target_miss_streak = 0
                     state["last_status"] = "chain_lock_retarget"
-                if str(nav_region_key) != str(locked_target_key):
-                    chain_lock_steps_remaining = int(max(0, chain_lock_steps_remaining - 1))
-                    if chain_lock_steps_remaining <= 0:
-                        _disable_chain_lock("window_expired")
-                    elif int(target_miss_streak) >= int(chain_lock_miss_limit):
+                nav_in_lock_target = bool(str(nav_region_key) == str(locked_target_key))
+                chain_lock_steps_remaining = int(max(0, chain_lock_steps_remaining - 1))
+                if chain_lock_steps_remaining <= 0:
+                    _disable_chain_lock("window_expired")
+                elif not nav_in_lock_target:
+                    if int(target_miss_streak) >= int(chain_lock_miss_limit):
                         if target_commit_active:
                             chain_lock_last_status = "tracking_commit_hold"
                         else:
@@ -6111,6 +6554,7 @@ class ActiveInferenceEFE(Agent):
         state["target_region_queue"] = list(queue)
         state["target_region_scores"] = dict(score_memory)
         _flush_pending_regions_to_state()
+        _flush_novelty_regions_to_state()
         state["completed_target_regions"] = list(completed_regions[-16:])
         state["target_sample_counts"] = dict(target_sample_counts)
         state["target_required_samples"] = dict(target_required_samples)
@@ -6245,6 +6689,48 @@ class ActiveInferenceEFE(Agent):
                 required_samples = int(max(required_samples, 2))
             target_required_samples[str(target_region_key)] = int(required_samples)
             remaining_samples = int(max(0, int(required_samples) - sample_count))
+            novelty_pending_related: list[str] = []
+            novelty_rotate_to_related = False
+            if novelty_protocol_active:
+                novelty_pending_related = [
+                    str(region_key)
+                    for region_key in novelty_related_region_keys
+                    if self._parse_region_key_v1(str(region_key)) is not None
+                    and int(max(0, target_sample_counts.get(str(region_key), 0)))
+                    < int(
+                        max(
+                            1,
+                            target_required_samples.get(
+                                str(region_key),
+                                _required_samples(str(region_key)),
+                            ),
+                        )
+                    )
+                ]
+                novelty_rotate_to_related = bool(
+                    remaining_samples <= 0
+                    and novelty_pending_related
+                    and (
+                        str(target_region_key) == str(novelty_source_region_key)
+                        or str(target_region_key) in set(novelty_related_region_keys)
+                    )
+                )
+                if novelty_rotate_to_related:
+                    _disable_chain_lock("novelty_rotate")
+                    target_commit_active = False
+                    priority_subqueue_active = True
+                    priority_subqueue_keys = list(novelty_pending_related[:16])
+                    score_memory[str(target_region_key)] = float(
+                        min(float(score_memory.get(str(target_region_key), 0.0)), 0.06)
+                    )
+                    for idx, region_key in enumerate(novelty_pending_related):
+                        score_memory[str(region_key)] = float(
+                            max(
+                                float(score_memory.get(str(region_key), 0.0)),
+                                max(0.72, 0.94 - (0.07 * float(idx))),
+                            )
+                        )
+                    state["last_status"] = "novelty_rotate_to_related"
             if remaining_samples <= 0:
                 if not completed_regions or str(completed_regions[-1]) != str(target_region_key):
                     completed_regions.append(str(target_region_key))
@@ -6260,6 +6746,8 @@ class ActiveInferenceEFE(Agent):
                         max(0.56, float(score_memory.get(str(target_region_key), 0.0)))
                     )
             next_interaction_target_key = "NA"
+            if novelty_rotate_to_related and novelty_pending_related:
+                next_interaction_target_key = str(novelty_pending_related[0])
             if (
                 remaining_samples <= 0
                 and interaction_chain_active
@@ -6359,6 +6847,7 @@ class ActiveInferenceEFE(Agent):
                 state["target_sample_counts"] = dict(target_sample_counts)
                 state["target_required_samples"] = dict(target_required_samples)
                 _flush_pending_regions_to_state()
+                _flush_novelty_regions_to_state()
                 state["interaction_chain_active"] = bool(interaction_chain_active)
                 state["interaction_target_chain"] = list(interaction_target_chain[:16])
                 state["interaction_target_index"] = int(max(0, interaction_target_index))
@@ -6414,6 +6903,10 @@ class ActiveInferenceEFE(Agent):
                 state["chain_lock_last_status"] = str(chain_lock_last_status)
                 state["priority_subqueue_active"] = False
                 state["priority_subqueue_keys"] = []
+                novelty_protocol_active = False
+                novelty_source_region_key = "NA"
+                novelty_related_region_keys = []
+                _flush_novelty_regions_to_state()
                 state["completion_count"] = int(state.get("completion_count", 0) + 1)
                 state["last_status"] = "completed"
 
