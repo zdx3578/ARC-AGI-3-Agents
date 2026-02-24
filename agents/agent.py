@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
@@ -11,6 +10,7 @@ from arcengine import FrameData, FrameDataRaw, GameAction, GameState
 from pydantic import ValidationError
 
 from .recorder import Recorder
+from .runtime_settings import get_runtime_str
 from .tracing import trace_agent_session
 
 logger = logging.getLogger()
@@ -60,7 +60,7 @@ class Agent(ABC):
         if record:
             self.start_recording()
         self.headers = {
-            "X-API-Key": os.getenv("ARC_API_KEY", ""),
+            "X-API-Key": get_runtime_str("ARC_API_KEY", "", section="runtime"),
             "Accept": "application/json",
         }
         self.arc_env = arc_env

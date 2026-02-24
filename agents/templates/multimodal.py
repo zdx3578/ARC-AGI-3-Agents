@@ -5,7 +5,6 @@ import base64
 import io
 import json
 import logging
-import os
 import re
 from textwrap import dedent
 from typing import Any, List, Optional, Sequence, Tuple
@@ -18,6 +17,7 @@ from openai.types.chat import ChatCompletion
 from PIL import Image
 
 from ..agent import Agent
+from ..runtime_settings import get_runtime_str
 
 logger = logging.getLogger()
 
@@ -319,13 +319,15 @@ class MultiModalLLM(Agent):
             # add a small delay before resetting after GAME_OVER to avoid timeout
             return GameAction.RESET
 
-        client = OpenAIClient(api_key=os.environ.get("OPENAI_SECRET_KEY", ""))
+        client = OpenAIClient(
+            api_key=get_runtime_str("OPENAI_SECRET_KEY", "", section="agents")
+        )
         # client = OpenAIClient(
         #     base_url="https://openrouter.ai/api/v1",
-        #     api_key=os.environ.get("OPEN_ROUTER_KEY", "")
+        #     api_key=get_runtime_str("OPEN_ROUTER_KEY", "", section="agents")
         # )
         # client = OpenAIClient(
-        #     api_key=os.environ.get("GROK_API_KEY", ""),
+        #     api_key=get_runtime_str("GROK_API_KEY", "", section="agents"),
         #     base_url="https://api.x.ai/v1"
         # )
 

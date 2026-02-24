@@ -11,6 +11,13 @@ from typing import Any
 from arcengine import FrameData, GameAction, GameState
 
 from ...agent import Agent
+from ...runtime_settings import (
+    get_runtime_bool,
+    get_runtime_float,
+    get_runtime_int,
+    get_runtime_setting,
+    get_runtime_str,
+)
 from .contracts import (
     ActionCandidateV1,
     ObservationPacketV1,
@@ -31,50 +38,43 @@ from .representation import (
 from .trace import ActiveInferenceTraceRecorderV1
 
 
-def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name, "").strip()
-    if not value:
-        return int(default)
-    try:
-        return int(value)
-    except Exception:
-        return int(default)
+def _cfg_value(name: str, default: Any) -> Any:
+    return get_runtime_setting(name, default, section="active_inference")
 
 
-def _env_float(name: str, default: float) -> float:
-    value = os.getenv(name, "").strip()
-    if not value:
-        return float(default)
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
+def _cfg_int(name: str, default: int) -> int:
+    return get_runtime_int(name, int(default), section="active_inference")
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name, "").strip().lower()
-    if not value:
-        return bool(default)
-    if value in ("1", "true", "yes", "y", "on"):
-        return True
-    if value in ("0", "false", "no", "n", "off"):
-        return False
-    return bool(default)
+def _cfg_float(name: str, default: float) -> float:
+    return get_runtime_float(name, float(default), section="active_inference")
 
 
-def _env_weight_overrides() -> dict[str, dict[str, float]]:
-    raw = os.getenv("ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON", "").strip()
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        return {}
+def _cfg_bool(name: str, default: bool) -> bool:
+    return get_runtime_bool(name, bool(default), section="active_inference")
+
+
+def _cfg_weight_overrides() -> dict[str, dict[str, float]]:
+    raw_any = _cfg_value("ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON", {})
+    parsed: Any = raw_any
+    if isinstance(raw_any, str):
+        raw = raw_any.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
     if not isinstance(parsed, dict):
         return {}
 
+    try:
+        parsed_dict: dict[str, Any] = dict(parsed)
+    except Exception:
+        return {}
+
     out: dict[str, dict[str, float]] = {}
-    for phase_any, values_any in parsed.items():
+    for phase_any, values_any in parsed_dict.items():
         phase = str(phase_any).strip()
         if phase not in ("explore", "explain", "exploit"):
             continue
@@ -123,7 +123,7 @@ class ActiveInferenceEFE(Agent):
         super().__init__(*args, **kwargs)
         self.episode_session_id = uuid.uuid4().hex[:12]
         self.cross_episode_memory_hard_off = True
-        self.cross_episode_memory_enable_requested = _env_bool(
+        self.cross_episode_memory_enable_requested = _cfg_bool(
             "ACTIVE_INFERENCE_ENABLE_CROSS_EPISODE_MEMORY",
             False,
         )
@@ -131,185 +131,193 @@ class ActiveInferenceEFE(Agent):
             self.cross_episode_memory_enable_requested
         )
         self.action_cost_objective_hard_off = True
-        self.action_cost_objective_enable_requested = _env_bool(
+        self.action_cost_objective_enable_requested = _cfg_bool(
             "ACTIVE_INFERENCE_ENABLE_ACTION_COST_OBJECTIVE",
             False,
         )
         self.action_cost_objective_override_blocked = bool(
             self.action_cost_objective_enable_requested
         )
-        self.MAX_ACTIONS = max(1, _env_int("ACTIVE_INFERENCE_MAX_ACTIONS", 80))
+        self.MAX_ACTIONS = max(1, _cfg_int("ACTIVE_INFERENCE_MAX_ACTIONS", 80))
         self.component_connectivity = (
-            4 if _env_int("ACTIVE_INFERENCE_COMPONENT_CONNECTIVITY", 8) == 4 else 8
+            4 if _cfg_int("ACTIVE_INFERENCE_COMPONENT_CONNECTIVITY", 8) == 4 else 8
         )
-        self.max_action6_points = max(1, _env_int("ACTIVE_INFERENCE_MAX_ACTION6_POINTS", 16))
-        self.top_k_reasoning = max(1, _env_int("ACTIVE_INFERENCE_TOP_K_REASONING", 5))
-        self.trace_candidate_limit = max(1, _env_int("ACTIVE_INFERENCE_TRACE_CANDIDATE_LIMIT", 30))
-        self.trace_include_full_representation = _env_bool(
+        self.max_action6_points = max(1, _cfg_int("ACTIVE_INFERENCE_MAX_ACTION6_POINTS", 16))
+        self.top_k_reasoning = max(1, _cfg_int("ACTIVE_INFERENCE_TOP_K_REASONING", 5))
+        self.trace_candidate_limit = max(1, _cfg_int("ACTIVE_INFERENCE_TRACE_CANDIDATE_LIMIT", 30))
+        self.trace_include_full_representation = _cfg_bool(
             "ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION",
             False,
         )
-        self.frame_chain_window = max(1, _env_int("ACTIVE_INFERENCE_FRAME_CHAIN_WINDOW", 8))
+        self.frame_chain_window = max(1, _cfg_int("ACTIVE_INFERENCE_FRAME_CHAIN_WINDOW", 8))
         self.available_actions_history_window = max(
             1,
-            _env_int("ACTIVE_INFERENCE_ACTION_SPACE_HISTORY_WINDOW", 24),
+            _cfg_int("ACTIVE_INFERENCE_ACTION_SPACE_HISTORY_WINDOW", 24),
         )
-        self.rollout_horizon = max(1, _env_int("ACTIVE_INFERENCE_ROLLOUT_HORIZON", 2))
+        self.rollout_horizon = max(1, _cfg_int("ACTIVE_INFERENCE_ROLLOUT_HORIZON", 2))
         self.rollout_discount = max(
             0.0,
-            min(1.0, _env_float("ACTIVE_INFERENCE_ROLLOUT_DISCOUNT", 0.55)),
+            min(1.0, _cfg_float("ACTIVE_INFERENCE_ROLLOUT_DISCOUNT", 0.55)),
         )
         self.rollout_max_candidates = max(
             1,
-            _env_int("ACTIVE_INFERENCE_ROLLOUT_MAX_CANDIDATES", 8),
+            _cfg_int("ACTIVE_INFERENCE_ROLLOUT_MAX_CANDIDATES", 8),
         )
-        self.rollout_only_in_exploit = _env_bool(
+        self.rollout_only_in_exploit = _cfg_bool(
             "ACTIVE_INFERENCE_ROLLOUT_ONLY_IN_EXPLOIT",
             True,
         )
         self.region_revisit_hard_threshold = max(
             4,
-            _env_int("ACTIVE_INFERENCE_REGION_REVISIT_HARD_THRESHOLD", 24),
+            _cfg_int("ACTIVE_INFERENCE_REGION_REVISIT_HARD_THRESHOLD", 24),
         )
         self.sequence_rollout_frontier_weight = max(
             0.0,
-            _env_float("ACTIVE_INFERENCE_SEQUENCE_ROLLOUT_FRONTIER_WEIGHT", 0.35),
+            _cfg_float("ACTIVE_INFERENCE_SEQUENCE_ROLLOUT_FRONTIER_WEIGHT", 0.35),
         )
         self.sequence_rollout_direction_weight = max(
             0.0,
-            _env_float("ACTIVE_INFERENCE_SEQUENCE_ROLLOUT_DIRECTION_WEIGHT", 0.25),
+            _cfg_float("ACTIVE_INFERENCE_SEQUENCE_ROLLOUT_DIRECTION_WEIGHT", 0.25),
         )
         self.sequence_probe_score_margin = max(
             0.0,
-            _env_float("ACTIVE_INFERENCE_SEQUENCE_PROBE_SCORE_MARGIN", 0.28),
+            _cfg_float("ACTIVE_INFERENCE_SEQUENCE_PROBE_SCORE_MARGIN", 0.28),
         )
         self.sequence_probe_trigger_steps = max(
             1,
-            _env_int("ACTIVE_INFERENCE_SEQUENCE_PROBE_TRIGGER_STEPS", 20),
+            _cfg_int("ACTIVE_INFERENCE_SEQUENCE_PROBE_TRIGGER_STEPS", 20),
         )
         self.coverage_sweep_target_regions = max(
             1,
-            _env_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_TARGET_REGIONS", 24),
+            _cfg_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_TARGET_REGIONS", 24),
         )
         self.coverage_sweep_score_margin = max(
             0.0,
-            _env_float("ACTIVE_INFERENCE_COVERAGE_SWEEP_SCORE_MARGIN", 0.42),
+            _cfg_float("ACTIVE_INFERENCE_COVERAGE_SWEEP_SCORE_MARGIN", 0.42),
         )
         self.coverage_resweep_interval = max(
             0,
-            _env_int("ACTIVE_INFERENCE_COVERAGE_RESWEEP_INTERVAL", 96),
+            _cfg_int("ACTIVE_INFERENCE_COVERAGE_RESWEEP_INTERVAL", 96),
         )
         self.coverage_resweep_span = max(
             0,
-            _env_int("ACTIVE_INFERENCE_COVERAGE_RESWEEP_SPAN", 24),
+            _cfg_int("ACTIVE_INFERENCE_COVERAGE_RESWEEP_SPAN", 24),
         )
         self.coverage_sweep_direction_retry_limit = max(
             1,
-            _env_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_DIRECTION_RETRY_LIMIT", 8),
+            _cfg_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_DIRECTION_RETRY_LIMIT", 8),
         )
         self.coverage_sweep_min_region_visits = max(
             1,
-            _env_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_MIN_REGION_VISITS", 2),
+            _cfg_int("ACTIVE_INFERENCE_COVERAGE_SWEEP_MIN_REGION_VISITS", 2),
         )
         self.coverage_prepass_steps = max(
             0,
-            _env_int(
+            _cfg_int(
                 "ACTIVE_INFERENCE_COVERAGE_PREPASS_STEPS",
                 min(300, int(self.MAX_ACTIONS)),
             ),
         )
         self.coverage_prepass_passes = max(
             1,
-            min(2, _env_int("ACTIVE_INFERENCE_COVERAGE_PREPASS_PASSES", 1)),
+            min(2, _cfg_int("ACTIVE_INFERENCE_COVERAGE_PREPASS_PASSES", 1)),
         )
-        self.coverage_matrix_sweep_enabled = _env_bool(
+        self.coverage_matrix_sweep_enabled = _cfg_bool(
             "ACTIVE_INFERENCE_COVERAGE_MATRIX_SWEEP_ENABLED",
             True,
         )
-        self.coverage_sweep_force_in_exploit = _env_bool(
+        self.coverage_sweep_force_in_exploit = _cfg_bool(
             "ACTIVE_INFERENCE_COVERAGE_SWEEP_FORCE_IN_EXPLOIT",
             True,
         )
-        self.high_info_focus_release_after_first_pass = _env_bool(
+        self.high_info_focus_release_after_first_pass = _cfg_bool(
             "ACTIVE_INFERENCE_HIGH_INFO_RELEASE_AFTER_FIRST_PASS",
             True,
         )
-        self.high_info_focus_release_action_counter = _env_int(
+        self.high_info_focus_release_action_counter = _cfg_int(
             "ACTIVE_INFERENCE_HIGH_INFO_RELEASE_ACTION_COUNTER",
             -1,
         )
-        self.enable_navigation_confidence_gating = _env_bool(
+        self.enable_navigation_confidence_gating = _cfg_bool(
             "ACTIVE_INFERENCE_NAV_CONFIDENCE_GATING_ENABLED",
             True,
         )
-        self.enable_sequence_causal_term = _env_bool(
+        self.enable_sequence_causal_term = _cfg_bool(
             "ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TERM_ENABLED",
             True,
         )
         self.sequence_causal_window_steps = max(
             4,
-            _env_int("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_WINDOW_STEPS", 24),
+            _cfg_int("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_WINDOW_STEPS", 24),
         )
         self.sequence_causal_verify_window_steps = max(
             2,
-            _env_int(
+            _cfg_int(
                 "ACTIVE_INFERENCE_SEQUENCE_CAUSAL_VERIFY_WINDOW_STEPS",
                 max(4, int(self.sequence_causal_window_steps // 3)),
             ),
         )
         self.sequence_causal_trigger_region_key = str(
-            os.getenv("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TRIGGER_REGION", "NA").strip()
+            get_runtime_str(
+                "ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TRIGGER_REGION",
+                "NA",
+                section="active_inference",
+            ).strip()
             or "NA"
         )
         self.sequence_causal_target_region_key = str(
-            os.getenv("ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TARGET_REGION", "NA").strip()
+            get_runtime_str(
+                "ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TARGET_REGION",
+                "NA",
+                section="active_inference",
+            ).strip()
             or "NA"
         )
         self.high_info_focus_window_steps = max(
             4,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_FOCUS_WINDOW_STEPS", 16),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_FOCUS_WINDOW_STEPS", 16),
         )
         self.high_info_chain_lock_window_steps = max(
             1,
-            _env_int(
+            _cfg_int(
                 "ACTIVE_INFERENCE_HIGH_INFO_CHAIN_LOCK_WINDOW_STEPS",
                 max(3, int(self.high_info_focus_window_steps // 3)),
             ),
         )
         self.high_info_target_commit_window_steps = max(
             2,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_TARGET_COMMIT_WINDOW_STEPS", 10),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_TARGET_COMMIT_WINDOW_STEPS", 10),
         )
         self.high_info_chain_lock_miss_limit = max(
             1,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_CHAIN_LOCK_MISS_LIMIT", 3),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_CHAIN_LOCK_MISS_LIMIT", 3),
         )
         self.high_info_target_commit_miss_limit = max(
             1,
-            _env_int(
+            _cfg_int(
                 "ACTIVE_INFERENCE_HIGH_INFO_TARGET_COMMIT_MISS_LIMIT",
                 max(4, int(self.high_info_target_commit_window_steps)),
             ),
         )
         self.high_info_focus_max_targets = max(
             1,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_FOCUS_MAX_TARGETS", 3),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_FOCUS_MAX_TARGETS", 3),
         )
         self.high_info_focus_min_trigger_score = max(
             0.0,
-            min(1.0, _env_float("ACTIVE_INFERENCE_HIGH_INFO_MIN_TRIGGER_SCORE", 0.50)),
+            min(1.0, _cfg_float("ACTIVE_INFERENCE_HIGH_INFO_MIN_TRIGGER_SCORE", 0.50)),
         )
         self.high_info_strong_change_pixels = max(
             64,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_STRONG_CHANGE_PIXELS", 512),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_STRONG_CHANGE_PIXELS", 512),
         )
         self.high_info_min_samples_per_target = max(
             1,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_MIN_SAMPLES_PER_TARGET", 2),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_MIN_SAMPLES_PER_TARGET", 2),
         )
         self.high_info_coupled_min_samples = max(
             int(self.high_info_min_samples_per_target),
-            _env_int(
+            _cfg_int(
                 "ACTIVE_INFERENCE_HIGH_INFO_COUPLED_MIN_SAMPLES",
                 max(3, int(self.high_info_min_samples_per_target) + 1),
             ),
@@ -318,155 +326,155 @@ class ActiveInferenceEFE(Agent):
             0.0,
             min(
                 1.0,
-                _env_float("ACTIVE_INFERENCE_HIGH_INFO_COUPLED_SCORE_FLOOR", 0.76),
+                _cfg_float("ACTIVE_INFERENCE_HIGH_INFO_COUPLED_SCORE_FLOOR", 0.76),
             ),
         )
         self.high_info_retrigger_cooldown_steps = max(
             0,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_RETRIGGER_COOLDOWN_STEPS", 10),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_RETRIGGER_COOLDOWN_STEPS", 10),
         )
-        self.high_info_simultaneous_focus_enabled = _env_bool(
+        self.high_info_simultaneous_focus_enabled = _cfg_bool(
             "ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_FOCUS_ENABLED",
             True,
         )
         self.high_info_simultaneous_min_region_pixels = max(
             1,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_MIN_REGION_PIXELS", 12),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_MIN_REGION_PIXELS", 12),
         )
         self.high_info_simultaneous_top_region_ratio = max(
             0.0,
             min(
                 1.0,
-                _env_float("ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_TOP_REGION_RATIO", 0.30),
+                _cfg_float("ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_TOP_REGION_RATIO", 0.30),
             ),
         )
         self.high_info_simultaneous_max_targets = max(
             1,
-            _env_int(
+            _cfg_int(
                 "ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_MAX_TARGETS",
                 max(3, int(self.high_info_focus_max_targets) + 1),
             ),
         )
         self.high_info_simultaneous_min_total_pixels = max(
             1,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_MIN_TOTAL_PIXELS", 24),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_SIMULTANEOUS_MIN_TOTAL_PIXELS", 24),
         )
         self.high_info_reachability_graph_min_edges = max(
             0,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_REACHABILITY_GRAPH_MIN_EDGES", 14),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_REACHABILITY_GRAPH_MIN_EDGES", 14),
         )
         self.high_info_reachability_graph_min_regions = max(
             1,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_REACHABILITY_GRAPH_MIN_REGIONS", 6),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_REACHABILITY_GRAPH_MIN_REGIONS", 6),
         )
-        self.high_info_novelty_protocol_enabled = _env_bool(
+        self.high_info_novelty_protocol_enabled = _cfg_bool(
             "ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_PROTOCOL_ENABLED",
             True,
         )
         self.high_info_novelty_retrigger_extra_samples = max(
             0,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_RETRIGGER_EXTRA_SAMPLES", 2),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_RETRIGGER_EXTRA_SAMPLES", 2),
         )
         self.high_info_novelty_related_extra_samples = max(
             0,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_RELATED_EXTRA_SAMPLES", 1),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_RELATED_EXTRA_SAMPLES", 1),
         )
         self.high_info_novelty_max_related_targets = max(
             1,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_MAX_RELATED_TARGETS", 3),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_MAX_RELATED_TARGETS", 3),
         )
         self.high_info_novelty_stats_max_entries = max(
             4,
-            _env_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_STATS_MAX_ENTRIES", 24),
+            _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_STATS_MAX_ENTRIES", 24),
         )
         self.orientation_alignment_min_similarity = max(
             0.35,
-            min(0.95, _env_float("ACTIVE_INFERENCE_ORIENTATION_MIN_SIMILARITY", 0.68)),
+            min(0.95, _cfg_float("ACTIVE_INFERENCE_ORIENTATION_MIN_SIMILARITY", 0.68)),
         )
         self.orientation_alignment_improve_delta = max(
             0.01,
-            min(0.30, _env_float("ACTIVE_INFERENCE_ORIENTATION_IMPROVE_DELTA", 0.04)),
+            min(0.30, _cfg_float("ACTIVE_INFERENCE_ORIENTATION_IMPROVE_DELTA", 0.04)),
         )
-        self.enable_empirical_region_override = _env_bool(
+        self.enable_empirical_region_override = _cfg_bool(
             "ACTIVE_INFERENCE_ENABLE_EMPIRICAL_REGION_OVERRIDE",
             True,
         )
         self.early_probe_budget = max(
             0,
-            _env_int(
+            _cfg_int(
                 "ACTIVE_INFERENCE_EARLY_PROBE_BUDGET",
                 max(8, min(512, int(round(float(self.MAX_ACTIONS) * 0.08)))),
             ),
         )
         self.action6_bucket_probe_min_attempts = max(
             1,
-            _env_int("ACTIVE_INFERENCE_ACTION6_BUCKET_PROBE_MIN_ATTEMPTS", 3),
+            _cfg_int("ACTIVE_INFERENCE_ACTION6_BUCKET_PROBE_MIN_ATTEMPTS", 3),
         )
         self.action6_subcluster_probe_min_attempts = max(
             1,
-            _env_int("ACTIVE_INFERENCE_ACTION6_SUBCLUSTER_PROBE_MIN_ATTEMPTS", 2),
+            _cfg_int("ACTIVE_INFERENCE_ACTION6_SUBCLUSTER_PROBE_MIN_ATTEMPTS", 2),
         )
         self.action6_probe_score_margin = max(
             0.0,
-            _env_float("ACTIVE_INFERENCE_ACTION6_PROBE_SCORE_MARGIN", 0.06),
+            _cfg_float("ACTIVE_INFERENCE_ACTION6_PROBE_SCORE_MARGIN", 0.06),
         )
         self.action6_explore_probe_score_margin = max(
             0.0,
-            _env_float("ACTIVE_INFERENCE_ACTION6_EXPLORE_PROBE_SCORE_MARGIN", 0.12),
+            _cfg_float("ACTIVE_INFERENCE_ACTION6_EXPLORE_PROBE_SCORE_MARGIN", 0.12),
         )
         self.action6_stagnation_step_threshold = max(
             1,
-            _env_int("ACTIVE_INFERENCE_ACTION6_STAGNATION_STEP_THRESHOLD", 12),
+            _cfg_int("ACTIVE_INFERENCE_ACTION6_STAGNATION_STEP_THRESHOLD", 12),
         )
         self.stagnation_probe_trigger_steps = max(
             1,
-            _env_int("ACTIVE_INFERENCE_STAGNATION_PROBE_TRIGGER_STEPS", 24),
+            _cfg_int("ACTIVE_INFERENCE_STAGNATION_PROBE_TRIGGER_STEPS", 24),
         )
         self.stagnation_probe_score_margin = max(
             0.0,
-            _env_float("ACTIVE_INFERENCE_STAGNATION_PROBE_SCORE_MARGIN", 0.22),
+            _cfg_float("ACTIVE_INFERENCE_STAGNATION_PROBE_SCORE_MARGIN", 0.22),
         )
         self.stagnation_probe_min_action_usage_gap = max(
             1,
-            _env_int("ACTIVE_INFERENCE_STAGNATION_PROBE_MIN_ACTION_USAGE_GAP", 8),
+            _cfg_int("ACTIVE_INFERENCE_STAGNATION_PROBE_MIN_ACTION_USAGE_GAP", 8),
         )
         self.stagnation_stop_loss_steps = max(
             1,
-            _env_int(
+            _cfg_int(
                 "ACTIVE_INFERENCE_STAGNATION_STOP_LOSS_STEPS",
                 max(80, int(round(float(self.MAX_ACTIONS) * 0.45))),
             ),
         )
         self.no_change_stop_loss_steps = max(
             1,
-            _env_int("ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS", 3),
+            _cfg_int("ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS", 3),
         )
-        self.stop_on_game_over = _env_bool(
+        self.stop_on_game_over = _cfg_bool(
             "ACTIVE_INFERENCE_STOP_ON_GAME_OVER",
             True,
         )
 
-        explore_steps = max(1, _env_int("ACTIVE_INFERENCE_EXPLORE_STEPS", 20))
+        explore_steps = max(1, _cfg_int("ACTIVE_INFERENCE_EXPLORE_STEPS", 20))
         self.exploration_base_steps = int(explore_steps)
         self.exploration_min_steps = max(
             1,
-            _env_int("ACTIVE_INFERENCE_EXPLORATION_MIN_STEPS", 20),
+            _cfg_int("ACTIVE_INFERENCE_EXPLORATION_MIN_STEPS", 20),
         )
         self.exploration_max_steps = max(
             self.exploration_min_steps,
-            _env_int(
+            _cfg_int(
                 "ACTIVE_INFERENCE_EXPLORATION_MAX_STEPS",
                 max(120, int(round(float(self.MAX_ACTIONS) * 0.70))),
             ),
         )
         self.exploration_fraction = max(
             0.0,
-            min(1.0, _env_float("ACTIVE_INFERENCE_EXPLORATION_FRACTION", 0.35)),
+            min(1.0, _cfg_float("ACTIVE_INFERENCE_EXPLORATION_FRACTION", 0.35)),
         )
         exploit_entropy_threshold = max(
-            0.0, _env_float("ACTIVE_INFERENCE_EXPLOIT_ENTROPY_THRESHOLD", 0.9)
+            0.0, _cfg_float("ACTIVE_INFERENCE_EXPLOIT_ENTROPY_THRESHOLD", 0.9)
         )
-        weight_overrides = _env_weight_overrides()
+        weight_overrides = _cfg_weight_overrides()
         self.policy = ActiveInferencePolicyEvaluatorV1(
             explore_steps=explore_steps,
             exploit_entropy_threshold=exploit_entropy_threshold,
@@ -527,7 +535,7 @@ class ActiveInferenceEFE(Agent):
         self._subcluster_select_count: dict[str, int] = {}
         self._navigation_direction_history_window = max(
             8,
-            _env_int("ACTIVE_INFERENCE_DIRECTION_HISTORY_WINDOW", 256),
+            _cfg_int("ACTIVE_INFERENCE_DIRECTION_HISTORY_WINDOW", 256),
         )
         self._recent_navigation_directions: list[str] = []
         self._navigation_direction_visit_count: dict[str, int] = {}
@@ -676,11 +684,11 @@ class ActiveInferenceEFE(Agent):
             "last_status": "idle",
         }
 
-        self.trace_enabled = _env_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
+        self.trace_enabled = _cfg_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
         self.trace_recorder: ActiveInferenceTraceRecorderV1 | None = None
         self._trace_closed = False
         if self.trace_enabled:
-            trace_root = os.getenv("RECORDINGS_DIR", "recordings")
+            trace_root = get_runtime_str("RECORDINGS_DIR", "recordings", section="runtime")
             self.trace_recorder = ActiveInferenceTraceRecorderV1(
                 root_dir=trace_root,
                 game_id=self.game_id,

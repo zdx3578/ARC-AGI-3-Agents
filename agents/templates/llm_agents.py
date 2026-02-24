@@ -1,6 +1,5 @@
 import json
 import logging
-import os
 import textwrap
 from typing import Any, Optional
 
@@ -9,6 +8,7 @@ from arcengine import FrameData, GameAction, GameState
 from openai import OpenAI as OpenAIClient
 
 from ..agent import Agent
+from ..runtime_settings import get_runtime_str
 
 logger = logging.getLogger()
 
@@ -60,7 +60,9 @@ class LLM(Agent):
         logging.getLogger("openai").setLevel(logging.CRITICAL)
         logging.getLogger("httpx").setLevel(logging.CRITICAL)
 
-        client = OpenAIClient(api_key=os.environ.get("OPENAI_API_KEY", ""))
+        client = OpenAIClient(
+            api_key=get_runtime_str("OPENAI_API_KEY", "", section="agents")
+        )
 
         functions = self.build_functions()
         tools = self.build_tools()

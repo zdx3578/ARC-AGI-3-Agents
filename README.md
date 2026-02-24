@@ -11,19 +11,27 @@ git clone https://github.com/arcprize/ARC-AGI-3-Agents.git
 cd ARC-AGI-3-Agents
 ```
 
-2. Copy .env.example to .env
+2. Create runtime config file `config/runtime_config.local.json`.
 
 ```bash
-cp .env.example .env
+mkdir -p config
+cat > config/runtime_config.local.json <<'JSON'
+{
+  "runtime": {
+    "ARC_API_KEY": "your_api_key_here",
+    "ARC_BASE_URL": "https://three.arcprize.org",
+    "OPERATION_MODE": "normal",
+    "ENVIRONMENTS_DIR": "environment_files",
+    "RECORDINGS_DIR": "recordings",
+    "SCHEME": "https",
+    "HOST": "three.arcprize.org",
+    "PORT": 443
+  }
+}
+JSON
 ```
 
-3. Get an API key from the [ARC-AGI-3 Website](https://three.arcprize.org/) and set it as an environment variable in your .env file.
-
-```bash
-export ARC_API_KEY="your_api_key_here"
-```
-
-4. Run the random agent (generates random actions) against the ls20 game.
+3. Run the random agent (generates random actions) against the ls20 game.
 
 ```bash
 uv run main.py --agent=random --game=ls20
@@ -71,7 +79,7 @@ Run it with:
 uv run main.py --agent=activeinferenceefe --game=ls20
 ```
 
-Useful environment variables:
+Useful `active_inference` config keys (set in `config/runtime_config.local.json`):
 
 - `ACTIVE_INFERENCE_MAX_ACTIONS` (default `80`)
 - `ACTIVE_INFERENCE_COMPONENT_CONNECTIVITY` (`4` or `8`, default `8`)
@@ -101,18 +109,26 @@ Useful environment variables:
 - `ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION` (default `false`)
 - `ACTIVE_INFERENCE_FRAME_CHAIN_WINDOW` (default `8`)
 - `ACTIVE_INFERENCE_ACTION_SPACE_HISTORY_WINDOW` (default `24`)
-- `ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` (optional)
+- `ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` (optional object; can also be JSON string)
 
-`ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` format example:
+`ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` example:
 
-```bash
-export ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON='{
-  "explore": {
-    "information_gain_mechanism_dynamics": 1.7,
-    "information_gain_action_semantics": 1.3
-  },
-  "exploit": {"action_cost": 1.2, "risk": 1.4, "vfe": 0.2}
-}'
+```json
+{
+  "active_inference": {
+    "ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON": {
+      "explore": {
+        "information_gain_mechanism_dynamics": 1.7,
+        "information_gain_action_semantics": 1.3
+      },
+      "exploit": {
+        "action_cost": 1.2,
+        "risk": 1.4,
+        "vfe": 0.2
+      }
+    }
+  }
+}
 ```
 
 ## Team Run Profiles
@@ -125,9 +141,11 @@ For this project, keep two standard run profiles so diagnostics are comparable:
 Example (single game):
 
 ```bash
-ACTIVE_INFERENCE_MAX_ACTIONS=300 uv run main.py --agent=activeinferenceefe --game=ls20 --tags=profile,debug300
-ACTIVE_INFERENCE_MAX_ACTIONS=3000 uv run main.py --agent=activeinferenceefe --game=ls20 --tags=profile,long3000
+uv run main.py --agent=activeinferenceefe --game=ls20 --tags=profile,debug300
+uv run main.py --agent=activeinferenceefe --game=ls20 --tags=profile,long3000
 ```
+
+Before each profile run, set `active_inference.ACTIVE_INFERENCE_MAX_ACTIONS` in `config/runtime_config.local.json` (e.g. `300` or `3000`).
 
 ### Offline / API-502 Fallback
 
@@ -138,15 +156,14 @@ with explicit `--game` ids. The runner no longer hard-fails on game-list fetch.
 uv run main.py --agent=random --game=ls20
 ```
 
-To force local-only execution (no online API calls), use:
+To force local-only execution (no online API calls), set `runtime.OPERATION_MODE` to `"offline"` and `runtime.ENVIRONMENTS_DIR` to your local path in config, then run:
 
 ```bash
-OPERATION_MODE=offline ENVIRONMENTS_DIR=environment_files \
 uv run main.py --agent=random --game=ls20
 ```
 
 Notes:
-- `OPERATION_MODE=offline` requires local environments in `ENVIRONMENTS_DIR`.
+- `runtime.OPERATION_MODE="offline"` requires local environments in `runtime.ENVIRONMENTS_DIR`.
 - If a game is not present locally, the run now exits cleanly with a clear "No playable environments" error.
 
 ### 2080 / 2080-out3TS Batch Example
@@ -162,7 +179,6 @@ Use repeated exploration with `500` actions per game:
 ```bash
 for game in ls20 ft09 vc33; do
   for run in 1 2 3 4 5; do
-    ACTIVE_INFERENCE_MAX_ACTIONS=500 \
     uv run main.py \
       --agent=activeinferenceefe \
       --game="$game" \

@@ -4,12 +4,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from .runtime_settings import get_runtime_str
+
 RECORDING_SUFFIX = ".recording.jsonl"
 
 
 def get_recordings_dir() -> str:
-    """Get the current recordings directory from environment variable."""
-    return os.environ.get("RECORDINGS_DIR", "")
+    """Get recordings directory from runtime config."""
+    return get_runtime_str("RECORDINGS_DIR", "recordings", section="runtime")
 
 
 class Recorder:

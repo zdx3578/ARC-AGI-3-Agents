@@ -1,12 +1,12 @@
 import json
 import logging
-import os
 import subprocess
 from typing import Any
 
 from arcengine import FrameData, GameAction, GameState
 
 from ..agent import Agent
+from ..runtime_settings import get_runtime_float, get_runtime_str
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +21,17 @@ class CatCsetArcBridge(Agent):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.policy_command = os.getenv("CATCSETARC_POLICY_COMMAND", "").strip()
+        self.policy_command = get_runtime_str(
+            "CATCSETARC_POLICY_COMMAND",
+            "",
+            section="agents",
+        ).strip()
         self.policy_timeout_seconds = float(
-            os.getenv("CATCSETARC_POLICY_TIMEOUT_SECONDS", "1.0")
+            get_runtime_float(
+                "CATCSETARC_POLICY_TIMEOUT_SECONDS",
+                1.0,
+                section="agents",
+            )
         )
 
     @property

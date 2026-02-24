@@ -1,0 +1,15 @@
+{
+  "runtime": {
+    "SCHEME": "http",
+    "HOST": "localhost",
+    "PORT": 8001,
+    "DEBUG": false,
+    "ARC_API_KEY": "",
+    "ARC_BASE_URL": "https://three.arcprize.org",
+    "OPERATION_MODE": "offline",
+    "ENVIRONMENTS_DIR": "environment_files",
+    "RECORDINGS_DIR": "recordings",
+    "AGENTOPS_API_KEY": ""
+  },
+  "active_inference": {}
+}

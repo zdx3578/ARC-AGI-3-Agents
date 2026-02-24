@@ -1,27 +1,6 @@
 # ruff: noqa: E402
 import os
 
-from dotenv import load_dotenv
-
-# Preserve explicit runtime environment overrides (e.g. OPERATION_MODE=offline uv run ...)
-# before loading dotenv files.
-_RUNTIME_ENV_OVERRIDES = {
-    key: os.environ[key]
-    for key in (
-        "ARC_API_KEY",
-        "ARC_BASE_URL",
-        "OPERATION_MODE",
-        "ENVIRONMENTS_DIR",
-        "RECORDINGS_DIR",
-        "ONLINE_ONLY",
-        "OFFLINE_ONLY",
-    )
-    if key in os.environ
-}
-
-load_dotenv(dotenv_path=".env.example")
-load_dotenv(dotenv_path=".env", override=True)
-
 import argparse
 import json
 import logging
@@ -32,18 +11,20 @@ from functools import partial
 from types import FrameType
 from typing import Optional
 
-from arc_agi import Arcade
+from arc_agi import Arcade, OperationMode
 from agents import AVAILABLE_AGENTS, Swarm
+from agents.runtime_settings import (
+    get_runtime_bool,
+    get_runtime_int,
+    get_runtime_str,
+)
 from agents.tracing import initialize as init_agentops
-
-# Re-apply runtime overrides after imports so explicit shell vars keep highest precedence.
-os.environ.update(_RUNTIME_ENV_OVERRIDES)
 
 logger = logging.getLogger()
 
-SCHEME = os.environ.get("SCHEME", "http")
-HOST = os.environ.get("HOST", "localhost")
-PORT = os.environ.get("PORT", 8001)
+SCHEME = get_runtime_str("SCHEME", "http", section="runtime")
+HOST = get_runtime_str("HOST", "localhost", section="runtime")
+PORT = get_runtime_int("PORT", 8001, section="runtime")
 
 # Hide standard ports in URL
 if (SCHEME == "http" and str(PORT) == "80") or (
@@ -52,6 +33,14 @@ if (SCHEME == "http" and str(PORT) == "80") or (
     ROOT_URL = f"{SCHEME}://{HOST}"
 else:
     ROOT_URL = f"{SCHEME}://{HOST}:{PORT}"
+
+
+def _operation_mode_from_config() -> OperationMode:
+    raw = get_runtime_str("OPERATION_MODE", "normal", section="runtime").strip().lower()
+    try:
+        return OperationMode(raw)
+    except Exception:
+        return OperationMode.NORMAL
 
 
 def _dedupe_preserve_order(values: list[str]) -> list[str]:
@@ -73,7 +62,17 @@ def _parse_requested_games(game_arg: Optional[str]) -> list[str]:
 
 def _collect_available_games() -> list[str]:
     try:
-        arcade = Arcade()
+        arcade = Arcade(
+            arc_api_key=get_runtime_str("ARC_API_KEY", "", section="runtime"),
+            arc_base_url=get_runtime_str(
+                "ARC_BASE_URL", "https://three.arcprize.org", section="runtime"
+            ),
+            operation_mode=_operation_mode_from_config(),
+            environments_dir=get_runtime_str(
+                "ENVIRONMENTS_DIR", "environment_files", section="runtime"
+            ),
+            recordings_dir=get_runtime_str("RECORDINGS_DIR", "recordings", section="runtime"),
+        )
         environments = arcade.get_environments()
         game_ids = _dedupe_preserve_order(
             [env.game_id for env in environments if env.game_id]
@@ -141,7 +140,7 @@ def cleanup(
 
 def main() -> None:
     log_level = logging.INFO
-    if os.environ.get("DEBUG", "False") == "True":
+    if get_runtime_bool("DEBUG", False, section="runtime"):
         log_level = logging.DEBUG
 
     logger.setLevel(log_level)
@@ -230,7 +229,10 @@ def main() -> None:
         tags.extend(user_tags)
 
     # Initialize AgentOps client
-    init_agentops(api_key=os.getenv("AGENTOPS_API_KEY"), log_level=log_level)
+    init_agentops(
+        api_key=get_runtime_str("AGENTOPS_API_KEY", "", section="runtime"),
+        log_level=log_level,
+    )
 
     swarm = Swarm(
         args.agent,
@@ -257,5 +259,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    os.environ["TESTING"] = "False"
     main()

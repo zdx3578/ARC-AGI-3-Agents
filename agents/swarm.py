@@ -2,17 +2,26 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from threading import Thread
 from typing import TYPE_CHECKING, Optional, Type
 
 from arc_agi import Arcade, OperationMode
 from arc_agi.scorecard import EnvironmentScorecard
 
+from .runtime_settings import get_runtime_str
+
 if TYPE_CHECKING:
     from .agent import Agent
 
 logger = logging.getLogger()
+
+
+def _operation_mode_from_config() -> OperationMode:
+    raw = get_runtime_str("OPERATION_MODE", "normal", section="runtime").strip().lower()
+    try:
+        return OperationMode(raw)
+    except Exception:
+        return OperationMode.NORMAL
 
 
 class Swarm:
@@ -48,11 +57,21 @@ class Swarm:
         self.agents = []
         self.cleanup_threads = []
         self.headers = {
-            "X-API-Key": os.getenv("ARC_API_KEY", ""),
+            "X-API-Key": get_runtime_str("ARC_API_KEY", "", section="runtime"),
             "Accept": "application/json",
         }
         self.tags = tags.copy() if tags is not None else []
-        self._arc = Arcade()
+        self._arc = Arcade(
+            arc_api_key=get_runtime_str("ARC_API_KEY", "", section="runtime"),
+            arc_base_url=get_runtime_str(
+                "ARC_BASE_URL", "https://three.arcprize.org", section="runtime"
+            ),
+            operation_mode=_operation_mode_from_config(),
+            environments_dir=get_runtime_str(
+                "ENVIRONMENTS_DIR", "environment_files", section="runtime"
+            ),
+            recordings_dir=get_runtime_str("RECORDINGS_DIR", "recordings", section="runtime"),
+        )
 
         # Set up base tags for tracing
         if self.agent_name.endswith(".recording.jsonl"):
@@ -127,7 +146,7 @@ class Swarm:
                 logger.info(f"View your scorecard online: {scorecard_url}")
             else:
                 logger.info(
-                    "Online scorecard is not available, to use the online API set the ONLINE_ONLY envvar to True"
+                    "Online scorecard is not available; set runtime.OPERATION_MODE to online in config/runtime_config.json"
                 )
 
         self.cleanup(scorecard)

@@ -11,22 +11,21 @@ from agents.templates.random_agent import Random
 @pytest.mark.unit
 class TestSwarmInitialization:
     def test_swarm_init(self):
-        with patch.dict("os.environ", {"ARC_API_KEY": "test-api-key"}):
-            swarm = Swarm(
-                agent="random", ROOT_URL="https://example.com", games=["game1", "game2"]
-            )
+        swarm = Swarm(
+            agent="random", ROOT_URL="https://example.com", games=["game1", "game2"]
+        )
 
-            assert swarm.agent_name == "random"
-            assert swarm.ROOT_URL == "https://example.com"
-            assert swarm.GAMES == ["game1", "game2"]
-            assert swarm.agent_class == Random
-            assert len(swarm.threads) == 0
-            assert len(swarm.agents) == 0
+        assert swarm.agent_name == "random"
+        assert swarm.ROOT_URL == "https://example.com"
+        assert swarm.GAMES == ["game1", "game2"]
+        assert swarm.agent_class == Random
+        assert len(swarm.threads) == 0
+        assert len(swarm.agents) == 0
 
-            assert swarm.headers["X-API-Key"] == "test-api-key"
-            assert swarm.headers["Accept"] == "application/json"
-            assert isinstance(swarm._session, requests.Session)
-            assert swarm._session.headers["Accept"] == "application/json"
+        assert swarm.headers["X-API-Key"] == "test-key"
+        assert swarm.headers["Accept"] == "application/json"
+        assert isinstance(swarm._session, requests.Session)
+        assert swarm._session.headers["Accept"] == "application/json"
 
 
 @pytest.mark.unit

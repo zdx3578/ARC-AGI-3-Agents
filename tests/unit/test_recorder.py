@@ -3,7 +3,6 @@ import os
 import threading
 import time
 from datetime import datetime
-from unittest.mock import patch
 
 import pytest
 
@@ -50,11 +49,10 @@ class TestRecorderInitialization:
         assert os.path.isdir(temp_recordings_dir)
 
     def test_recorder_with_empty_recordings_dir(self):
-        with patch.dict("os.environ", {"RECORDINGS_DIR": ""}):
-            recorder = Recorder(prefix="test")
+        recorder = Recorder(prefix="test")
 
-            assert recorder.prefix == "test"
-            assert recorder.guid is not None
+        assert recorder.prefix == "test"
+        assert recorder.guid is not None
 
 
 @pytest.mark.unit
@@ -178,8 +176,7 @@ class TestRecorderClassMethods:
             with open(filepath, "w") as f:
                 f.write('{"test": "data"}\n')
 
-        with patch.dict("os.environ", {"RECORDINGS_DIR": temp_recordings_dir}):
-            recordings = Recorder.list()
+        recordings = Recorder.list()
 
         recording_jsonl_files = [
             f for f in recordings if f.endswith(".recording.jsonl")
@@ -196,8 +193,7 @@ class TestRecorderClassMethods:
         for f in glob.glob(os.path.join(temp_recordings_dir, "*.recording.jsonl")):
             os.unlink(f)
 
-        with patch.dict("os.environ", {"RECORDINGS_DIR": temp_recordings_dir}):
-            recordings = Recorder.list()
+        recordings = Recorder.list()
         assert recordings == []
 
     @pytest.mark.parametrize(
