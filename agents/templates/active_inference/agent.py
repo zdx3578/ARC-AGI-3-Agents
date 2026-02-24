@@ -524,6 +524,8 @@ class ActiveInferenceEFE(Agent):
         self._control_schema_counts: dict[str, dict[str, int]] = {}
         self._tracked_agent_token_digest: str | None = None
         self._tracked_agent_anchor_xy: tuple[int, int] | None = None
+        self._tracked_agent_color: int | None = None
+        self._tracked_agent_area_ema: float | None = None
         self._navigation_anchor_jump_reject_count = 0
         self._navigation_anchor_jump_streak = 0
         self._last_known_agent_pos_region: tuple[int, int] | None = None
@@ -2340,6 +2342,7 @@ class ActiveInferenceEFE(Agent):
         frame_before: list[list[int]],
         frame_after: list[list[int]],
         max_regions: int = 64,
+        allowed_pixel_mask: list[list[bool]] | None = None,
     ) -> dict[str, int]:
         if not frame_before or not frame_after:
             return {}
@@ -2352,8 +2355,21 @@ class ActiveInferenceEFE(Agent):
             row_after = frame_after[y]
             if not isinstance(row_before, list) or not isinstance(row_after, list):
                 continue
+            mask_row = (
+                allowed_pixel_mask[y]
+                if isinstance(allowed_pixel_mask, list)
+                and y < len(allowed_pixel_mask)
+                and isinstance(allowed_pixel_mask[y], list)
+                else None
+            )
             usable_width = int(min(len(row_before), len(row_after)))
             for x in range(usable_width):
+                if (
+                    isinstance(mask_row, list)
+                    and x < len(mask_row)
+                    and not bool(mask_row[x])
+                ):
+                    continue
                 if int(row_before[x]) == int(row_after[x]):
                     continue
                 rx = int(max(0, min(7, int(x) // 8)))
@@ -2364,6 +2380,405 @@ class ActiveInferenceEFE(Agent):
         if int(max_regions) > 0:
             rows = rows[: int(max_regions)]
         return {str(k): int(v) for (k, v) in rows if int(v) > 0}
+
+    @staticmethod
+    def _walkable_component_mask_from_anchor_v1(
+        frame: list[list[int]],
+        *,
+        anchor_x: int,
+        anchor_y: int,
+        search_radius: int = 6,
+        min_component_pixels: int = 80,
+    ) -> tuple[list[list[bool]] | None, dict[str, Any]]:
+        meta: dict[str, Any] = {
+            "enabled": False,
+            "anchor_xy": {"x": int(anchor_x), "y": int(anchor_y)},
+            "selected_color": -1,
+            "component_pixels": 0,
+            "dilated_pixels": 0,
+            "candidate_count": 0,
+        }
+        if not frame:
+            meta["reason"] = "empty_frame"
+            return None, meta
+        height = int(len(frame))
+        width = int(min(len(row) for row in frame if isinstance(row, list)) or 0)
+        if height <= 0 or width <= 0:
+            meta["reason"] = "invalid_dimensions"
+            return None, meta
+        if anchor_x < 0 or anchor_y < 0 or anchor_x >= width or anchor_y >= height:
+            meta["reason"] = "invalid_anchor"
+            return None, meta
+
+        def _component_mask_for_seed(seed_x: int, seed_y: int, color: int) -> list[list[bool]]:
+            mask = [[False for _ in range(width)] for _ in range(height)]
+            queue: list[tuple[int, int]] = [(int(seed_x), int(seed_y))]
+            head = 0
+            mask[int(seed_y)][int(seed_x)] = True
+            while head < len(queue):
+                cx, cy = queue[head]
+                head += 1
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx = int(cx + dx)
+                    ny = int(cy + dy)
+                    if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                        continue
+                    if mask[ny][nx]:
+                        continue
+                    if int(frame[ny][nx]) != int(color):
+                        continue
+                    mask[ny][nx] = True
+                    queue.append((int(nx), int(ny)))
+            return mask
+
+        def _mask_pixels(mask: list[list[bool]]) -> int:
+            return int(sum(1 for row in mask for v in row if bool(v)))
+
+        center_color = int(frame[int(anchor_y)][int(anchor_x)])
+        color_hist: dict[int, int] = {}
+        nearest_xy_by_color: dict[int, tuple[int, int, int]] = {}
+        for y in range(max(0, int(anchor_y) - int(search_radius)), min(height, int(anchor_y) + int(search_radius) + 1)):
+            row = frame[y]
+            if not isinstance(row, list):
+                continue
+            for x in range(max(0, int(anchor_x) - int(search_radius)), min(width, int(anchor_x) + int(search_radius) + 1)):
+                dist = int(abs(int(x) - int(anchor_x)) + abs(int(y) - int(anchor_y)))
+                if dist < 2 or dist > int(search_radius):
+                    continue
+                color = int(row[x])
+                color_hist[color] = int(color_hist.get(color, 0) + 1)
+                prev = nearest_xy_by_color.get(color)
+                if prev is None or dist < int(prev[0]):
+                    nearest_xy_by_color[color] = (int(dist), int(x), int(y))
+
+        ranked_colors = sorted(
+            color_hist.items(),
+            key=lambda item: (-int(item[1]), 0 if int(item[0]) != int(center_color) else 1, int(item[0])),
+        )
+        candidate_colors = [int(color) for (color, count) in ranked_colors if int(count) >= 4][:6]
+        if int(center_color) not in candidate_colors:
+            candidate_colors.append(int(center_color))
+        meta["candidate_count"] = int(len(candidate_colors))
+
+        best_mask: list[list[bool]] | None = None
+        best_pixels = 0
+        best_color = -1
+        for color in candidate_colors:
+            if int(color) in nearest_xy_by_color:
+                _, sx, sy = nearest_xy_by_color[int(color)]
+            else:
+                sx = int(anchor_x)
+                sy = int(anchor_y)
+            if int(frame[int(sy)][int(sx)]) != int(color):
+                found = False
+                for y in range(max(0, int(anchor_y) - int(search_radius)), min(height, int(anchor_y) + int(search_radius) + 1)):
+                    row = frame[y]
+                    if not isinstance(row, list):
+                        continue
+                    for x in range(max(0, int(anchor_x) - int(search_radius)), min(width, int(anchor_x) + int(search_radius) + 1)):
+                        if int(row[x]) == int(color):
+                            sx = int(x)
+                            sy = int(y)
+                            found = True
+                            break
+                    if found:
+                        break
+                if not found:
+                    continue
+            mask = _component_mask_for_seed(int(sx), int(sy), int(color))
+            pixels = _mask_pixels(mask)
+            if pixels > int(best_pixels):
+                best_pixels = int(pixels)
+                best_mask = mask
+                best_color = int(color)
+
+        if best_mask is None or int(best_pixels) < int(min_component_pixels):
+            meta["reason"] = "component_too_small"
+            meta["component_pixels"] = int(best_pixels)
+            return None, meta
+
+        dilated = [[bool(v) for v in row] for row in best_mask]
+        for _ in range(3):
+            expanded = [list(row) for row in dilated]
+            for y in range(height):
+                for x in range(width):
+                    if not dilated[y][x]:
+                        continue
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx = int(x + dx)
+                        ny = int(y + dy)
+                        if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                            continue
+                        expanded[ny][nx] = True
+            dilated = expanded
+
+        meta["enabled"] = True
+        meta["selected_color"] = int(best_color)
+        meta["component_pixels"] = int(best_pixels)
+        meta["dilated_pixels"] = int(_mask_pixels(dilated))
+        return dilated, meta
+
+    def _high_info_allowed_pixel_mask_v1(
+        self,
+        *,
+        frame_before: list[list[int]],
+        frame_after: list[list[int]],
+        previous_representation: RepresentationStateV1,
+        current_representation: RepresentationStateV1,
+        navigation_state_estimate: dict[str, Any],
+        tracked_token_before: str | None,
+    ) -> tuple[list[list[bool]] | None, dict[str, Any]]:
+        meta: dict[str, Any] = {
+            "enabled": False,
+            "mask_pixels": 0,
+            "mask_ratio": 0.0,
+            "method": "region_allowlist_v2",
+            "visited_region_count": 0,
+            "map_region_count": 0,
+            "frontier_region_count": 0,
+            "allowed_region_count": 0,
+            "seed_region_keys": [],
+            "trusted_seed_region_keys": [],
+            "dropped_seed_region_keys": [],
+            "map_region_keys": [],
+            "frontier_region_keys": [],
+        }
+        if not frame_before or not frame_after:
+            meta["reason"] = "empty_frame"
+            return None, meta
+        height = int(min(len(frame_before), len(frame_after)))
+        width = int(
+            min(
+                min((len(row) for row in frame_before if isinstance(row, list)), default=0),
+                min((len(row) for row in frame_after if isinstance(row, list)), default=0),
+            )
+        )
+        if height <= 0 or width <= 0:
+            meta["reason"] = "invalid_dimensions"
+            return None, meta
+
+        before_seed: tuple[int, int] | None = None
+        after_seed: tuple[int, int] | None = None
+        if tracked_token_before:
+            tracked_before = self._find_object_by_digest_v1(
+                previous_representation,
+                str(tracked_token_before),
+            )
+            if isinstance(tracked_before, dict):
+                bx = int(tracked_before.get("centroid_x", -1))
+                by = int(tracked_before.get("centroid_y", -1))
+                if bx >= 0 and by >= 0:
+                    before_seed = (int(bx), int(by))
+        if before_seed is None and self._tracked_agent_anchor_xy is not None:
+            before_seed = (
+                int(self._tracked_agent_anchor_xy[0]),
+                int(self._tracked_agent_anchor_xy[1]),
+            )
+        if isinstance(navigation_state_estimate, dict):
+            pos = navigation_state_estimate.get("agent_pos_xy", {})
+            if isinstance(pos, dict):
+                ax = int(pos.get("x", -1))
+                ay = int(pos.get("y", -1))
+                if ax >= 0 and ay >= 0:
+                    after_seed = (int(ax), int(ay))
+        if after_seed is None and self._tracked_agent_token_digest:
+            tracked_after = self._find_object_by_digest_v1(
+                current_representation,
+                str(self._tracked_agent_token_digest),
+            )
+            if isinstance(tracked_after, dict):
+                ax = int(tracked_after.get("centroid_x", -1))
+                ay = int(tracked_after.get("centroid_y", -1))
+                if ax >= 0 and ay >= 0:
+                    after_seed = (int(ax), int(ay))
+        if after_seed is None and before_seed is not None:
+            after_seed = (int(before_seed[0]), int(before_seed[1]))
+
+        def _region_key_from_pixel(px: int, py: int) -> str:
+            rx = int(max(0, min(7, int(px) // 8)))
+            ry = int(max(0, min(7, int(py) // 8)))
+            return self._region_key_from_xy_v1(int(rx), int(ry))
+
+        def _neighbor_region_keys(region_key: str) -> list[str]:
+            parsed = self._parse_region_key_v1(str(region_key))
+            if parsed is None:
+                return []
+            rx, ry = int(parsed[0]), int(parsed[1])
+            neighbors: list[str] = []
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx = int(rx + dx)
+                ny = int(ry + dy)
+                if nx < 0 or ny < 0 or nx > 7 or ny > 7:
+                    continue
+                neighbors.append(self._region_key_from_xy_v1(int(nx), int(ny)))
+            return neighbors
+
+        seed_region_keys: set[str] = set()
+        if before_seed is not None:
+            seed_region_keys.add(_region_key_from_pixel(int(before_seed[0]), int(before_seed[1])))
+        if after_seed is not None:
+            seed_region_keys.add(_region_key_from_pixel(int(after_seed[0]), int(after_seed[1])))
+        nav_region_payload = navigation_state_estimate.get("agent_pos_region", {})
+        if isinstance(nav_region_payload, dict):
+            nav_key = self._region_key_from_region_payload_v1(nav_region_payload)
+            if self._parse_region_key_v1(str(nav_key)) is not None:
+                seed_region_keys.add(str(nav_key))
+        if self._last_known_agent_pos_region is not None:
+            seed_region_keys.add(
+                self._region_key_from_xy_v1(
+                    int(self._last_known_agent_pos_region[0]),
+                    int(self._last_known_agent_pos_region[1]),
+                )
+            )
+        if self._latest_observed_agent_pos_region is not None:
+            seed_region_keys.add(
+                self._region_key_from_xy_v1(
+                    int(self._latest_observed_agent_pos_region[0]),
+                    int(self._latest_observed_agent_pos_region[1]),
+                )
+            )
+        seed_region_keys = {
+            str(key) for key in seed_region_keys if self._parse_region_key_v1(str(key)) is not None
+        }
+
+        visited_region_keys: set[str] = {
+            str(region_key)
+            for (region_key, count) in self._region_visit_counts.items()
+            if int(count) > 0 and self._parse_region_key_v1(str(region_key)) is not None
+        }
+        if not visited_region_keys:
+            visited_region_keys = set(seed_region_keys)
+
+        map_region_keys: set[str] = set()
+        if visited_region_keys:
+            nav_anchor_key = "NA"
+            if isinstance(nav_region_payload, dict):
+                nav_anchor_key = self._region_key_from_region_payload_v1(nav_region_payload)
+            if self._parse_region_key_v1(str(nav_anchor_key)) is None:
+                nav_anchor_key = "NA"
+            primary_anchor_candidates: list[str] = []
+            if str(nav_anchor_key) in visited_region_keys:
+                primary_anchor_candidates.append(str(nav_anchor_key))
+            if self._last_known_agent_pos_region is not None:
+                last_key = self._region_key_from_xy_v1(
+                    int(self._last_known_agent_pos_region[0]),
+                    int(self._last_known_agent_pos_region[1]),
+                )
+                if str(last_key) in visited_region_keys:
+                    primary_anchor_candidates.append(str(last_key))
+            if self._latest_observed_agent_pos_region is not None:
+                obs_key = self._region_key_from_xy_v1(
+                    int(self._latest_observed_agent_pos_region[0]),
+                    int(self._latest_observed_agent_pos_region[1]),
+                )
+                if str(obs_key) in visited_region_keys:
+                    primary_anchor_candidates.append(str(obs_key))
+            anchor_candidates = [
+                str(key)
+                for key in primary_anchor_candidates
+                if self._parse_region_key_v1(str(key)) is not None
+            ]
+            if not anchor_candidates:
+                anchor_candidates = [str(key) for key in seed_region_keys if str(key) in visited_region_keys]
+            if not anchor_candidates and seed_region_keys and visited_region_keys:
+                nearest_anchor = min(
+                    visited_region_keys,
+                    key=lambda key: (
+                        min(
+                            self._region_distance_v1(str(key), str(seed_key))
+                            for seed_key in seed_region_keys
+                        ),
+                        -int(self._region_visit_counts.get(str(key), 0)),
+                        str(key),
+                    ),
+                )
+                anchor_candidates = [str(nearest_anchor)]
+            if not anchor_candidates and visited_region_keys:
+                anchor_candidates = [
+                    str(
+                        max(
+                            visited_region_keys,
+                            key=lambda key: (
+                                int(self._region_visit_counts.get(str(key), 0)),
+                                -int(self._parse_region_key_v1(str(key))[1]) if self._parse_region_key_v1(str(key)) is not None else 0,
+                                -int(self._parse_region_key_v1(str(key))[0]) if self._parse_region_key_v1(str(key)) is not None else 0,
+                            ),
+                        )
+                    )
+                ]
+            if anchor_candidates:
+                queue = [str(anchor_candidates[0])]
+                head = 0
+                map_region_keys.add(str(anchor_candidates[0]))
+                while head < len(queue):
+                    current_key = str(queue[head])
+                    head += 1
+                    for neighbor_key in _neighbor_region_keys(str(current_key)):
+                        key = str(neighbor_key)
+                        if key in map_region_keys or key not in visited_region_keys:
+                            continue
+                        map_region_keys.add(str(key))
+                        queue.append(str(key))
+        if not map_region_keys:
+            map_region_keys = set(visited_region_keys)
+
+        frontier_region_keys: set[str] = set()
+        for region_key in list(map_region_keys):
+            for neighbor_key in _neighbor_region_keys(str(region_key)):
+                if str(neighbor_key) in map_region_keys:
+                    continue
+                frontier_region_keys.add(str(neighbor_key))
+
+        trusted_seed_region_keys: set[str] = set()
+        dropped_seed_region_keys: set[str] = set()
+        for seed_key in seed_region_keys:
+            key = str(seed_key)
+            if key in map_region_keys or key in frontier_region_keys:
+                trusted_seed_region_keys.add(key)
+            else:
+                dropped_seed_region_keys.add(key)
+
+        allowed_region_keys: set[str] = set(map_region_keys)
+        allowed_region_keys.update(str(v) for v in frontier_region_keys)
+        allowed_region_keys.update(str(v) for v in trusted_seed_region_keys)
+        allowed_region_keys = {
+            str(key)
+            for key in allowed_region_keys
+            if self._parse_region_key_v1(str(key)) is not None
+        }
+        if not allowed_region_keys:
+            meta["reason"] = "no_allowed_regions"
+            return None, meta
+
+        mask = [[False for _ in range(width)] for _ in range(height)]
+        for y in range(height):
+            for x in range(width):
+                region_key = _region_key_from_pixel(int(x), int(y))
+                if str(region_key) in allowed_region_keys:
+                    mask[y][x] = True
+
+        mask_pixels = int(sum(1 for row in mask for v in row if bool(v)))
+        frame_pixels = int(max(1, height * width))
+        mask_ratio = float(mask_pixels / float(frame_pixels))
+        if mask_pixels <= 0:
+            meta["reason"] = "mask_empty"
+            meta["mask_pixels"] = int(mask_pixels)
+            meta["mask_ratio"] = float(mask_ratio)
+            return None, meta
+
+        meta["enabled"] = True
+        meta["mask_pixels"] = int(mask_pixels)
+        meta["mask_ratio"] = float(mask_ratio)
+        meta["visited_region_count"] = int(len(visited_region_keys))
+        meta["map_region_count"] = int(len(map_region_keys))
+        meta["frontier_region_count"] = int(len(frontier_region_keys))
+        meta["allowed_region_count"] = int(len(allowed_region_keys))
+        meta["seed_region_keys"] = [str(v) for v in sorted(seed_region_keys)[:16]]
+        meta["trusted_seed_region_keys"] = [str(v) for v in sorted(trusted_seed_region_keys)[:16]]
+        meta["dropped_seed_region_keys"] = [str(v) for v in sorted(dropped_seed_region_keys)[:16]]
+        meta["map_region_keys"] = [str(v) for v in sorted(map_region_keys)[:32]]
+        meta["frontier_region_keys"] = [str(v) for v in sorted(frontier_region_keys)[:32]]
+        return mask, meta
 
     def _simultaneous_changed_region_info_v1(
         self,
@@ -2496,9 +2911,14 @@ class ActiveInferenceEFE(Agent):
         reachable_sorted.sort()
         unknown_sorted.sort()
         unreachable_sorted.sort()
-        changed_region_keys = [
-            str(row[2]) for row in (reachable_sorted + unknown_sorted + unreachable_sorted)
-        ]
+        if bool(reachability_graph_ready):
+            changed_region_keys = [str(row[2]) for row in reachable_sorted]
+            if not changed_region_keys:
+                changed_region_keys = [str(row[2]) for row in unknown_sorted]
+        else:
+            changed_region_keys = [
+                str(row[2]) for row in (reachable_sorted + unknown_sorted + unreachable_sorted)
+            ]
         result["changed_region_keys"] = list(changed_region_keys)
         result["reachable_region_keys"] = [str(row[2]) for row in reachable_sorted]
         result["unknown_region_keys"] = [str(row[2]) for row in unknown_sorted]
@@ -2511,12 +2931,37 @@ class ActiveInferenceEFE(Agent):
             if isinstance(self._latest_navigation_state_estimate, dict)
             else {}
         )
+        observed_key = "NA"
+        if self._latest_observed_agent_pos_region is not None:
+            orx, ory = self._latest_observed_agent_pos_region
+            observed_key = self._region_key_from_xy_v1(int(orx), int(ory))
         region = latest.get("agent_pos_region", {})
         if bool(latest.get("matched", False)) and isinstance(region, dict):
             rx = int(region.get("x", -1))
             ry = int(region.get("y", -1))
             if rx >= 0 and ry >= 0:
                 latest_key = self._region_key_from_xy_v1(int(rx), int(ry))
+                if (
+                    self._parse_region_key_v1(str(observed_key)) is not None
+                    and str(observed_key) != str(latest_key)
+                ):
+                    if self._last_known_agent_pos_region is not None:
+                        last_rx, last_ry = self._last_known_agent_pos_region
+                        last_key = self._region_key_from_xy_v1(int(last_rx), int(last_ry))
+                        latest_plausible = self._region_step_plausible_v1(
+                            str(last_key),
+                            str(latest_key),
+                            max_axis_step=1,
+                        )
+                        observed_plausible = self._region_step_plausible_v1(
+                            str(last_key),
+                            str(observed_key),
+                            max_axis_step=1,
+                        )
+                        if observed_plausible or (not latest_plausible):
+                            return str(observed_key)
+                    else:
+                        return str(observed_key)
                 if self._last_known_agent_pos_region is not None:
                     last_rx, last_ry = self._last_known_agent_pos_region
                     last_key = self._region_key_from_xy_v1(int(last_rx), int(last_ry))
@@ -2525,9 +2970,7 @@ class ActiveInferenceEFE(Agent):
                         str(latest_key),
                         max_axis_step=1,
                     ):
-                        if self._latest_observed_agent_pos_region is not None:
-                            orx, ory = self._latest_observed_agent_pos_region
-                            observed_key = self._region_key_from_xy_v1(int(orx), int(ory))
+                        if self._parse_region_key_v1(str(observed_key)) is not None:
                             if self._region_step_plausible_v1(
                                 str(last_key),
                                 str(observed_key),
@@ -2536,9 +2979,8 @@ class ActiveInferenceEFE(Agent):
                                 return str(observed_key)
                         return str(last_key)
                 return str(latest_key)
-        if self._latest_observed_agent_pos_region is not None:
-            rx, ry = self._latest_observed_agent_pos_region
-            return self._region_key_from_xy_v1(int(rx), int(ry))
+        if self._parse_region_key_v1(str(observed_key)) is not None:
+            return str(observed_key)
         if self._last_known_agent_pos_region is not None:
             rx, ry = self._last_known_agent_pos_region
             return self._region_key_from_xy_v1(int(rx), int(ry))
@@ -2551,32 +2993,122 @@ class ActiveInferenceEFE(Agent):
         object_nodes = list(getattr(representation, "object_nodes", []))
         if not object_nodes:
             return
-        candidates = [
-            node
-            for node in object_nodes
-            if int(getattr(node, "color", -1)) == 12 and int(getattr(node, "area", 0)) > 0
-        ]
-        if not candidates:
-            return
+        frame_width = int(max(1, getattr(representation, "frame_width", 1)))
+        frame_height = int(max(1, getattr(representation, "frame_height", 1)))
+        peripheral_margin_x = max(1, int(round(float(frame_width) * 0.08)))
+        peripheral_margin_y = max(1, int(round(float(frame_height) * 0.08)))
+        ui_max_area = max(4, int(round(float(frame_width * frame_height) * 0.004)))
+        ui_max_side = max(2, int(round(float(min(frame_width, frame_height)) * 0.08)))
+
+        def peripheral_ui_likelihood(node: Any) -> float:
+            try:
+                area = int(getattr(node, "area", 0))
+                cx = int(getattr(node, "centroid_x", -1))
+                cy = int(getattr(node, "centroid_y", -1))
+                min_x = int(getattr(node, "bbox_min_x", cx))
+                max_x = int(getattr(node, "bbox_max_x", cx))
+                min_y = int(getattr(node, "bbox_min_y", cy))
+                max_y = int(getattr(node, "bbox_max_y", cy))
+            except Exception:
+                return 0.0
+            if cx < 0 or cy < 0:
+                return 0.0
+            width = max(1, int(max_x - min_x + 1))
+            height = max(1, int(max_y - min_y + 1))
+            near_periphery = bool(
+                cx < peripheral_margin_x
+                or cx >= max(0, frame_width - peripheral_margin_x)
+                or cy < peripheral_margin_y
+                or cy >= max(0, frame_height - peripheral_margin_y)
+            )
+            if not near_periphery:
+                return 0.0
+            area_score = (
+                1.0
+                if area <= ui_max_area
+                else max(0.0, 1.0 - (float(area - ui_max_area) / float(max(1, ui_max_area * 2))))
+            )
+            side = max(width, height)
+            side_score = 1.0 if side <= ui_max_side else 0.0
+            boundary_score = 0.25 if bool(getattr(node, "touches_boundary", False)) else 0.0
+            return float(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        (0.65 * area_score) + (0.25 * side_score) + float(boundary_score),
+                    ),
+                )
+            )
+
         last_region = self._last_known_agent_pos_region
         last_cx = None
         last_cy = None
         if last_region is not None:
             last_cx = (int(last_region[0]) * 8) + 4
             last_cy = (int(last_region[1]) * 8) + 4
+        anchor_x = None
+        anchor_y = None
+        if self._tracked_agent_anchor_xy is not None:
+            anchor_x = int(self._tracked_agent_anchor_xy[0])
+            anchor_y = int(self._tracked_agent_anchor_xy[1])
+        expected_action_id = int(self._previous_action_candidate.action_id) if self._previous_action_candidate is not None else -1
+        expected_dir = self._action_direction_vector_v1(expected_action_id)
+        expected_step = 5
+        expected_x = anchor_x
+        expected_y = anchor_y
+        if anchor_x is not None and anchor_y is not None and expected_dir is not None:
+            ex, ey = expected_dir
+            expected_x = int(anchor_x + (int(ex) * int(expected_step)))
+            expected_y = int(anchor_y + (int(ey) * int(expected_step)))
+
         best_node = None
         best_score = float("inf")
-        for node in candidates:
+        for node in object_nodes:
             area = int(getattr(node, "area", 0))
             cx = int(getattr(node, "centroid_x", -1))
             cy = int(getattr(node, "centroid_y", -1))
-            if cx < 0 or cy < 0:
+            if area <= 0 or cx < 0 or cy < 0:
                 continue
-            score = float(abs(area - 10))
+            ui_likelihood = float(peripheral_ui_likelihood(node))
+            if ui_likelihood >= 0.95:
+                continue
+            score = 0.0
+            if self._tracked_agent_area_ema is not None:
+                score += 0.55 * float(abs(float(area) - float(self._tracked_agent_area_ema)))
+            else:
+                score += 0.10 * float(abs(area - 14))
+            if self._tracked_agent_color is not None and int(getattr(node, "color", -1)) != int(self._tracked_agent_color):
+                score += 8.0
+            if self._tracked_agent_token_digest and str(getattr(node, "digest", "")) == str(self._tracked_agent_token_digest):
+                score -= 10.0
             if bool(getattr(node, "touches_boundary", False)):
-                score += 15.0
+                score += 12.0
+            score += float(16.0 * ui_likelihood)
             if last_cx is not None and last_cy is not None:
-                score += 0.08 * float(abs(cx - int(last_cx)) + abs(cy - int(last_cy)))
+                score += 0.06 * float(abs(cx - int(last_cx)) + abs(cy - int(last_cy)))
+            if expected_x is not None and expected_y is not None:
+                expected_dist = int(abs(cx - int(expected_x)) + abs(cy - int(expected_y)))
+                score += 0.28 * float(expected_dist)
+                if expected_dist > 20:
+                    score += 10.0
+            elif anchor_x is not None and anchor_y is not None:
+                anchor_dist = int(abs(cx - int(anchor_x)) + abs(cy - int(anchor_y)))
+                score += 0.22 * float(anchor_dist)
+                if anchor_dist > 16:
+                    score += 8.0
+            if last_region is not None:
+                last_key = self._region_key_from_xy_v1(int(last_region[0]), int(last_region[1]))
+                candidate_key = self._region_key_from_xy_v1(
+                    int(max(0, min(7, cx // 8))),
+                    int(max(0, min(7, cy // 8))),
+                )
+                if not self._region_step_plausible_v1(
+                    str(last_key),
+                    str(candidate_key),
+                    max_axis_step=1,
+                ):
+                    score += 14.0
             if score < best_score:
                 best_score = float(score)
                 best_node = node
@@ -6638,6 +7170,36 @@ class ActiveInferenceEFE(Agent):
         nav_region_valid = self._parse_region_key_v1(str(nav_region_key)) is not None
         nav_in_coupled = bool(nav_region_valid and str(nav_region_key) in coupled_region_keys)
         simultaneous_subcycle_active = bool(priority_subqueue_active and priority_subqueue_keys)
+        target_region_recent_change = int(
+            max(0, region_recent_change_pixels.get(str(target_region_key), 0))
+        )
+        target_region_required_samples = int(
+            max(
+                1,
+                target_required_samples.get(
+                    str(target_region_key),
+                    _required_samples(str(target_region_key)),
+                ),
+            )
+        )
+        target_region_sample_count = int(
+            max(0, target_sample_counts.get(str(target_region_key), 0))
+        )
+        target_region_pending_samples = bool(
+            target_region_sample_count < target_region_required_samples
+        )
+        target_is_event_priority = bool(
+            str(target_region_key) in simultaneous_priority_set
+            or str(target_region_key) in region_sudden_spike_priority_keys
+        )
+        allow_opportunistic_switch = bool(
+            (not target_commit_active)
+            and (not target_is_event_priority)
+            and (
+                (target_region_recent_change <= 0)
+                or (not target_region_pending_samples)
+            )
+        )
         if (
             nav_in_coupled
             and str(nav_region_key) != str(target_region_key)
@@ -6645,6 +7207,7 @@ class ActiveInferenceEFE(Agent):
             and (not chain_lock_active)
             and (not hard_commit_mode)
             and (not reachable_diff_priority_active)
+            and allow_opportunistic_switch
         ):
             nav_required_samples = int(_required_samples(str(nav_region_key)))
             nav_sample_count = int(max(0, target_sample_counts.get(str(nav_region_key), 0)))
@@ -7651,10 +8214,21 @@ class ActiveInferenceEFE(Agent):
                 effect_translation_delta_bucket = str(navigation_direction_bucket)
         state_action_key = f"{state_before_digest}|{action_token}"
         transition_edge_key = f"{state_before_digest}|{action_token}|{state_after_digest}"
+        high_info_allowed_pixel_mask, high_info_allowed_mask_meta = (
+            self._high_info_allowed_pixel_mask_v1(
+                frame_before=previous_packet.frame,
+                frame_after=current_packet.frame,
+                previous_representation=previous_representation,
+                current_representation=current_representation,
+                navigation_state_estimate=navigation_state_estimate,
+                tracked_token_before=tracked_token_before,
+            )
+        )
         changed_region_diff_map = self._changed_region_diff_map_v1(
             frame_before=previous_packet.frame,
             frame_after=current_packet.frame,
             max_regions=64,
+            allowed_pixel_mask=high_info_allowed_pixel_mask,
         )
         changed_region_total_pixels = int(
             sum(int(v) for v in changed_region_diff_map.values())
@@ -7724,6 +8298,7 @@ class ActiveInferenceEFE(Agent):
             },
             "changed_region_total_pixels_v1": int(changed_region_total_pixels),
             "changed_region_topk_v1": list(changed_region_topk),
+            "high_info_allowed_mask_v1": dict(high_info_allowed_mask_meta),
         }
         return TransitionRecordV1(
             schema_name="active_inference_transition_record_v1",
@@ -9155,6 +9730,17 @@ class ActiveInferenceEFE(Agent):
         per_action[delta_key] = int(per_action.get(delta_key, 0) + 1)
         self._tracked_agent_token_digest = str(current.digest)
         self._tracked_agent_anchor_xy = (int(current_centroid_x), int(current_centroid_y))
+        try:
+            self._tracked_agent_color = int(getattr(current, "color", -1))
+            tracked_area_now = float(max(1, int(getattr(current, "area", 1))))
+            if self._tracked_agent_area_ema is None:
+                self._tracked_agent_area_ema = float(tracked_area_now)
+            else:
+                self._tracked_agent_area_ema = float(
+                    (0.75 * float(self._tracked_agent_area_ema)) + (0.25 * tracked_area_now)
+                )
+        except Exception:
+            pass
         self._navigation_anchor_jump_streak = 0
 
         return {
@@ -10184,6 +10770,8 @@ class ActiveInferenceEFE(Agent):
         if selected_action_id == 0:
             self._tracked_agent_token_digest = None
             self._tracked_agent_anchor_xy = None
+            self._tracked_agent_color = None
+            self._tracked_agent_area_ema = None
             self._navigation_anchor_jump_streak = 0
 
         self._previous_packet = packet
