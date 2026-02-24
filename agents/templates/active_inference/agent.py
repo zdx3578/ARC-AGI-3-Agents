@@ -269,6 +269,17 @@ class ActiveInferenceEFE(Agent):
             4,
             _env_int("ACTIVE_INFERENCE_HIGH_INFO_FOCUS_WINDOW_STEPS", 16),
         )
+        self.high_info_chain_lock_window_steps = max(
+            1,
+            _env_int(
+                "ACTIVE_INFERENCE_HIGH_INFO_CHAIN_LOCK_WINDOW_STEPS",
+                max(3, int(self.high_info_focus_window_steps // 3)),
+            ),
+        )
+        self.high_info_chain_lock_miss_limit = max(
+            1,
+            _env_int("ACTIVE_INFERENCE_HIGH_INFO_CHAIN_LOCK_MISS_LIMIT", 3),
+        )
         self.high_info_focus_max_targets = max(
             1,
             _env_int("ACTIVE_INFERENCE_HIGH_INFO_FOCUS_MAX_TARGETS", 3),
@@ -469,6 +480,9 @@ class ActiveInferenceEFE(Agent):
         self._available_actions_history: list[list[int]] = []
         self._control_schema_counts: dict[str, dict[str, int]] = {}
         self._tracked_agent_token_digest: str | None = None
+        self._tracked_agent_anchor_xy: tuple[int, int] | None = None
+        self._navigation_anchor_jump_reject_count = 0
+        self._navigation_anchor_jump_streak = 0
         self._last_known_agent_pos_region: tuple[int, int] | None = None
         self._latest_observed_agent_pos_region: tuple[int, int] | None = None
         self._latest_navigation_state_estimate: dict[str, Any] = {}
@@ -592,6 +606,12 @@ class ActiveInferenceEFE(Agent):
             "cross_region_key": "NA",
             "gate_region_key": "NA",
             "verify_action_ids": [],
+            "chain_lock_active": False,
+            "chain_lock_window_steps": int(self.high_info_chain_lock_window_steps),
+            "chain_lock_steps_remaining": 0,
+            "chain_lock_target_region_key": "NA",
+            "chain_lock_miss_limit": int(self.high_info_chain_lock_miss_limit),
+            "chain_lock_last_status": "idle",
             "interaction_chain_active": False,
             "interaction_chain_generation": 0,
             "interaction_target_chain": [],
@@ -1646,6 +1666,8 @@ class ActiveInferenceEFE(Agent):
         self,
         *,
         fallback_source_region_key: str = "NA",
+        reachable_region_set: set[str] | None = None,
+        reachability_graph_ready: bool = False,
     ) -> dict[str, Any]:
         nav = (
             self._latest_navigation_target_features_v1
@@ -1760,6 +1782,40 @@ class ActiveInferenceEFE(Agent):
         if fallback_key != "NA":
             candidate_region_keys.add(str(fallback_key))
 
+        reachable_keys: set[str] = set()
+        if isinstance(reachable_region_set, set):
+            for region_key in reachable_region_set:
+                key = str(region_key)
+                if self._parse_region_key_v1(key) is None:
+                    continue
+                reachable_keys.add(str(key))
+        frontier_keys: set[str] = set(reachable_keys)
+        for region_key in list(reachable_keys):
+            parsed = self._parse_region_key_v1(str(region_key))
+            if parsed is None:
+                continue
+            rx, ry = parsed
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx = int(rx + dx)
+                ny = int(ry + dy)
+                if nx < 0 or ny < 0 or nx > 7 or ny > 7:
+                    continue
+                frontier_keys.add(f"{int(nx)}:{int(ny)}")
+        if self._parse_region_key_v1(str(fallback_key)) is not None:
+            frontier_keys.add(str(fallback_key))
+
+        def _region_reachability_state(region_key: str) -> str:
+            key = str(region_key)
+            if self._parse_region_key_v1(key) is None:
+                return "invalid"
+            if not bool(reachability_graph_ready):
+                return "unknown"
+            if key in reachable_keys:
+                return "reachable"
+            if key in frontier_keys:
+                return "frontier"
+            return "out_of_graph"
+
         def _region_base_score(region_key: str) -> float:
             row = row_by_region.get(str(region_key), {})
             info_score = float(max(0.0, row.get("info_score", 0.0)))
@@ -1810,19 +1866,50 @@ class ActiveInferenceEFE(Agent):
             base = float(max(support_prior, (0.30 + (0.70 * support))) * base)
             if str(region_key) == str(fallback_key):
                 base = float(base + 0.05)
+            reachability_state = _region_reachability_state(str(region_key))
+            if reachability_state == "out_of_graph":
+                if nav_kind_rank >= 2 and nav_hint >= 0.80:
+                    base = float(base * 0.82)
+                elif str(region_key) == str(fallback_key):
+                    base = float(base * 0.88)
+                else:
+                    base = float(base * 0.58)
+            elif reachability_state == "frontier":
+                base = float(base + 0.04)
+            parsed_region = self._parse_region_key_v1(str(region_key))
+            if parsed_region is not None:
+                rx, ry = parsed_region
+                peripheral_corner = bool(
+                    (int(ry) <= 1 or int(ry) >= 6)
+                    and (int(rx) <= 1 or int(rx) >= 6)
+                )
+                if (
+                    peripheral_corner
+                    and attempts <= 0
+                    and visit_count <= 0
+                    and reachability_state != "reachable"
+                ):
+                    base = float(base * 0.72)
             return float(max(0.0, min(1.0, base)))
 
-        primary_candidates: list[tuple[float, int, int, int, str]] = []
+        primary_candidates: list[tuple[float, int, int, int, int, str]] = []
         for region_key in candidate_region_keys:
             if self._parse_region_key_v1(str(region_key)) is None:
                 continue
             score = float(_region_base_score(str(region_key)))
             kind_rank = int(max(0, min(2, nav_region_kind_rank.get(str(region_key), 0))))
+            reachability_state = _region_reachability_state(str(region_key))
+            reachability_priority = 1
+            if reachability_state == "reachable":
+                reachability_priority = 0
+            elif reachability_state == "out_of_graph":
+                reachability_priority = 2
             visit_count = int(max(0, self._region_visit_counts.get(str(region_key), 0)))
             attempts = int(max(0, row_by_region.get(str(region_key), {}).get("attempts", 0)))
             primary_candidates.append(
                 (
                     float(score),
+                    int(reachability_priority),
                     -int(kind_rank),
                     int(attempts),
                     int(visit_count),
@@ -1835,14 +1922,15 @@ class ActiveInferenceEFE(Agent):
                 int(item[1]),
                 int(item[2]),
                 int(item[3]),
-                str(item[4]),
+                int(item[4]),
+                str(item[5]),
             )
         )
 
         primary_region_key = "NA"
         primary_region_score = 0.0
         if primary_candidates and float(primary_candidates[0][0]) >= 0.12:
-            primary_region_key = str(primary_candidates[0][4])
+            primary_region_key = str(primary_candidates[0][5])
             primary_region_score = float(primary_candidates[0][0])
         elif fallback_key != "NA":
             primary_region_key = str(fallback_key)
@@ -1852,7 +1940,7 @@ class ActiveInferenceEFE(Agent):
         secondary_region_score = 0.0
         pair_affinity_score = 0.0
         if self._parse_region_key_v1(primary_region_key) is not None:
-            secondary_candidates: list[tuple[float, int, int, str, float, int]] = []
+            secondary_candidates: list[tuple[float, int, int, int, str, float, int]] = []
             for region_key in candidate_region_keys:
                 key = str(region_key)
                 if self._parse_region_key_v1(key) is None or key == str(primary_region_key):
@@ -1909,6 +1997,28 @@ class ActiveInferenceEFE(Agent):
                     anchor_bonus += 0.10
                 if orientation_misaligned and nav_kind_rank >= 2:
                     anchor_bonus += 0.08
+                weak_evidence = bool(
+                    progress_rate <= 0.0
+                    and structural_signal < 0.12
+                    and pair_affinity < 0.14
+                )
+                weak_evidence_penalty = 0.0
+                if weak_evidence:
+                    weak_evidence_penalty += 0.22
+                    if nav_kind_rank <= 0 and nav_hint < 0.70:
+                        weak_evidence_penalty += 0.12
+                reachability_state = _region_reachability_state(str(key))
+                reachability_penalty = 0.0
+                reachability_priority = 1
+                if reachability_state == "reachable":
+                    reachability_priority = 0
+                elif reachability_state == "out_of_graph":
+                    reachability_priority = 3
+                    if nav_kind_rank >= 2 and nav_hint >= 0.82:
+                        reachability_penalty = 0.08
+                        reachability_priority = 2
+                    else:
+                        reachability_penalty = 0.26
                 score = float(
                     (0.50 * base)
                     + (0.20 * pair_affinity)
@@ -1920,10 +2030,13 @@ class ActiveInferenceEFE(Agent):
                     - float(locality_penalty)
                     - float(stale_penalty)
                     - float(loop_penalty)
+                    - float(weak_evidence_penalty)
+                    - float(reachability_penalty)
                 )
                 secondary_candidates.append(
                     (
                         float(score),
+                        int(reachability_priority),
                         int(attempts),
                         int(visit_count),
                         str(key),
@@ -1932,27 +2045,33 @@ class ActiveInferenceEFE(Agent):
                     )
                 )
             secondary_candidates.sort(
-                key=lambda item: (-float(item[0]), int(item[1]), int(item[2]), str(item[3]))
+                key=lambda item: (
+                    -float(item[0]),
+                    int(item[1]),
+                    int(item[2]),
+                    int(item[3]),
+                    str(item[4]),
+                )
             )
-            if secondary_candidates and float(secondary_candidates[0][0]) >= 0.08:
+            if secondary_candidates and float(secondary_candidates[0][0]) >= 0.16:
                 chosen_secondary = secondary_candidates[0]
-                chosen_distance = int(chosen_secondary[5])
+                chosen_distance = int(chosen_secondary[6])
                 if chosen_distance <= 1:
                     near_score = float(chosen_secondary[0])
                     far_alternative = next(
                         (
                             row
                             for row in secondary_candidates
-                            if int(row[5]) >= 2
+                            if int(row[6]) >= 2
                             and float(row[0]) >= float(near_score - 0.08)
                         ),
                         None,
                     )
                     if far_alternative is not None:
                         chosen_secondary = far_alternative
-                secondary_region_key = str(chosen_secondary[3])
+                secondary_region_key = str(chosen_secondary[4])
                 secondary_region_score = float(chosen_secondary[0])
-                pair_affinity_score = float(chosen_secondary[4])
+                pair_affinity_score = float(chosen_secondary[5])
             elif fallback_key != "NA" and str(fallback_key) != str(primary_region_key):
                 secondary_region_key = str(fallback_key)
                 secondary_region_score = float(_region_base_score(secondary_region_key))
@@ -2569,6 +2688,18 @@ class ActiveInferenceEFE(Agent):
             "cross_region_key": str(state.get("cross_region_key", "NA")),
             "gate_region_key": str(state.get("gate_region_key", "NA")),
             "verify_action_ids": [int(v) for v in verify_action_ids],
+            "chain_lock_active": bool(state.get("chain_lock_active", False)),
+            "chain_lock_window_steps": int(
+                max(1, state.get("chain_lock_window_steps", self.high_info_chain_lock_window_steps))
+            ),
+            "chain_lock_steps_remaining": int(
+                max(0, state.get("chain_lock_steps_remaining", 0))
+            ),
+            "chain_lock_target_region_key": str(
+                state.get("chain_lock_target_region_key", "NA")
+            ),
+            "chain_lock_miss_limit": int(max(1, state.get("chain_lock_miss_limit", 1))),
+            "chain_lock_last_status": str(state.get("chain_lock_last_status", "idle")),
             "interaction_chain_active": bool(state.get("interaction_chain_active", False)),
             "interaction_chain_generation": int(
                 max(0, state.get("interaction_chain_generation", 0))
@@ -3167,6 +3298,21 @@ class ActiveInferenceEFE(Agent):
         bonus_hint = 0.0
         penalty_hint = 0.0
         interaction_chain_active = bool(state.get("interaction_chain_active", False))
+        chain_lock_target_region_key = str(state.get("chain_lock_target_region_key", "NA"))
+        chain_lock_window_steps = int(
+            max(1, state.get("chain_lock_window_steps", self.high_info_chain_lock_window_steps))
+        )
+        chain_lock_steps_remaining = int(max(0, state.get("chain_lock_steps_remaining", 0)))
+        chain_lock_active = bool(
+            state.get("chain_lock_active", False)
+            and interaction_chain_active
+            and bool(state.get("active", False))
+            and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
+            and chain_lock_steps_remaining > 0
+        )
+        chain_lock_target_match = bool(
+            chain_lock_active and str(target_region_key) == str(chain_lock_target_region_key)
+        )
         if bool(state.get("active", False)):
             if verify_action_candidate:
                 bonus_hint += 1.0
@@ -3229,6 +3375,13 @@ class ActiveInferenceEFE(Agent):
                     bonus_hint += 0.18
                 if moves_away_target:
                     penalty_hint += 0.38
+                if chain_lock_active and chain_lock_target_match:
+                    if reaches_target:
+                        bonus_hint += 0.62
+                    elif moves_toward_target:
+                        bonus_hint += 0.40
+                    elif moves_away_target:
+                        penalty_hint += 0.84
                 if high_block_loop_risk:
                     penalty_hint += 1.20
                     bonus_hint = float(0.45 * bonus_hint)
@@ -3283,6 +3436,11 @@ class ActiveInferenceEFE(Agent):
             "verify_action_ids": [int(v) for v in sorted(verify_action_set)],
             "verify_action_candidate": bool(verify_action_candidate),
             "interaction_chain_active": bool(interaction_chain_active),
+            "chain_lock_active": bool(chain_lock_active),
+            "chain_lock_window_steps": int(chain_lock_window_steps),
+            "chain_lock_steps_remaining": int(chain_lock_steps_remaining),
+            "chain_lock_target_region_key": str(chain_lock_target_region_key),
+            "chain_lock_target_match": bool(chain_lock_target_match),
             "bonus_hint": float(max(0.0, bonus_hint)),
             "penalty_hint": float(max(0.0, penalty_hint)),
         }
@@ -3587,6 +3745,12 @@ class ActiveInferenceEFE(Agent):
             state["interaction_target_chain"] = []
             state["interaction_target_index"] = 0
             state["interaction_last_status"] = "disabled"
+            state["chain_lock_active"] = False
+            state["chain_lock_window_steps"] = int(self.high_info_chain_lock_window_steps)
+            state["chain_lock_steps_remaining"] = 0
+            state["chain_lock_target_region_key"] = "NA"
+            state["chain_lock_miss_limit"] = int(self.high_info_chain_lock_miss_limit)
+            state["chain_lock_last_status"] = "disabled"
             state["trigger_region_key_effective"] = str(
                 state.get("trigger_region_key", self.sequence_causal_trigger_region_key)
             )
@@ -3625,6 +3789,12 @@ class ActiveInferenceEFE(Agent):
             state["interaction_target_chain"] = []
             state["interaction_target_index"] = 0
             state["interaction_last_status"] = "timeout"
+            state["chain_lock_active"] = False
+            state["chain_lock_window_steps"] = int(self.high_info_chain_lock_window_steps)
+            state["chain_lock_steps_remaining"] = 0
+            state["chain_lock_target_region_key"] = "NA"
+            state["chain_lock_miss_limit"] = int(self.high_info_chain_lock_miss_limit)
+            state["chain_lock_last_status"] = "timeout"
             state["priority_subqueue_active"] = False
             state["priority_subqueue_keys"] = []
             state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
@@ -3722,6 +3892,54 @@ class ActiveInferenceEFE(Agent):
             state.get("priority_subqueue_active", False)
             and bool(priority_subqueue_keys)
         )
+        chain_lock_window_steps = int(
+            max(1, state.get("chain_lock_window_steps", self.high_info_chain_lock_window_steps))
+        )
+        chain_lock_miss_limit = int(
+            max(1, state.get("chain_lock_miss_limit", self.high_info_chain_lock_miss_limit))
+        )
+        chain_lock_active = bool(state.get("chain_lock_active", False))
+        chain_lock_steps_remaining = int(max(0, state.get("chain_lock_steps_remaining", 0)))
+        chain_lock_target_region_key = str(state.get("chain_lock_target_region_key", "NA"))
+        chain_lock_last_status = str(state.get("chain_lock_last_status", "idle"))
+
+        def _disable_chain_lock(status: str) -> None:
+            nonlocal chain_lock_active
+            nonlocal chain_lock_steps_remaining
+            nonlocal chain_lock_target_region_key
+            nonlocal chain_lock_last_status
+            chain_lock_active = False
+            chain_lock_steps_remaining = 0
+            chain_lock_target_region_key = "NA"
+            chain_lock_last_status = str(status)
+
+        def _arm_chain_lock(target_region_key: str, status: str) -> None:
+            nonlocal chain_lock_active
+            nonlocal chain_lock_steps_remaining
+            nonlocal chain_lock_target_region_key
+            nonlocal chain_lock_last_status
+            key = str(target_region_key)
+            if (
+                interaction_chain_active
+                and self._parse_region_key_v1(key) is not None
+                and bool(state.get("active", False))
+            ):
+                chain_lock_active = True
+                chain_lock_steps_remaining = int(chain_lock_window_steps)
+                chain_lock_target_region_key = str(key)
+                chain_lock_last_status = str(status)
+            else:
+                _disable_chain_lock(status)
+
+        if (
+            not interaction_chain_active
+            or self._parse_region_key_v1(str(chain_lock_target_region_key)) is None
+            or chain_lock_steps_remaining <= 0
+        ):
+            if not interaction_chain_active:
+                _disable_chain_lock("inactive")
+            else:
+                chain_lock_active = False
         min_samples_per_target = int(max(1, self.high_info_min_samples_per_target))
         coupled_min_samples = int(max(min_samples_per_target, self.high_info_coupled_min_samples))
         coupled_progress_locked = bool(int(current_packet.levels_completed) <= 0)
@@ -3759,8 +3977,39 @@ class ActiveInferenceEFE(Agent):
         simultaneous_reachable_set = set(simultaneous_reachable_region_keys)
         simultaneous_unknown_set = set(simultaneous_unknown_region_keys)
         simultaneous_unreachable_set = set(simultaneous_unreachable_region_keys)
+        reachable_or_frontier_set: set[str] = {
+            str(v)
+            for v in reachable_region_set
+            if self._parse_region_key_v1(str(v)) is not None
+        }
+        for region_key in list(reachable_or_frontier_set):
+            parsed = self._parse_region_key_v1(str(region_key))
+            if parsed is None:
+                continue
+            rx, ry = parsed
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx = int(rx + dx)
+                ny = int(ry + dy)
+                if nx < 0 or ny < 0 or nx > 7 or ny > 7:
+                    continue
+                reachable_or_frontier_set.add(f"{int(nx)}:{int(ny)}")
+        if self._parse_region_key_v1(str(source_region_key)) is not None:
+            reachable_or_frontier_set.add(str(source_region_key))
+        if self._parse_region_key_v1(str(nav_region_key)) is not None:
+            reachable_or_frontier_set.add(str(nav_region_key))
+
+        def _reachable_or_frontier_region_v1(region_key: str) -> bool:
+            key = str(region_key)
+            if self._parse_region_key_v1(key) is None:
+                return False
+            if not bool(reachability_graph_ready):
+                return True
+            return bool(key in reachable_or_frontier_set)
+
         coupled_info = self._high_info_coupled_regions_v1(
             fallback_source_region_key=str(source_region_key),
+            reachable_region_set=set(reachable_region_set),
+            reachability_graph_ready=bool(reachability_graph_ready),
         )
         coupled_region_keys = {
             str(v)
@@ -4029,6 +4278,12 @@ class ActiveInferenceEFE(Agent):
                 region_key = str(row.get("region_key", "NA"))
                 if self._parse_region_key_v1(region_key) is None:
                     continue
+                if (
+                    not _reachable_or_frontier_region_v1(str(region_key))
+                    and str(region_key) not in coupled_region_keys
+                    and str(region_key) not in simultaneous_priority_set
+                ):
+                    continue
                 info_score = float(max(0.0, row.get("info_score", 0.0)))
                 if info_score <= 0.0:
                     continue
@@ -4153,6 +4408,8 @@ class ActiveInferenceEFE(Agent):
                     for ry in range(min_ry, max_ry + 1):
                         for rx in range(min_rx, max_rx + 1):
                             key = f"{int(rx)}:{int(ry)}"
+                            if not _reachable_or_frontier_region_v1(str(key)):
+                                continue
                             row_bias = 0.06 if int(ry) <= 2 else 0.0
                             target_scores_local[key] = max(
                                 float(target_scores_local.get(key, 0.0)),
@@ -4164,6 +4421,8 @@ class ActiveInferenceEFE(Agent):
                 region_visit_count = int(max(0, self._region_visit_counts.get(str(region_key), 0)))
                 region_progress_rate = float(max(0.0, region_row.get("progress_rate", 0.0)))
                 region_monotony_penalty = float(max(0.0, region_row.get("monotony_penalty", 0.0)))
+                if not _reachable_or_frontier_region_v1(str(region_key)):
+                    base_floor = float(min(base_floor, 0.58))
                 if region_key == str(primary_coupled_region_key):
                     if orientation_misaligned:
                         base_floor = float(min(1.0, base_floor + 0.14))
@@ -4200,7 +4459,7 @@ class ActiveInferenceEFE(Agent):
             sample_counts: dict[str, int],
         ) -> list[str]:
             current_target = str(state.get("current_target_region_key", "NA"))
-            rows: list[tuple[int, int, int, int, int, int, float, int, int, str]] = []
+            rows: list[tuple[int, int, int, int, int, int, int, float, int, int, str]] = []
             for region_key, score in target_scores_raw.items():
                 region_key = str(region_key)
                 if self._parse_region_key_v1(region_key) is None:
@@ -4208,6 +4467,13 @@ class ActiveInferenceEFE(Agent):
                 if (
                     region_key in simultaneous_unreachable_set
                     and bool(reachability_graph_ready)
+                ):
+                    continue
+                reachable_or_frontier = bool(_reachable_or_frontier_region_v1(str(region_key)))
+                if (
+                    (not reachable_or_frontier)
+                    and region_key not in simultaneous_priority_set
+                    and region_key not in coupled_region_keys
                 ):
                     continue
                 score_value = float(score)
@@ -4227,11 +4493,14 @@ class ActiveInferenceEFE(Agent):
                     simultaneous_priority = 0
                 elif region_key in simultaneous_unknown_set:
                     simultaneous_priority = 1
+                reachability_priority = 0 if reachable_or_frontier else 1
                 high_value_priority = (
                     0 if score_value >= float(high_value_threshold) else 1
                 )
                 unsampled_bonus = 0.12 if sample_count <= 0 else 0.0
                 adjusted_score = float(score_value + unsampled_bonus)
+                if (not reachable_or_frontier) and region_key in coupled_region_keys:
+                    adjusted_score = float(adjusted_score - 0.18)
                 route_distance = int(
                     self._region_route_distance_v1(
                         region_adjacency,
@@ -4249,6 +4518,7 @@ class ActiveInferenceEFE(Agent):
                 rows.append(
                     (
                         int(simultaneous_priority),
+                        int(reachability_priority),
                         int(coupled_priority),
                         int(remaining_priority),
                         int(high_value_priority),
@@ -4546,10 +4816,18 @@ class ActiveInferenceEFE(Agent):
                 state["interaction_target_chain"] = list(interaction_chain)
                 state["interaction_target_index"] = 0
                 state["interaction_last_status"] = "armed"
+                _arm_chain_lock(str(interaction_chain[0]), "armed")
             else:
                 state["interaction_target_chain"] = []
                 state["interaction_target_index"] = 0
                 state["interaction_last_status"] = "insufficient_chain"
+                _disable_chain_lock("insufficient_chain")
+            state["chain_lock_active"] = bool(chain_lock_active)
+            state["chain_lock_window_steps"] = int(chain_lock_window_steps)
+            state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
+            state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
+            state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+            state["chain_lock_last_status"] = str(chain_lock_last_status)
             state["priority_subqueue_active"] = bool(priority_subqueue_active)
             state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
             state["last_status"] = (
@@ -4648,6 +4926,20 @@ class ActiveInferenceEFE(Agent):
                             if interaction_chain_active
                             else "rearm_single"
                         )
+                        if interaction_chain_active and rearm_chain:
+                            _arm_chain_lock(str(rearm_chain[0]), "rearm_armed")
+                        else:
+                            _disable_chain_lock("rearm_single")
+                        state["chain_lock_active"] = bool(chain_lock_active)
+                        state["chain_lock_window_steps"] = int(chain_lock_window_steps)
+                        state["chain_lock_steps_remaining"] = int(
+                            max(0, chain_lock_steps_remaining)
+                        )
+                        state["chain_lock_target_region_key"] = str(
+                            chain_lock_target_region_key
+                        )
+                        state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+                        state["chain_lock_last_status"] = str(chain_lock_last_status)
                         state["priority_subqueue_active"] = False
                         state["priority_subqueue_keys"] = []
                         state["last_status"] = "idle_rearm"
@@ -4681,6 +4973,13 @@ class ActiveInferenceEFE(Agent):
             state["interaction_chain_active"] = bool(interaction_chain_active)
             state["interaction_target_chain"] = list(interaction_target_chain[:16])
             state["interaction_target_index"] = int(max(0, interaction_target_index))
+            _disable_chain_lock("inactive")
+            state["chain_lock_active"] = bool(chain_lock_active)
+            state["chain_lock_window_steps"] = int(chain_lock_window_steps)
+            state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
+            state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
+            state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+            state["chain_lock_last_status"] = str(chain_lock_last_status)
             state["priority_subqueue_active"] = bool(priority_subqueue_active)
             state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
             return
@@ -4715,6 +5014,13 @@ class ActiveInferenceEFE(Agent):
             state["interaction_target_chain"] = []
             state["interaction_target_index"] = 0
             state["interaction_last_status"] = "completed"
+            _disable_chain_lock("completed")
+            state["chain_lock_active"] = bool(chain_lock_active)
+            state["chain_lock_window_steps"] = int(chain_lock_window_steps)
+            state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
+            state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
+            state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+            state["chain_lock_last_status"] = str(chain_lock_last_status)
             state["priority_subqueue_active"] = False
             state["priority_subqueue_keys"] = []
             state["completion_count"] = int(state.get("completion_count", 0) + 1)
@@ -4735,8 +5041,18 @@ class ActiveInferenceEFE(Agent):
             )
             interaction_target_key = str(interaction_target_chain[interaction_target_index])
             if self._parse_region_key_v1(interaction_target_key) is not None:
-                queue = [str(interaction_target_key)] + [
-                    str(v) for v in queue if str(v) != str(interaction_target_key)
+                if (
+                    chain_lock_active
+                    and str(chain_lock_target_region_key) != str(interaction_target_key)
+                ):
+                    _arm_chain_lock(str(interaction_target_key), "retarget")
+                effective_target_key = str(interaction_target_key)
+                if chain_lock_active and (
+                    self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
+                ):
+                    effective_target_key = str(chain_lock_target_region_key)
+                queue = [str(effective_target_key)] + [
+                    str(v) for v in queue if str(v) != str(effective_target_key)
                 ]
                 state["interaction_chain_active"] = True
                 state["interaction_target_chain"] = list(interaction_target_chain[:16])
@@ -4785,8 +5101,35 @@ class ActiveInferenceEFE(Agent):
             target_miss_streak = 0
         elif str(target_region_key) != str(previous_target_region_key):
             target_miss_streak = 0
+        if chain_lock_active:
+            if self._parse_region_key_v1(str(chain_lock_target_region_key)) is None:
+                _disable_chain_lock("invalid_target")
+            else:
+                locked_target_key = str(chain_lock_target_region_key)
+                if str(target_region_key) != str(locked_target_key):
+                    if str(locked_target_key) in set(str(v) for v in queue):
+                        queue = [str(locked_target_key)] + [
+                            str(v) for v in queue if str(v) != str(locked_target_key)
+                        ]
+                        target_region_key = str(locked_target_key)
+                        target_miss_streak = 0
+                        state["last_status"] = "chain_lock_retarget"
+                if str(nav_region_key) != str(locked_target_key):
+                    chain_lock_steps_remaining = int(max(0, chain_lock_steps_remaining - 1))
+                    if chain_lock_steps_remaining <= 0:
+                        _disable_chain_lock("window_expired")
+                    elif int(target_miss_streak) >= int(chain_lock_miss_limit):
+                        _disable_chain_lock("miss_limit")
+                    else:
+                        chain_lock_last_status = "tracking"
+                else:
+                    chain_lock_last_status = "in_target"
         miss_streak_limit = int(max(12, 2 * int(self.high_info_focus_window_steps)))
-        if int(target_miss_streak) >= int(miss_streak_limit) and len(queue) > 1:
+        if (
+            (not chain_lock_active)
+            and int(target_miss_streak) >= int(miss_streak_limit)
+            and len(queue) > 1
+        ):
             alternate_queue = [
                 str(v)
                 for v in queue[1:]
@@ -4857,6 +5200,12 @@ class ActiveInferenceEFE(Agent):
         state["interaction_chain_active"] = bool(interaction_chain_active)
         state["interaction_target_chain"] = list(interaction_target_chain[:16])
         state["interaction_target_index"] = int(max(0, interaction_target_index))
+        state["chain_lock_active"] = bool(chain_lock_active)
+        state["chain_lock_window_steps"] = int(chain_lock_window_steps)
+        state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
+        state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
+        state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+        state["chain_lock_last_status"] = str(chain_lock_last_status)
         state["priority_subqueue_active"] = bool(priority_subqueue_active)
         state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
         state["stage"] = "seek"
@@ -4868,6 +5217,7 @@ class ActiveInferenceEFE(Agent):
             nav_in_coupled
             and str(nav_region_key) != str(target_region_key)
             and (not simultaneous_subcycle_active)
+            and (not chain_lock_active)
         ):
             nav_required_samples = int(_required_samples(str(nav_region_key)))
             nav_sample_count = int(max(0, target_sample_counts.get(str(nav_region_key), 0)))
@@ -4951,6 +5301,7 @@ class ActiveInferenceEFE(Agent):
                         state["interaction_target_chain"] = list(interaction_target_chain[:16])
                         state["interaction_target_index"] = int(interaction_target_index)
                         state["interaction_last_status"] = "advance"
+                        _arm_chain_lock(str(next_interaction_target_key), "advance")
                     else:
                         interaction_chain_active = False
                         interaction_target_chain = []
@@ -4959,6 +5310,7 @@ class ActiveInferenceEFE(Agent):
                         state["interaction_target_chain"] = []
                         state["interaction_target_index"] = 0
                         state["interaction_last_status"] = "completed"
+                        _disable_chain_lock("chain_completed")
             refreshed_queue = _rank_queue(
                 score_memory,
                 anchor_region_key=str(nav_region_key),
@@ -4997,6 +5349,14 @@ class ActiveInferenceEFE(Agent):
                         for v in refreshed_queue
                         if str(v) not in set(priority_subqueue_keys)
                     ]
+            if (
+                chain_lock_active
+                and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
+                and str(chain_lock_target_region_key) in set(str(v) for v in refreshed_queue)
+            ):
+                refreshed_queue = [str(chain_lock_target_region_key)] + [
+                    str(v) for v in refreshed_queue if str(v) != str(chain_lock_target_region_key)
+                ]
             if refreshed_queue:
                 state["target_region_queue"] = list(refreshed_queue)
                 state["current_target_region_key"] = str(refreshed_queue[0])
@@ -5006,6 +5366,12 @@ class ActiveInferenceEFE(Agent):
                 state["interaction_chain_active"] = bool(interaction_chain_active)
                 state["interaction_target_chain"] = list(interaction_target_chain[:16])
                 state["interaction_target_index"] = int(max(0, interaction_target_index))
+                state["chain_lock_active"] = bool(chain_lock_active)
+                state["chain_lock_window_steps"] = int(chain_lock_window_steps)
+                state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
+                state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
+                state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+                state["chain_lock_last_status"] = str(chain_lock_last_status)
                 state["priority_subqueue_active"] = bool(priority_subqueue_active)
                 state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
                 if not bool(state.get("interaction_chain_active", False)):
@@ -5035,6 +5401,13 @@ class ActiveInferenceEFE(Agent):
                 state["interaction_target_chain"] = []
                 state["interaction_target_index"] = 0
                 state["interaction_last_status"] = "completed"
+                _disable_chain_lock("completed")
+                state["chain_lock_active"] = bool(chain_lock_active)
+                state["chain_lock_window_steps"] = int(chain_lock_window_steps)
+                state["chain_lock_steps_remaining"] = int(max(0, chain_lock_steps_remaining))
+                state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
+                state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+                state["chain_lock_last_status"] = str(chain_lock_last_status)
                 state["priority_subqueue_active"] = False
                 state["priority_subqueue_keys"] = []
                 state["completion_count"] = int(state.get("completion_count", 0) + 1)
@@ -6724,6 +7097,10 @@ class ActiveInferenceEFE(Agent):
             "navigation_implausible_transition_count": int(
                 self._navigation_implausible_transition_count
             ),
+            "navigation_anchor_jump_reject_count": int(
+                self._navigation_anchor_jump_reject_count
+            ),
+            "navigation_anchor_jump_streak": int(self._navigation_anchor_jump_streak),
             "navigation_blocked_rate": float(nav_blocked / float(max(1, nav_attempts))),
             "navigation_ui_reject_count": int(nav_ui_reject),
             "navigation_ui_reject_rate": float(nav_ui_reject / float(max(1, nav_attempts))),
@@ -7021,6 +7398,106 @@ class ActiveInferenceEFE(Agent):
                 "peripheral_ui_likelihood": float(peripheral_ui_likelihood_pair),
             }
 
+        def bbox_gap_with_pad(a: Any, b: Any, pad: int = 0) -> tuple[int, int]:
+            try:
+                a_min_x = int(getattr(a, "bbox_min_x", int(getattr(a, "centroid_x", 0))))
+                a_max_x = int(getattr(a, "bbox_max_x", int(getattr(a, "centroid_x", 0))))
+                a_min_y = int(getattr(a, "bbox_min_y", int(getattr(a, "centroid_y", 0))))
+                a_max_y = int(getattr(a, "bbox_max_y", int(getattr(a, "centroid_y", 0))))
+                b_min_x = int(getattr(b, "bbox_min_x", int(getattr(b, "centroid_x", 0))))
+                b_max_x = int(getattr(b, "bbox_max_x", int(getattr(b, "centroid_x", 0))))
+                b_min_y = int(getattr(b, "bbox_min_y", int(getattr(b, "centroid_y", 0))))
+                b_max_y = int(getattr(b, "bbox_max_y", int(getattr(b, "centroid_y", 0))))
+            except Exception:
+                return (10**9, 10**9)
+            if a_max_x + int(pad) < b_min_x:
+                gap_x = int(b_min_x - (a_max_x + int(pad)))
+            elif b_max_x + int(pad) < a_min_x:
+                gap_x = int(a_min_x - (b_max_x + int(pad)))
+            else:
+                gap_x = 0
+            if a_max_y + int(pad) < b_min_y:
+                gap_y = int(b_min_y - (a_max_y + int(pad)))
+            elif b_max_y + int(pad) < a_min_y:
+                gap_y = int(a_min_y - (b_max_y + int(pad)))
+            else:
+                gap_y = 0
+            return (int(gap_x), int(gap_y))
+
+        def nodes_adjacent(a: Any, b: Any, pad: int = 1) -> bool:
+            gap_x, gap_y = bbox_gap_with_pad(a, b, pad=pad)
+            return bool(gap_x <= 0 and gap_y <= 0)
+
+        def composite_component(seed: Any, nodes: list[Any]) -> list[Any]:
+            seed_area = int(max(1, getattr(seed, "area", 1)))
+            area_limit = int(max(16, (seed_area * 3)))
+            side_limit = int(max(4, round(float(min(frame_width, frame_height)) * 0.22)))
+            component: list[Any] = [seed]
+            stack: list[Any] = [seed]
+            seen = {str(getattr(seed, "digest", ""))}
+            while stack:
+                anchor = stack.pop()
+                for candidate in nodes:
+                    candidate_digest = str(getattr(candidate, "digest", ""))
+                    if candidate_digest in seen:
+                        continue
+                    try:
+                        candidate_area = int(max(1, getattr(candidate, "area", 1)))
+                        candidate_w = int(
+                            max(
+                                1,
+                                int(getattr(candidate, "bbox_max_x", 0))
+                                - int(getattr(candidate, "bbox_min_x", 0))
+                                + 1,
+                            )
+                        )
+                        candidate_h = int(
+                            max(
+                                1,
+                                int(getattr(candidate, "bbox_max_y", 0))
+                                - int(getattr(candidate, "bbox_min_y", 0))
+                                + 1,
+                            )
+                        )
+                    except Exception:
+                        continue
+                    if candidate_area > area_limit:
+                        continue
+                    if max(candidate_w, candidate_h) > side_limit:
+                        continue
+                    if float(peripheral_ui_likelihood(candidate)) >= 0.70:
+                        continue
+                    if not nodes_adjacent(anchor, candidate, pad=1):
+                        continue
+                    seen.add(candidate_digest)
+                    component.append(candidate)
+                    stack.append(candidate)
+            return component
+
+        def weighted_centroid(nodes: list[Any], fallback: Any) -> tuple[int, int]:
+            total_weight = 0.0
+            weighted_x = 0.0
+            weighted_y = 0.0
+            for node in nodes:
+                try:
+                    node_area = float(max(1, int(getattr(node, "area", 1))))
+                    node_x = float(int(getattr(node, "centroid_x", 0)))
+                    node_y = float(int(getattr(node, "centroid_y", 0)))
+                except Exception:
+                    continue
+                total_weight += node_area
+                weighted_x += (node_x * node_area)
+                weighted_y += (node_y * node_area)
+            if total_weight <= 0.0:
+                return (
+                    int(getattr(fallback, "centroid_x", 0)),
+                    int(getattr(fallback, "centroid_y", 0)),
+                )
+            return (
+                int(round(weighted_x / total_weight)),
+                int(round(weighted_y / total_weight)),
+            )
+
         def search(previous_pool: list[Any]) -> tuple[tuple[Any, Any] | None, dict[str, float]]:
             best_pair_local: tuple[Any, Any] | None = None
             best_metrics_local: dict[str, float] = {}
@@ -7077,6 +7554,16 @@ class ActiveInferenceEFE(Agent):
             }
 
         previous, current = best_pair
+        previous_component = composite_component(previous, previous_nodes)
+        current_component = composite_component(current, current_nodes)
+        previous_centroid_x, previous_centroid_y = weighted_centroid(
+            previous_component,
+            previous,
+        )
+        current_centroid_x, current_centroid_y = weighted_centroid(
+            current_component,
+            current,
+        )
         peripheral_ui_score = float(
             max(0.0, min(1.0, best_metrics.get("peripheral_ui_likelihood", 0.0)))
         )
@@ -7104,14 +7591,62 @@ class ActiveInferenceEFE(Agent):
                 "control_schema_posterior": self._control_schema_posterior(),
             }
 
-        delta_x = int(current.centroid_x) - int(previous.centroid_x)
-        delta_y = int(current.centroid_y) - int(previous.centroid_y)
+        if action_id in (1, 2, 3, 4) and self._tracked_agent_anchor_xy is not None:
+            anchor_x, anchor_y = self._tracked_agent_anchor_xy
+            anchor_jump = int(
+                abs(int(current_centroid_x) - int(anchor_x))
+                + abs(int(current_centroid_y) - int(anchor_y))
+            )
+            anchor_jump_max = 24
+            if anchor_jump > int(anchor_jump_max):
+                self._navigation_anchor_jump_reject_count = int(
+                    self._navigation_anchor_jump_reject_count + 1
+                )
+                self._navigation_anchor_jump_streak = int(
+                    self._navigation_anchor_jump_streak + 1
+                )
+                if self._navigation_anchor_jump_streak < 3:
+                    anchor_region_x = int(max(0, min(7, int(anchor_x) // 8)))
+                    anchor_region_y = int(max(0, min(7, int(anchor_y) // 8)))
+                    return {
+                        "schema_name": "active_inference_navigation_state_estimate_v1",
+                        "schema_version": 1,
+                        "matched": False,
+                        "reason": "anchor_jump_guard",
+                        "peripheral_ui_candidate": False,
+                        "peripheral_ui_likelihood": float(peripheral_ui_score),
+                        "agent_pos_xy": {
+                            "x": int(anchor_x),
+                            "y": int(anchor_y),
+                        },
+                        "agent_pos_region": {
+                            "x": int(anchor_region_x),
+                            "y": int(anchor_region_y),
+                        },
+                        "anchor_jump_distance": int(anchor_jump),
+                        "anchor_jump_max": int(anchor_jump_max),
+                        "anchor_jump_streak": int(self._navigation_anchor_jump_streak),
+                        "tracked_pair_source": (
+                            "tracked_first_pass"
+                            if tracked_previous_nodes
+                            and str(previous.digest) == tracked_digest
+                            else "global_pair_search"
+                        ),
+                        "control_schema_posterior": self._control_schema_posterior(),
+                    }
+                # Allow controlled re-anchor after repeated rejects.
+                self._navigation_anchor_jump_streak = 0
+
+        delta_x = int(current_centroid_x) - int(previous_centroid_x)
+        delta_y = int(current_centroid_y) - int(previous_centroid_y)
         shift = int(abs(delta_x) + abs(delta_y))
         delta_key = f"dx={delta_x}|dy={delta_y}"
         action_key = str(int(executed_candidate.action_id))
         per_action = self._control_schema_counts.setdefault(action_key, {})
         per_action[delta_key] = int(per_action.get(delta_key, 0) + 1)
         self._tracked_agent_token_digest = str(current.digest)
+        self._tracked_agent_anchor_xy = (int(current_centroid_x), int(current_centroid_y))
+        self._navigation_anchor_jump_streak = 0
 
         return {
             "schema_name": "active_inference_navigation_state_estimate_v1",
@@ -7122,13 +7657,24 @@ class ActiveInferenceEFE(Agent):
                 "previous_digest": str(previous.digest),
                 "current_digest": str(current.digest),
             },
+            "tracked_agent_component_v1": {
+                "mode": "spatial_merge_single_track_v1",
+                "previous_member_count": int(len(previous_component)),
+                "current_member_count": int(len(current_component)),
+                "previous_member_digests": [
+                    str(getattr(node, "digest", "NA")) for node in previous_component[:8]
+                ],
+                "current_member_digests": [
+                    str(getattr(node, "digest", "NA")) for node in current_component[:8]
+                ],
+            },
             "agent_pos_xy": {
-                "x": int(current.centroid_x),
-                "y": int(current.centroid_y),
+                "x": int(current_centroid_x),
+                "y": int(current_centroid_y),
             },
             "agent_pos_region": {
-                "x": int(max(0, min(7, int(current.centroid_x) // 8))),
-                "y": int(max(0, min(7, int(current.centroid_y) // 8))),
+                "x": int(max(0, min(7, int(current_centroid_x) // 8))),
+                "y": int(max(0, min(7, int(current_centroid_y) // 8))),
             },
             "delta_pos_xy": {"dx": int(delta_x), "dy": int(delta_y)},
             "displacement_manhattan": int(shift),
@@ -8126,6 +8672,10 @@ class ActiveInferenceEFE(Agent):
         self._subcluster_select_count[selected_subcluster_id] = (
             int(self._subcluster_select_count.get(selected_subcluster_id, 0)) + 1
         )
+        if selected_action_id == 0:
+            self._tracked_agent_token_digest = None
+            self._tracked_agent_anchor_xy = None
+            self._navigation_anchor_jump_streak = 0
 
         self._previous_packet = packet
         self._previous_representation = representation
