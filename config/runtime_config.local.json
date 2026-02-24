@@ -1,0 +1,12 @@
+{
+  "runtime": {
+    "OPERATION_MODE": "offline",
+    "ENVIRONMENTS_DIR": "environment_files",
+    "RECORDINGS_DIR": "recordings"
+  },
+  "active_inference": {
+    "ACTIVE_INFERENCE_MAX_ACTIONS": 500,
+    "ACTIVE_INFERENCE_TRACE_ENABLED": true,
+    "ACTIVE_INFERENCE_STOP_ON_GAME_OVER": false
+  }
+}

@@ -3454,6 +3454,8 @@ class ActiveInferencePolicyEvaluatorV1:
         high_info_state_commit_active = False
         high_info_state_chain_lock_active = False
         high_info_state_priority_subqueue_active = False
+        high_info_state_inner_loop_active = False
+        high_info_state_inner_loop_target_region = "NA"
         if entries:
             meta0 = getattr(entries[0].candidate, "metadata", {})
             if isinstance(meta0, dict):
@@ -3475,6 +3477,14 @@ class ActiveInferencePolicyEvaluatorV1:
                     high_info_state_priority_subqueue_active = bool(
                         high_info_state_raw.get("priority_subqueue_active", False)
                     )
+                    high_info_state_inner_loop_active = bool(
+                        high_info_state_raw.get("inner_loop_active", False)
+                    )
+                    high_info_state_inner_loop_target_region = str(
+                        high_info_state_raw.get("inner_loop_current_target_region_key", "NA")
+                    )
+                    if self._parse_region_key(high_info_state_inner_loop_target_region) is None:
+                        high_info_state_inner_loop_target_region = "NA"
 
         high_info_rows: list[dict[str, Any]] = []
         for entry in entries:
@@ -3555,9 +3565,24 @@ class ActiveInferencePolicyEvaluatorV1:
                 or int(max(0, row["features"].get("remaining_samples", 0))) > 0
             )
         ]
+        high_info_inner_loop_rows = [
+            row
+            for row in high_info_seek_rows
+            if (
+                high_info_state_inner_loop_active
+                and str(high_info_state_inner_loop_target_region) != "NA"
+                and str(row["features"].get("target_region_key", "NA"))
+                == str(high_info_state_inner_loop_target_region)
+            )
+        ]
         high_info_focus_hard_priority_available = bool(high_info_hard_rows)
+        prepass_first_cycle_complete = bool(
+            int(global_action_counter) >= int(prepass_cycle_length)
+        )
         high_info_force_prepass_release = bool(
             fixed_prepass_entry is not None
+            and prepass_first_cycle_complete
+            and bool(self.high_info_focus_release_after_first_pass)
             and (
                 (
                     bool(high_info_state_active)
@@ -3603,6 +3628,35 @@ class ActiveInferencePolicyEvaluatorV1:
                 gx, gy = goal_parsed
                 coverage_prepass_goal_region = {"x": int(gx), "y": int(gy)}
             tie_breaker_rule_applied = "prepass_fixed_two_pass"
+        elif high_info_inner_loop_rows and high_info_prepass_gate_open:
+            high_info_inner_loop_rows.sort(
+                key=lambda row: (
+                    0 if bool(row["features"].get("reaches_target_region", False)) else 1,
+                    0 if bool(row["features"].get("moves_toward_target_region", False)) else 1,
+                    0
+                    if int(row["features"].get("target_route_distance_after", 10**6))
+                    < int(row["features"].get("target_route_distance_before", 10**6))
+                    else 1,
+                    0 if not bool(row["features"].get("stays_in_current_region", False)) else 1,
+                    int(row["features"].get("target_route_distance_after", 10**6)),
+                    int(row["features"].get("distance_after", 10**6)),
+                    float(max(0.0, row["features"].get("predicted_edge_blocked_rate", 0.0))),
+                    int(max(0, row["features"].get("predicted_region_visit_count", 0))),
+                    float(row["score"]),
+                    int(action_count_map.get(int(row["entry"].candidate.action_id), 0)),
+                    int(row["entry"].candidate.action_id),
+                    str(row["entry"].candidate.candidate_id),
+                )
+            )
+            selected_entry = high_info_inner_loop_rows[0]["entry"]
+            high_info_focus_probe_applied = True
+            high_info_focus_probe_reason = "inner_loop_queue_strict"
+            high_info_focus_status = "inner_loop_queue_strict"
+            high_info_focus_target_region = str(
+                high_info_inner_loop_rows[0]["features"].get("target_region_key", "NA")
+            )
+            high_info_focus_reachable_max_diff_region = str(high_info_focus_target_region)
+            tie_breaker_rule_applied = "high_info_inner_loop_strict"
         elif high_info_hard_rows and high_info_prepass_gate_open:
             high_info_hard_rows.sort(
                 key=lambda row: (
@@ -3899,6 +3953,11 @@ class ActiveInferencePolicyEvaluatorV1:
             "high_info_state_priority_subqueue_active": bool(
                 high_info_state_priority_subqueue_active
             ),
+            "high_info_state_inner_loop_active": bool(high_info_state_inner_loop_active),
+            "high_info_state_inner_loop_target_region": str(
+                high_info_state_inner_loop_target_region
+            ),
+            "prepass_first_cycle_complete": bool(prepass_first_cycle_complete),
             "high_info_force_prepass_release": bool(high_info_force_prepass_release),
             "fixed_two_pass_suppressed_by_high_info": bool(
                 fixed_two_pass_suppressed_by_high_info
@@ -3908,7 +3967,11 @@ class ActiveInferencePolicyEvaluatorV1:
             "high_info_focus_reachable_max_diff_region": str(
                 high_info_focus_reachable_max_diff_region
             ),
-            "high_info_focus_queue_head": str(high_info_focus_reachable_max_diff_region),
+            "high_info_focus_queue_head": str(
+                high_info_focus_target_region
+                if str(high_info_focus_target_region) != "NA"
+                else high_info_focus_reachable_max_diff_region
+            ),
             "high_info_focus_target_region": str(high_info_focus_target_region),
             "high_info_focus_status": str(high_info_focus_status),
             "high_info_focus_probe_candidates": list(high_info_focus_probe_candidates),
