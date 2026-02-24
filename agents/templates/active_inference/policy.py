@@ -1336,6 +1336,17 @@ class ActiveInferencePolicyEvaluatorV1:
         high_info_interaction_chain_active = bool(
             high_info_focus.get("interaction_chain_active", False)
         )
+        high_info_chain_lock_active = bool(high_info_focus.get("chain_lock_active", False))
+        high_info_chain_lock_steps_remaining = int(
+            max(0, high_info_focus.get("chain_lock_steps_remaining", 0))
+        )
+        high_info_target_change_magnitude = self._clamp01(
+            float(high_info_focus.get("target_change_magnitude", 0.0))
+        )
+        high_info_target_change_delta = self._clamp01(
+            float(high_info_focus.get("target_change_delta", 0.0))
+        )
+        high_info_target_sudden_spike = bool(high_info_focus.get("target_sudden_spike", False))
         high_info_bonus = 0.0
         high_info_penalty = 0.0
         if high_info_focus_enabled and high_info_focus_active:
@@ -1345,6 +1356,10 @@ class ActiveInferencePolicyEvaluatorV1:
             high_info_penalty = float(
                 (0.40 + (0.60 * high_info_target_score)) * high_info_penalty_hint
             )
+            if int(candidate.action_id) in (1, 2, 3, 4):
+                high_info_bonus = float(
+                    high_info_bonus + (0.10 * high_info_target_change_magnitude)
+                )
             if high_info_verify_action_candidate:
                 high_info_bonus = float(high_info_bonus + (0.45 * high_info_target_score))
             if high_info_interaction_chain_active and int(candidate.action_id) in (1, 2, 3, 4):
@@ -1354,6 +1369,24 @@ class ActiveInferencePolicyEvaluatorV1:
                     high_info_penalty = float(
                         high_info_penalty + 0.42 + (0.18 * high_info_target_score)
                     )
+            if (
+                high_info_chain_lock_active
+                and int(candidate.action_id) in (1, 2, 3, 4)
+                and bool(high_info_focus.get("chain_lock_target_match", False))
+            ):
+                lock_urgency = self._clamp01(
+                    1.0
+                    - (
+                        float(high_info_chain_lock_steps_remaining)
+                        / float(max(1, high_info_focus.get("chain_lock_window_steps", 1)))
+                    )
+                )
+                if bool(high_info_focus.get("reaches_target_region", False)):
+                    high_info_bonus = float(high_info_bonus + 0.42 + (0.18 * lock_urgency))
+                elif bool(high_info_focus.get("moves_toward_target_region", False)):
+                    high_info_bonus = float(high_info_bonus + 0.30 + (0.12 * lock_urgency))
+                elif bool(high_info_focus.get("moves_away_target_region", False)):
+                    high_info_penalty = float(high_info_penalty + 0.72 + (0.12 * lock_urgency))
             if int(candidate.action_id) in (1, 2, 3, 4):
                 if bool(high_info_focus.get("target_is_reachable_simultaneous", False)):
                     if bool(high_info_focus.get("moves_toward_target_region", False)):
@@ -1362,6 +1395,15 @@ class ActiveInferencePolicyEvaluatorV1:
                         high_info_penalty = float(high_info_penalty + 0.46)
                 if bool(high_info_focus.get("target_is_unreachable_simultaneous", False)):
                     high_info_penalty = float(high_info_penalty + 0.95)
+                if high_info_target_sudden_spike:
+                    if bool(high_info_focus.get("moves_toward_target_region", False)):
+                        high_info_bonus = float(
+                            high_info_bonus + 0.26 + (0.12 * high_info_target_change_delta)
+                        )
+                    elif bool(high_info_focus.get("moves_away_target_region", False)):
+                        high_info_penalty = float(
+                            high_info_penalty + 0.56 + (0.14 * high_info_target_change_delta)
+                        )
         orientation_alignment = self._candidate_orientation_alignment_features(candidate)
         orientation_alignment_enabled = bool(
             int(candidate.action_id) in (1, 2, 3, 4)
@@ -2514,6 +2556,15 @@ class ActiveInferencePolicyEvaluatorV1:
             "target_score": self._clamp01(float(raw.get("target_score", 0.0))),
             "target_sample_count": int(max(0, raw.get("target_sample_count", 0))),
             "remaining_samples": int(max(0, raw.get("remaining_samples", 0))),
+            "target_recent_change_pixels": int(max(0, raw.get("target_recent_change_pixels", 0))),
+            "target_change_magnitude": self._clamp01(
+                float(raw.get("target_change_magnitude", 0.0))
+            ),
+            "target_change_magnitude_ema": self._clamp01(
+                float(raw.get("target_change_magnitude_ema", 0.0))
+            ),
+            "target_change_delta": self._clamp01(float(raw.get("target_change_delta", 0.0))),
+            "target_sudden_spike": bool(raw.get("target_sudden_spike", False)),
             "distance_before": int(raw.get("distance_before", 10**6)),
             "distance_after": int(raw.get("distance_after", 10**6)),
             "distance_delta": int(raw.get("distance_delta", 0)),
@@ -2542,6 +2593,13 @@ class ActiveInferencePolicyEvaluatorV1:
             "high_block_loop_risk": bool(raw.get("high_block_loop_risk", False)),
             "verify_action_candidate": bool(raw.get("verify_action_candidate", False)),
             "interaction_chain_active": bool(raw.get("interaction_chain_active", False)),
+            "chain_lock_active": bool(raw.get("chain_lock_active", False)),
+            "chain_lock_window_steps": int(max(1, raw.get("chain_lock_window_steps", 1))),
+            "chain_lock_steps_remaining": int(max(0, raw.get("chain_lock_steps_remaining", 0))),
+            "chain_lock_target_region_key": str(
+                raw.get("chain_lock_target_region_key", "NA")
+            ),
+            "chain_lock_target_match": bool(raw.get("chain_lock_target_match", False)),
             "verify_action_ids": [
                 int(v)
                 for v in verify_action_ids
@@ -4828,12 +4886,54 @@ class ActiveInferencePolicyEvaluatorV1:
                 best_high_info_score = min(
                     float(row["score"]) for row in candidate_high_info_rows
                 )
+                chain_lock_pool = [
+                    row
+                    for row in candidate_high_info_rows
+                    if bool(row["features"].get("chain_lock_active", False))
+                    and bool(row["features"].get("chain_lock_target_match", False))
+                    and int(row["entry"].candidate.action_id) in (1, 2, 3, 4)
+                ]
+                if chain_lock_pool and str(
+                    candidate_high_info_rows[0]["features"].get("stage", "idle")
+                ) != "verify":
+                    chain_lock_toward_pool = [
+                        row
+                        for row in chain_lock_pool
+                        if bool(row["features"].get("reaches_target_region", False))
+                        or bool(row["features"].get("moves_toward_target_region", False))
+                    ]
+                    if chain_lock_toward_pool:
+                        chain_lock_pool = chain_lock_toward_pool
+                    chain_lock_pool.sort(
+                        key=lambda row: (
+                            0 if bool(row["features"].get("reaches_target_region", False)) else 1,
+                            0
+                            if bool(row["features"].get("moves_toward_target_region", False))
+                            else 1,
+                            1 if bool(row.get("blocked_hard_skip", False)) else 0,
+                            float(row.get("blocked_soft_penalty", 0.0)),
+                            int(row["features"].get("distance_after", 10**6)),
+                            int(row["features"].get("predicted_edge_attempts", 10**6)),
+                            float(row["score"]),
+                            int(
+                                action_count_map.get(
+                                    int(row["entry"].candidate.action_id),
+                                    0,
+                                )
+                            ),
+                            int(row["entry"].candidate.action_id),
+                            str(row["entry"].candidate.candidate_id),
+                        )
+                    )
+                    selected_entry = chain_lock_pool[0]["entry"]
+                    high_info_focus_probe_applied = True
+                    high_info_focus_probe_reason = "chain_lock_window_priority"
                 verify_pool = [
                     row
                     for row in candidate_high_info_rows
                     if bool(row["features"].get("verify_action_candidate", False))
                 ]
-                if verify_pool:
+                if verify_pool and (not high_info_focus_probe_applied):
                     verify_pool.sort(
                         key=lambda row: (
                             -float(row["features"].get("bonus_hint", 0.0)),
@@ -5561,6 +5661,18 @@ class ActiveInferencePolicyEvaluatorV1:
                         "target_region_key": str(
                             row["features"].get("target_region_key", "NA")
                         ),
+                        "chain_lock_active": bool(
+                            row["features"].get("chain_lock_active", False)
+                        ),
+                        "chain_lock_steps_remaining": int(
+                            row["features"].get("chain_lock_steps_remaining", 0)
+                        ),
+                        "chain_lock_target_region_key": str(
+                            row["features"].get("chain_lock_target_region_key", "NA")
+                        ),
+                        "chain_lock_target_match": bool(
+                            row["features"].get("chain_lock_target_match", False)
+                        ),
                         "predicted_region_key": str(
                             row["features"].get("predicted_region_key", "NA")
                         ),
@@ -5590,6 +5702,21 @@ class ActiveInferencePolicyEvaluatorV1:
                         ),
                         "remaining_samples": int(
                             row["features"].get("remaining_samples", 0)
+                        ),
+                        "target_recent_change_pixels": int(
+                            row["features"].get("target_recent_change_pixels", 0)
+                        ),
+                        "target_change_magnitude": float(
+                            row["features"].get("target_change_magnitude", 0.0)
+                        ),
+                        "target_change_magnitude_ema": float(
+                            row["features"].get("target_change_magnitude_ema", 0.0)
+                        ),
+                        "target_change_delta": float(
+                            row["features"].get("target_change_delta", 0.0)
+                        ),
+                        "target_sudden_spike": bool(
+                            row["features"].get("target_sudden_spike", False)
                         ),
                         "moves_toward_target_region": bool(
                             row["features"].get("moves_toward_target_region", False)

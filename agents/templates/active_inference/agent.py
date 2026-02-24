@@ -603,6 +603,13 @@ class ActiveInferenceEFE(Agent):
             "simultaneous_unreachable_region_keys": [],
             "simultaneous_anchor_region_key": "NA",
             "simultaneous_changed_total_pixels": 0,
+            "region_recent_change_pixels": {},
+            "region_change_magnitude": {},
+            "region_change_magnitude_ema": {},
+            "region_change_delta": {},
+            "region_sudden_spike_keys": [],
+            "last_trigger_changed_pixels": 0,
+            "last_trigger_changed_region_diff_map": {},
             "cross_region_key": "NA",
             "gate_region_key": "NA",
             "verify_action_ids": [],
@@ -2633,6 +2640,27 @@ class ActiveInferenceEFE(Agent):
         priority_subqueue = state.get("priority_subqueue_keys", [])
         if not isinstance(priority_subqueue, list):
             priority_subqueue = []
+        region_recent_change_pixels = state.get("region_recent_change_pixels", {})
+        if not isinstance(region_recent_change_pixels, dict):
+            region_recent_change_pixels = {}
+        region_change_magnitude = state.get("region_change_magnitude", {})
+        if not isinstance(region_change_magnitude, dict):
+            region_change_magnitude = {}
+        region_change_magnitude_ema = state.get("region_change_magnitude_ema", {})
+        if not isinstance(region_change_magnitude_ema, dict):
+            region_change_magnitude_ema = {}
+        region_change_delta = state.get("region_change_delta", {})
+        if not isinstance(region_change_delta, dict):
+            region_change_delta = {}
+        region_sudden_spike_keys = state.get("region_sudden_spike_keys", [])
+        if not isinstance(region_sudden_spike_keys, list):
+            region_sudden_spike_keys = []
+        last_trigger_changed_region_diff_map = state.get(
+            "last_trigger_changed_region_diff_map",
+            {},
+        )
+        if not isinstance(last_trigger_changed_region_diff_map, dict):
+            last_trigger_changed_region_diff_map = {}
         return {
             "schema_name": "active_inference_high_info_focus_state_v1",
             "schema_version": 1,
@@ -2685,6 +2713,45 @@ class ActiveInferenceEFE(Agent):
             "simultaneous_changed_total_pixels": int(
                 max(0, state.get("simultaneous_changed_total_pixels", 0))
             ),
+            "region_recent_change_pixels": {
+                str(k): int(max(0, v))
+                for (k, v) in sorted(
+                    region_recent_change_pixels.items(),
+                    key=lambda item: (-int(item[1]), str(item[0])),
+                )[:16]
+            },
+            "region_change_magnitude": {
+                str(k): float(max(0.0, min(1.0, v)))
+                for (k, v) in sorted(
+                    region_change_magnitude.items(),
+                    key=lambda item: (-float(item[1]), str(item[0])),
+                )[:16]
+            },
+            "region_change_magnitude_ema": {
+                str(k): float(max(0.0, min(1.0, v)))
+                for (k, v) in sorted(
+                    region_change_magnitude_ema.items(),
+                    key=lambda item: (-float(item[1]), str(item[0])),
+                )[:16]
+            },
+            "region_change_delta": {
+                str(k): float(max(0.0, min(1.0, v)))
+                for (k, v) in sorted(
+                    region_change_delta.items(),
+                    key=lambda item: (-float(item[1]), str(item[0])),
+                )[:16]
+            },
+            "region_sudden_spike_keys": [str(v) for v in region_sudden_spike_keys[:16]],
+            "last_trigger_changed_pixels": int(
+                max(0, state.get("last_trigger_changed_pixels", 0))
+            ),
+            "last_trigger_changed_region_diff_map": {
+                str(k): int(max(0, v))
+                for (k, v) in sorted(
+                    last_trigger_changed_region_diff_map.items(),
+                    key=lambda item: (-int(item[1]), str(item[0])),
+                )[:16]
+            },
             "cross_region_key": str(state.get("cross_region_key", "NA")),
             "gate_region_key": str(state.get("gate_region_key", "NA")),
             "verify_action_ids": [int(v) for v in verify_action_ids],
@@ -3249,6 +3316,26 @@ class ActiveInferenceEFE(Agent):
         required_samples_map = state.get("target_required_samples", {})
         if not isinstance(required_samples_map, dict):
             required_samples_map = {}
+        region_recent_change_pixels = state.get("region_recent_change_pixels", {})
+        if not isinstance(region_recent_change_pixels, dict):
+            region_recent_change_pixels = {}
+        region_change_magnitude_map = state.get("region_change_magnitude", {})
+        if not isinstance(region_change_magnitude_map, dict):
+            region_change_magnitude_map = {}
+        region_change_magnitude_ema_map = state.get("region_change_magnitude_ema", {})
+        if not isinstance(region_change_magnitude_ema_map, dict):
+            region_change_magnitude_ema_map = {}
+        region_change_delta_map = state.get("region_change_delta", {})
+        if not isinstance(region_change_delta_map, dict):
+            region_change_delta_map = {}
+        region_sudden_spike_keys = state.get("region_sudden_spike_keys", [])
+        if not isinstance(region_sudden_spike_keys, list):
+            region_sudden_spike_keys = []
+        region_sudden_spike_set = {
+            str(v)
+            for v in region_sudden_spike_keys
+            if self._parse_region_key_v1(str(v)) is not None
+        }
         coupled_regions = state.get("coupled_region_keys", [])
         if not isinstance(coupled_regions, list):
             coupled_regions = []
@@ -3279,6 +3366,28 @@ class ActiveInferenceEFE(Agent):
         remaining_samples = int(
             max(0, int(required_samples) - int(target_sample_count))
         )
+        target_recent_change_pixels = int(
+            max(0, region_recent_change_pixels.get(str(target_region_key), 0))
+        )
+        target_change_magnitude = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    region_change_magnitude_map.get(
+                        str(target_region_key),
+                        region_change_magnitude_ema_map.get(str(target_region_key), 0.0),
+                    ),
+                ),
+            )
+        )
+        target_change_magnitude_ema = float(
+            max(0.0, min(1.0, region_change_magnitude_ema_map.get(str(target_region_key), 0.0)))
+        )
+        target_change_delta = float(
+            max(0.0, min(1.0, region_change_delta_map.get(str(target_region_key), 0.0)))
+        )
+        target_sudden_spike = bool(str(target_region_key) in region_sudden_spike_set)
         persistent_self_loop_risk = bool(
             stays_in_current_region
             and int(predicted_edge_attempts) >= 36
@@ -3332,8 +3441,11 @@ class ActiveInferenceEFE(Agent):
                 if str(target_region_key) in coupled_region_set:
                     coupled_sample_bonus = float(min(0.48, 0.18 * float(remaining_samples)))
             if action_id in (1, 2, 3, 4):
+                bonus_hint += float(0.12 * target_change_magnitude)
                 if reaches_target or moves_toward_target:
                     bonus_hint += float(sample_bonus + coupled_sample_bonus)
+                    if target_sudden_spike:
+                        bonus_hint += float(0.24 + (0.16 * target_change_delta))
                     if interaction_chain_active:
                         bonus_hint += 0.12
                     if target_is_reachable_simultaneous:
@@ -3346,6 +3458,8 @@ class ActiveInferenceEFE(Agent):
                         penalty_hint += float(
                             min(0.16, 0.06 * float(max(0, remaining_samples)))
                         )
+                    if target_sudden_spike:
+                        penalty_hint += float(0.58 + (0.18 * target_change_delta))
                     if interaction_chain_active:
                         penalty_hint += 0.36
                     if target_is_reachable_simultaneous:
@@ -3419,6 +3533,11 @@ class ActiveInferenceEFE(Agent):
             "target_sample_count": int(target_sample_count),
             "required_samples": int(required_samples),
             "remaining_samples": int(remaining_samples),
+            "target_recent_change_pixels": int(target_recent_change_pixels),
+            "target_change_magnitude": float(target_change_magnitude),
+            "target_change_magnitude_ema": float(target_change_magnitude_ema),
+            "target_change_delta": float(target_change_delta),
+            "target_sudden_spike": bool(target_sudden_spike),
             "distance_before": int(distance_before),
             "distance_after": int(distance_after),
             "distance_delta": int(distance_delta),
@@ -3741,6 +3860,13 @@ class ActiveInferenceEFE(Agent):
             state["simultaneous_unreachable_region_keys"] = []
             state["simultaneous_anchor_region_key"] = "NA"
             state["simultaneous_changed_total_pixels"] = 0
+            state["region_recent_change_pixels"] = {}
+            state["region_change_magnitude"] = {}
+            state["region_change_magnitude_ema"] = {}
+            state["region_change_delta"] = {}
+            state["region_sudden_spike_keys"] = []
+            state["last_trigger_changed_pixels"] = 0
+            state["last_trigger_changed_region_diff_map"] = {}
             state["interaction_chain_active"] = False
             state["interaction_target_chain"] = []
             state["interaction_target_index"] = 0
@@ -3785,6 +3911,13 @@ class ActiveInferenceEFE(Agent):
             state["simultaneous_unreachable_region_keys"] = []
             state["simultaneous_anchor_region_key"] = "NA"
             state["simultaneous_changed_total_pixels"] = 0
+            state["region_recent_change_pixels"] = {}
+            state["region_change_magnitude"] = {}
+            state["region_change_magnitude_ema"] = {}
+            state["region_change_delta"] = {}
+            state["region_sudden_spike_keys"] = []
+            state["last_trigger_changed_pixels"] = 0
+            state["last_trigger_changed_region_diff_map"] = {}
             state["interaction_chain_active"] = False
             state["interaction_target_chain"] = []
             state["interaction_target_index"] = 0
@@ -4044,6 +4177,71 @@ class ActiveInferenceEFE(Agent):
 
         obs_change_type = str(getattr(causal_signature, "obs_change_type", ""))
         changed_pixels = int(max(0, getattr(causal_signature, "changed_pixel_count", 0)))
+        effect_summary = transition_record.effect_summary if transition_record is not None else {}
+        if not isinstance(effect_summary, dict):
+            effect_summary = {}
+        changed_region_diff_map_raw = effect_summary.get("changed_region_diff_map_v1", {})
+        if not isinstance(changed_region_diff_map_raw, dict):
+            changed_region_diff_map_raw = {}
+        region_recent_change_pixels: dict[str, int] = {}
+        for region_key_raw, pixels_raw in changed_region_diff_map_raw.items():
+            region_key = str(region_key_raw)
+            if self._parse_region_key_v1(region_key) is None:
+                continue
+            pixels = int(max(0, pixels_raw))
+            if pixels <= 0:
+                continue
+            region_recent_change_pixels[str(region_key)] = int(pixels)
+        total_changed_pixels_for_regions = int(
+            max(1, changed_pixels, sum(int(v) for v in region_recent_change_pixels.values()))
+        )
+        region_change_magnitude_prev = state.get("region_change_magnitude_ema", {})
+        if not isinstance(region_change_magnitude_prev, dict):
+            region_change_magnitude_prev = {}
+        region_change_magnitude_ema: dict[str, float] = {}
+        for region_key_raw, magnitude_raw in region_change_magnitude_prev.items():
+            region_key = str(region_key_raw)
+            if self._parse_region_key_v1(region_key) is None:
+                continue
+            magnitude = float(max(0.0, min(1.0, magnitude_raw)))
+            if magnitude <= 0.0:
+                continue
+            decayed = float(0.92 * magnitude)
+            if decayed >= 0.01:
+                region_change_magnitude_ema[str(region_key)] = float(decayed)
+        region_change_magnitude_now: dict[str, float] = {}
+        region_change_delta_now: dict[str, float] = {}
+        for region_key, pixels in region_recent_change_pixels.items():
+            ratio = float(pixels) / float(max(1, total_changed_pixels_for_regions))
+            density = float(min(1.0, float(pixels) / 64.0))
+            magnitude_now = float(max(0.0, min(1.0, (0.65 * ratio) + (0.35 * density))))
+            prev_ema = float(max(0.0, min(1.0, region_change_magnitude_ema.get(region_key, 0.0))))
+            ema_now = float((0.72 * prev_ema) + (0.28 * magnitude_now))
+            region_change_magnitude_now[str(region_key)] = float(magnitude_now)
+            region_change_delta_now[str(region_key)] = float(max(0.0, magnitude_now - prev_ema))
+            region_change_magnitude_ema[str(region_key)] = float(max(0.0, min(1.0, ema_now)))
+        region_sudden_spike_keys_now: set[str] = set()
+        for region_key, magnitude_now in region_change_magnitude_now.items():
+            delta_now = float(max(0.0, region_change_delta_now.get(region_key, 0.0)))
+            pixels_now = int(max(0, region_recent_change_pixels.get(region_key, 0)))
+            non_source_large_change = bool(
+                str(region_key) != str(source_region_key)
+                and pixels_now >= int(max(8, self.high_info_simultaneous_min_region_pixels))
+                and int(changed_pixels) >= int(self.high_info_simultaneous_min_total_pixels)
+                and float(magnitude_now) >= 0.22
+            )
+            spike_detected = bool(
+                delta_now >= 0.22
+                or (
+                    float(magnitude_now) >= 0.68
+                    and pixels_now >= int(max(8, self.high_info_simultaneous_min_region_pixels))
+                )
+                or non_source_large_change
+            )
+            if not spike_detected:
+                continue
+            if _reachable_or_frontier_region_v1(str(region_key)):
+                region_sudden_spike_keys_now.add(str(region_key))
         strong_event = bool(
             obs_change_type in ("CC_COUNT_CHANGE", "GLOBAL_PATTERN_CHANGE", "METADATA_PROGRESS_CHANGE")
             or changed_pixels >= int(self.high_info_strong_change_pixels)
@@ -4226,7 +4424,7 @@ class ActiveInferenceEFE(Agent):
             and simultaneous_touches_coupled
         )
         if simultaneous_focus_reset:
-            ordered_priority_rows: list[tuple[int, int, str]] = []
+            ordered_priority_rows: list[tuple[int, float, int, int, str]] = []
             for region_key in simultaneous_focus_candidates:
                 route_distance = int(
                     self._region_route_distance_v1(
@@ -4251,12 +4449,92 @@ class ActiveInferenceEFE(Agent):
                         ),
                     )
                 )
+                change_magnitude = float(
+                    max(
+                        0.0,
+                        min(
+                            1.0,
+                            max(
+                                region_change_magnitude_now.get(str(region_key), 0.0),
+                                region_change_magnitude_ema.get(str(region_key), 0.0),
+                            ),
+                        ),
+                    )
+                )
+                sudden_priority = (
+                    0 if str(region_key) in region_sudden_spike_keys_now else 1
+                )
                 ordered_priority_rows.append(
-                    (int(route_distance), -int(region_diff), str(region_key))
+                    (
+                        int(sudden_priority),
+                        float(-change_magnitude),
+                        -int(region_diff),
+                        int(route_distance),
+                        str(region_key),
+                    )
                 )
             ordered_priority_rows.sort()
-            priority_subqueue_keys = [str(row[2]) for row in ordered_priority_rows]
+            priority_subqueue_keys = [str(row[4]) for row in ordered_priority_rows]
             priority_subqueue_active = bool(len(priority_subqueue_keys) >= 2)
+        for region_key in simultaneous_reachable_set:
+            key = str(region_key)
+            if self._parse_region_key_v1(key) is None:
+                continue
+            if float(region_change_delta_now.get(key, 0.0)) >= 0.14:
+                region_sudden_spike_keys_now.add(str(key))
+        region_event_priority_keys: set[str] = set()
+        for region_key, pixels in region_recent_change_pixels.items():
+            key = str(region_key)
+            if self._parse_region_key_v1(key) is None:
+                continue
+            if key == str(source_region_key):
+                continue
+            magnitude = float(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        max(
+                            region_change_magnitude_now.get(key, 0.0),
+                            region_change_magnitude_ema.get(key, 0.0),
+                        ),
+                    ),
+                )
+            )
+            if (
+                int(pixels) >= int(max(8, self.high_info_simultaneous_min_region_pixels))
+                and magnitude >= 0.20
+            ):
+                region_event_priority_keys.add(str(key))
+        region_sudden_spike_priority_keys = {
+            str(region_key)
+            for region_key in (set(region_sudden_spike_keys_now) | set(region_event_priority_keys))
+            if self._parse_region_key_v1(str(region_key)) is not None
+            and (
+                _reachable_or_frontier_region_v1(str(region_key))
+                or str(region_key) in simultaneous_priority_set
+                or str(region_key) in region_event_priority_keys
+            )
+        }
+        region_change_magnitude_effective: dict[str, float] = {}
+        for region_key in set(region_change_magnitude_ema.keys()) | set(region_change_magnitude_now.keys()):
+            key = str(region_key)
+            if self._parse_region_key_v1(key) is None:
+                continue
+            effective = float(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        max(
+                            region_change_magnitude_ema.get(key, 0.0),
+                            region_change_magnitude_now.get(key, 0.0),
+                        ),
+                    ),
+                )
+            )
+            if effective > 0.0:
+                region_change_magnitude_effective[str(key)] = float(effective)
 
         def _collect_hot_targets(anchor_region_key: str) -> dict[str, float]:
             target_scores_local: dict[str, float] = {}
@@ -4278,16 +4556,47 @@ class ActiveInferenceEFE(Agent):
                 region_key = str(row.get("region_key", "NA"))
                 if self._parse_region_key_v1(region_key) is None:
                     continue
+                ui_suppression_hint = float(
+                    max(0.0, min(1.0, row.get("ui_suppression", 0.0)))
+                )
+                event_override = bool(
+                    str(region_key) in region_event_priority_keys
+                    and ui_suppression_hint < 0.70
+                )
                 if (
                     not _reachable_or_frontier_region_v1(str(region_key))
                     and str(region_key) not in coupled_region_keys
                     and str(region_key) not in simultaneous_priority_set
+                    and not event_override
                 ):
                     continue
                 info_score = float(max(0.0, row.get("info_score", 0.0)))
                 if info_score <= 0.0:
                     continue
                 visit_count = int(self._region_visit_counts.get(region_key, 0))
+                recent_change_pixels = int(max(0, region_recent_change_pixels.get(region_key, 0)))
+                recent_change_magnitude = float(
+                    max(
+                        0.0,
+                        min(
+                            1.0,
+                            region_change_magnitude_now.get(
+                                region_key,
+                                region_change_magnitude_ema.get(region_key, 0.0),
+                            ),
+                        ),
+                    )
+                )
+                recent_change_delta = float(
+                    max(0.0, min(1.0, region_change_delta_now.get(region_key, 0.0)))
+                )
+                sudden_spike = bool(region_key in region_sudden_spike_keys_now)
+                non_source_event_change = bool(
+                    str(region_key) != str(source_region_key)
+                    and recent_change_pixels
+                    >= int(max(8, self.high_info_simultaneous_min_region_pixels))
+                    and int(changed_pixels) >= int(self.high_info_simultaneous_min_total_pixels)
+                )
                 novelty_bonus = float(max(0.0, 1.0 - min(1.0, float(visit_count) / 10.0))) * 0.20
                 revisit_penalty = float(min(0.18, float(visit_count) / 20.0))
                 stale_loop_penalty = 0.0
@@ -4316,6 +4625,30 @@ class ActiveInferenceEFE(Agent):
                         info_score + novelty_bonus - revisit_penalty - stale_loop_penalty,
                     )
                 )
+                score = float(
+                    score
+                    + (0.22 * recent_change_magnitude)
+                    + (
+                        (0.28 + (0.22 * recent_change_delta))
+                        if sudden_spike
+                        else 0.0
+                    )
+                    + (
+                        0.20 + (0.14 * recent_change_magnitude)
+                        if non_source_event_change
+                        else 0.0
+                    )
+                )
+                if sudden_spike and _reachable_or_frontier_region_v1(str(region_key)):
+                    spike_floor = float(
+                        min(
+                            1.0,
+                            0.78
+                            + (0.14 * recent_change_magnitude)
+                            + (0.08 if recent_change_pixels >= 12 else 0.0),
+                        )
+                    )
+                    score = float(max(score, spike_floor))
                 if region_key == str(anchor_region_key) and strong_event:
                     anchor_sample_count = int(
                         max(0, target_sample_counts.get(str(region_key), 0))
@@ -4363,6 +4696,24 @@ class ActiveInferenceEFE(Agent):
                     route_bonus = float(max(0.0, 0.18 - (0.04 * float(route_distance))))
                     rank_penalty = float(0.05 * float(idx))
                     base_score = float(0.74 + route_bonus - rank_penalty)
+                    change_magnitude = float(
+                        max(
+                            0.0,
+                            min(
+                                1.0,
+                                region_change_magnitude_now.get(
+                                    str(region_key),
+                                    region_change_magnitude_ema.get(str(region_key), 0.0),
+                                ),
+                            ),
+                        )
+                    )
+                    change_delta = float(
+                        max(0.0, min(1.0, region_change_delta_now.get(str(region_key), 0.0)))
+                    )
+                    base_score = float(base_score + (0.14 * change_magnitude))
+                    if str(region_key) in region_sudden_spike_keys_now:
+                        base_score = float(base_score + 0.16 + (0.10 * change_delta))
                     if str(region_key) in simultaneous_reachable_set:
                         base_score = float(base_score + 0.16)
                     elif str(region_key) in simultaneous_unknown_set:
@@ -4459,7 +4810,9 @@ class ActiveInferenceEFE(Agent):
             sample_counts: dict[str, int],
         ) -> list[str]:
             current_target = str(state.get("current_target_region_key", "NA"))
-            rows: list[tuple[int, int, int, int, int, int, int, float, int, int, str]] = []
+            rows: list[
+                tuple[int, int, int, int, int, int, int, int, float, float, int, int, str]
+            ] = []
             for region_key, score in target_scores_raw.items():
                 region_key = str(region_key)
                 if self._parse_region_key_v1(region_key) is None:
@@ -4474,6 +4827,7 @@ class ActiveInferenceEFE(Agent):
                     (not reachable_or_frontier)
                     and region_key not in simultaneous_priority_set
                     and region_key not in coupled_region_keys
+                    and region_key not in region_event_priority_keys
                 ):
                     continue
                 score_value = float(score)
@@ -4499,6 +4853,31 @@ class ActiveInferenceEFE(Agent):
                 )
                 unsampled_bonus = 0.12 if sample_count <= 0 else 0.0
                 adjusted_score = float(score_value + unsampled_bonus)
+                dynamic_change_score = float(
+                    max(
+                        0.0,
+                        min(
+                            1.0,
+                            max(
+                                region_change_magnitude_now.get(region_key, 0.0),
+                                region_change_magnitude_ema.get(region_key, 0.0),
+                            ),
+                        ),
+                    )
+                )
+                sudden_priority_active = bool(
+                    (
+                        region_key in region_sudden_spike_priority_keys
+                        or region_key in region_event_priority_keys
+                    )
+                    and (
+                        dynamic_change_score >= 0.20
+                        or score_value >= float(max(high_value_threshold, 0.62))
+                    )
+                )
+                adjusted_score = float(adjusted_score + (0.18 * dynamic_change_score))
+                if sudden_priority_active and reachable_or_frontier:
+                    adjusted_score = float(adjusted_score + 0.36)
                 if (not reachable_or_frontier) and region_key in coupled_region_keys:
                     adjusted_score = float(adjusted_score - 0.18)
                 route_distance = int(
@@ -4517,6 +4896,7 @@ class ActiveInferenceEFE(Agent):
                     )
                 rows.append(
                     (
+                        0 if sudden_priority_active else 1,
                         int(simultaneous_priority),
                         int(reachability_priority),
                         int(coupled_priority),
@@ -4524,6 +4904,7 @@ class ActiveInferenceEFE(Agent):
                         int(high_value_priority),
                         int(carry_priority),
                         int(completed_priority),
+                        float(-dynamic_change_score),
                         float(-adjusted_score),
                         int(route_distance),
                         int(self._region_visit_counts.get(region_key, 0)),
@@ -4534,18 +4915,32 @@ class ActiveInferenceEFE(Agent):
             queue = [str(row[-1]) for row in rows]
             if not queue:
                 return []
+            sudden_head = [key for key in queue if key in region_sudden_spike_priority_keys]
             simultaneous_head = [
                 key
                 for key in queue
-                if key in simultaneous_reachable_set or key in simultaneous_unknown_set
+                if (
+                    key not in set(sudden_head)
+                    and (key in simultaneous_reachable_set or key in simultaneous_unknown_set)
+                )
             ]
-            coupled_head = [key for key in queue if key in coupled_region_keys and key not in simultaneous_head]
+            coupled_head = [
+                key
+                for key in queue
+                if key in coupled_region_keys
+                and key not in set(sudden_head)
+                and key not in simultaneous_head
+            ]
             non_coupled = [
                 key
                 for key in queue
-                if key not in coupled_region_keys and key not in simultaneous_head
+                if key not in set(sudden_head)
+                and key not in coupled_region_keys
+                and key not in simultaneous_head
             ]
-            if simultaneous_head:
+            if sudden_head:
+                queue = sudden_head + simultaneous_head + coupled_head + non_coupled
+            elif simultaneous_head:
                 queue = simultaneous_head + coupled_head + non_coupled
             elif coupled_progress_locked and coupled_head and non_coupled:
                 high_non_coupled = [
@@ -4588,7 +4983,13 @@ class ActiveInferenceEFE(Agent):
             preferred = [key for key in normalized if str(key) != str(source_key)]
             if preferred:
                 normalized = list(preferred)
-            if coupled_progress_locked:
+            sudden_head = [key for key in normalized if key in region_sudden_spike_priority_keys]
+            if sudden_head:
+                sudden_set = set(str(v) for v in sudden_head)
+                normalized = list(sudden_head) + [
+                    str(v) for v in normalized if str(v) not in sudden_set
+                ]
+            if coupled_progress_locked and not sudden_head:
                 coupled_only = [key for key in normalized if key in coupled_region_keys]
                 if len(coupled_only) >= 2:
                     normalized = [str(coupled_only[0]), str(coupled_only[1])]
@@ -4772,6 +5173,35 @@ class ActiveInferenceEFE(Agent):
             state["simultaneous_changed_total_pixels"] = int(
                 max(0, simultaneous_changed_total_pixels)
             )
+            state["region_recent_change_pixels"] = {
+                str(k): int(max(0, v))
+                for (k, v) in region_recent_change_pixels.items()
+                if self._parse_region_key_v1(str(k)) is not None and int(v) > 0
+            }
+            state["region_change_magnitude"] = {
+                str(k): float(max(0.0, min(1.0, v)))
+                for (k, v) in region_change_magnitude_effective.items()
+                if self._parse_region_key_v1(str(k)) is not None
+            }
+            state["region_change_magnitude_ema"] = {
+                str(k): float(max(0.0, min(1.0, v)))
+                for (k, v) in region_change_magnitude_ema.items()
+                if self._parse_region_key_v1(str(k)) is not None
+            }
+            state["region_change_delta"] = {
+                str(k): float(max(0.0, min(1.0, v)))
+                for (k, v) in region_change_delta_now.items()
+                if self._parse_region_key_v1(str(k)) is not None
+            }
+            state["region_sudden_spike_keys"] = [
+                str(v) for v in sorted(region_sudden_spike_priority_keys)[:16]
+            ]
+            state["last_trigger_changed_pixels"] = int(max(0, changed_pixels))
+            state["last_trigger_changed_region_diff_map"] = {
+                str(k): int(max(0, v))
+                for (k, v) in region_recent_change_pixels.items()
+                if self._parse_region_key_v1(str(k)) is not None and int(v) > 0
+            }
             state["cross_region_key"] = str(primary_coupled_region_key)
             state["gate_region_key"] = str(secondary_coupled_region_key)
             state["coupled_region_keys"] = [
@@ -4913,6 +5343,35 @@ class ActiveInferenceEFE(Agent):
                         state["simultaneous_changed_total_pixels"] = int(
                             max(0, simultaneous_changed_total_pixels)
                         )
+                        state["region_recent_change_pixels"] = {
+                            str(k): int(max(0, v))
+                            for (k, v) in region_recent_change_pixels.items()
+                            if self._parse_region_key_v1(str(k)) is not None and int(v) > 0
+                        }
+                        state["region_change_magnitude"] = {
+                            str(k): float(max(0.0, min(1.0, v)))
+                            for (k, v) in region_change_magnitude_effective.items()
+                            if self._parse_region_key_v1(str(k)) is not None
+                        }
+                        state["region_change_magnitude_ema"] = {
+                            str(k): float(max(0.0, min(1.0, v)))
+                            for (k, v) in region_change_magnitude_ema.items()
+                            if self._parse_region_key_v1(str(k)) is not None
+                        }
+                        state["region_change_delta"] = {
+                            str(k): float(max(0.0, min(1.0, v)))
+                            for (k, v) in region_change_delta_now.items()
+                            if self._parse_region_key_v1(str(k)) is not None
+                        }
+                        state["region_sudden_spike_keys"] = [
+                            str(v) for v in sorted(region_sudden_spike_priority_keys)[:16]
+                        ]
+                        state["last_trigger_changed_pixels"] = int(max(0, changed_pixels))
+                        state["last_trigger_changed_region_diff_map"] = {
+                            str(k): int(max(0, v))
+                            for (k, v) in region_recent_change_pixels.items()
+                            if self._parse_region_key_v1(str(k)) is not None and int(v) > 0
+                        }
                         state["cross_region_key"] = str(primary_coupled_region_key)
                         state["gate_region_key"] = str(secondary_coupled_region_key)
                         state["coupled_region_keys"] = [
@@ -4967,6 +5426,35 @@ class ActiveInferenceEFE(Agent):
             state["simultaneous_changed_total_pixels"] = int(
                 max(0, simultaneous_changed_total_pixels)
             )
+            state["region_recent_change_pixels"] = {
+                str(k): int(max(0, v))
+                for (k, v) in region_recent_change_pixels.items()
+                if self._parse_region_key_v1(str(k)) is not None and int(v) > 0
+            }
+            state["region_change_magnitude"] = {
+                str(k): float(max(0.0, min(1.0, v)))
+                for (k, v) in region_change_magnitude_effective.items()
+                if self._parse_region_key_v1(str(k)) is not None
+            }
+            state["region_change_magnitude_ema"] = {
+                str(k): float(max(0.0, min(1.0, v)))
+                for (k, v) in region_change_magnitude_ema.items()
+                if self._parse_region_key_v1(str(k)) is not None
+            }
+            state["region_change_delta"] = {
+                str(k): float(max(0.0, min(1.0, v)))
+                for (k, v) in region_change_delta_now.items()
+                if self._parse_region_key_v1(str(k)) is not None
+            }
+            state["region_sudden_spike_keys"] = [
+                str(v) for v in sorted(region_sudden_spike_priority_keys)[:16]
+            ]
+            state["last_trigger_changed_pixels"] = int(max(0, changed_pixels))
+            state["last_trigger_changed_region_diff_map"] = {
+                str(k): int(max(0, v))
+                for (k, v) in region_recent_change_pixels.items()
+                if self._parse_region_key_v1(str(k)) is not None and int(v) > 0
+            }
             state["cross_region_key"] = str(primary_coupled_region_key)
             state["gate_region_key"] = str(secondary_coupled_region_key)
             state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
@@ -4996,6 +5484,56 @@ class ActiveInferenceEFE(Agent):
             completed_recent=completed_recent,
             sample_counts=target_sample_counts,
         )
+        if queue and (strong_event or int(changed_pixels) >= int(self.high_info_simultaneous_min_total_pixels)):
+            source_change_magnitude = float(
+                max(0.0, min(1.0, region_change_magnitude_effective.get(str(source_region_key), 0.0)))
+            )
+            event_priority_candidates = sorted(
+                [
+                    str(region_key)
+                    for region_key in region_sudden_spike_priority_keys
+                    if self._parse_region_key_v1(str(region_key)) is not None
+                    and str(region_key) != str(source_region_key)
+                    and float(region_change_magnitude_effective.get(str(region_key), 0.0)) >= 0.20
+                ],
+                key=lambda key: (
+                    -float(region_change_magnitude_effective.get(str(key), 0.0)),
+                    int(
+                        self._region_route_distance_v1(
+                            region_adjacency,
+                            start_region_key=str(anchor_key),
+                            goal_region_key=str(key),
+                        )
+                    ),
+                    str(key),
+                ),
+            )
+            if event_priority_candidates:
+                top_event_key = str(event_priority_candidates[0])
+                top_event_mag = float(
+                    max(0.0, min(1.0, region_change_magnitude_effective.get(str(top_event_key), 0.0)))
+                )
+                if (
+                    top_event_mag >= float(max(0.20, source_change_magnitude - 0.28))
+                    and str(top_event_key) != str(queue[0])
+                ):
+                    event_priority_window = [
+                        str(v)
+                        for v in event_priority_candidates[
+                            : int(max(1, min(3, self.high_info_focus_max_targets)))
+                        ]
+                    ]
+                    queue = list(event_priority_window) + [
+                        str(v) for v in queue if str(v) not in set(event_priority_window)
+                    ]
+                    priority_subqueue_active = bool(event_priority_window)
+                    priority_subqueue_keys = list(event_priority_window)
+                    if (
+                        chain_lock_active
+                        and str(chain_lock_target_region_key) not in set(event_priority_window)
+                    ):
+                        _disable_chain_lock("event_change_priority")
+                    state["last_status"] = "event_change_priority_lock"
         if not queue:
             state["active"] = False
             state["stage"] = "idle"
@@ -5010,6 +5548,13 @@ class ActiveInferenceEFE(Agent):
             state["simultaneous_unreachable_region_keys"] = []
             state["simultaneous_anchor_region_key"] = "NA"
             state["simultaneous_changed_total_pixels"] = 0
+            state["region_recent_change_pixels"] = {}
+            state["region_change_magnitude"] = {}
+            state["region_change_magnitude_ema"] = {}
+            state["region_change_delta"] = {}
+            state["region_sudden_spike_keys"] = []
+            state["last_trigger_changed_pixels"] = 0
+            state["last_trigger_changed_region_diff_map"] = {}
             state["interaction_chain_active"] = False
             state["interaction_target_chain"] = []
             state["interaction_target_index"] = 0
@@ -5194,6 +5739,35 @@ class ActiveInferenceEFE(Agent):
         state["simultaneous_changed_total_pixels"] = int(
             max(0, simultaneous_changed_total_pixels)
         )
+        state["region_recent_change_pixels"] = {
+            str(k): int(max(0, v))
+            for (k, v) in region_recent_change_pixels.items()
+            if self._parse_region_key_v1(str(k)) is not None and int(v) > 0
+        }
+        state["region_change_magnitude"] = {
+            str(k): float(max(0.0, min(1.0, v)))
+            for (k, v) in region_change_magnitude_effective.items()
+            if self._parse_region_key_v1(str(k)) is not None
+        }
+        state["region_change_magnitude_ema"] = {
+            str(k): float(max(0.0, min(1.0, v)))
+            for (k, v) in region_change_magnitude_ema.items()
+            if self._parse_region_key_v1(str(k)) is not None
+        }
+        state["region_change_delta"] = {
+            str(k): float(max(0.0, min(1.0, v)))
+            for (k, v) in region_change_delta_now.items()
+            if self._parse_region_key_v1(str(k)) is not None
+        }
+        state["region_sudden_spike_keys"] = [
+            str(v) for v in sorted(region_sudden_spike_priority_keys)[:16]
+        ]
+        state["last_trigger_changed_pixels"] = int(max(0, changed_pixels))
+        state["last_trigger_changed_region_diff_map"] = {
+            str(k): int(max(0, v))
+            for (k, v) in region_recent_change_pixels.items()
+            if self._parse_region_key_v1(str(k)) is not None and int(v) > 0
+        }
         state["cross_region_key"] = str(primary_coupled_region_key)
         state["gate_region_key"] = str(secondary_coupled_region_key)
         state["coupled_region_keys"] = [str(v) for v in sorted(coupled_region_keys)]
