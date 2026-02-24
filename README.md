@@ -198,7 +198,7 @@ done
 - Updated to use the new [ARC-AGI](https://github.com/arcprize/ARC-AGI) tool
   - Allows local execution of environments
   - Allows the creation of your own environments, see [Creating an Environment](https://docs.arcprize.org/add_game)
-  - If you want to continue to use the online API/Replays set `ONLINE_ONLY` to `True` in `.env.example`
+  - If you want to continue to use the online API/Replays set `runtime.OPERATION_MODE` to `"online"` in `config/runtime_config.local.json`
 
 ## [0.9.2] - 2025-08-19
 
@@ -238,10 +238,14 @@ pip install -U agentops
 
 ### Configuration
 
-1. Add your AgentOps API key to your `.env` file:
+1. Add your AgentOps API key to `config/runtime_config.local.json`:
 
-```bash
-AGENTOPS_API_KEY=aos_your_api_key_here
+```json
+{
+  "runtime": {
+    "AGENTOPS_API_KEY": "aos_your_api_key_here"
+  }
+}
 ```
 
 2. The AgentOps integration is automatically initialized when you run an agent. The tracing decorator `@trace_agent_session` is already applied to agent execution methods in the codebase.
