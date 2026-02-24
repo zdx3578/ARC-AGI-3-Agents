@@ -387,6 +387,12 @@ class ActiveInferenceEFE(Agent):
             4,
             _cfg_int("ACTIVE_INFERENCE_HIGH_INFO_NOVELTY_STATS_MAX_ENTRIES", 24),
         )
+        # When disabled, high-info focus becomes purely evidence-driven (triggered by actual
+        # high-diff/novel events), rather than rearming on heuristically "coupled" regions.
+        self.high_info_idle_rearm_enabled = _cfg_bool(
+            "ACTIVE_INFERENCE_HIGH_INFO_IDLE_REARM_ENABLED",
+            False,
+        )
         self.orientation_alignment_min_similarity = max(
             0.35,
             min(0.95, _cfg_float("ACTIVE_INFERENCE_ORIENTATION_MIN_SIMILARITY", 0.68)),
@@ -526,6 +532,9 @@ class ActiveInferenceEFE(Agent):
         self._tracked_agent_anchor_xy: tuple[int, int] | None = None
         self._tracked_agent_color: int | None = None
         self._tracked_agent_area_ema: float | None = None
+        # Cached arena bbox used by high-info diff masking as a fallback when segmentation drifts.
+        # Stored as (min_x, min_y, max_x, max_y) in pixel coordinates.
+        self._high_info_cached_arena_bbox: tuple[int, int, int, int] | None = None
         self._navigation_anchor_jump_reject_count = 0
         self._navigation_anchor_jump_streak = 0
         self._last_known_agent_pos_region: tuple[int, int] | None = None
@@ -676,6 +685,10 @@ class ActiveInferenceEFE(Agent):
             "interaction_last_status": "idle",
             "priority_subqueue_active": False,
             "priority_subqueue_keys": [],
+            "inner_loop_active": False,
+            "inner_loop_reason": "NA",
+            "inner_loop_queue": [],
+            "inner_loop_current_target_region_key": "NA",
             "novelty_protocol_active": False,
             "novelty_source_region_key": "NA",
             "novelty_related_region_keys": [],
@@ -683,6 +696,7 @@ class ActiveInferenceEFE(Agent):
             "novelty_trigger_count": 0,
             "novelty_last_action_counter": -1,
             "novelty_signature_stats": {},
+            "novelty_baseline_sample_counts": {},
             "last_status": "idle",
         }
 
@@ -1715,7 +1729,9 @@ class ActiveInferenceEFE(Agent):
             col = int(scol)
         except Exception:
             return None
-        if row < 0 or col < 0:
+        # Region grid is fixed 8x8 (0..7). Reject drifted/UI-sourced keys early so they
+        # cannot poison reachability, masks, or queues.
+        if row < 0 or col < 0 or row > 7 or col > 7:
             return None
         # Region keys are stored as row:col. Internal geometry keeps (x, y)=(col, row).
         return (int(col), int(row))
@@ -1724,7 +1740,7 @@ class ActiveInferenceEFE(Agent):
     def _region_key_from_xy_v1(region_x: int, region_y: int) -> str:
         col = int(region_x)
         row = int(region_y)
-        if col < 0 or row < 0:
+        if col < 0 or row < 0 or col > 7 or row > 7:
             return "NA"
         return f"{int(row)}:{int(col)}"
 
@@ -2594,6 +2610,181 @@ class ActiveInferenceEFE(Agent):
         if after_seed is None and before_seed is not None:
             after_seed = (int(before_seed[0]), int(before_seed[1]))
 
+        def _arena_bbox_candidate(rep: RepresentationStateV1) -> tuple[float, dict[str, Any]] | None:
+            nodes = list(getattr(rep, "object_nodes", []) or [])
+            if not nodes:
+                return None
+            seed_xy = after_seed if after_seed is not None else before_seed
+            frame_pixels = int(max(1, height * width))
+            min_area = int(max(64, frame_pixels * 0.05))
+            best: tuple[float, dict[str, Any]] | None = None
+            for node in nodes:
+                try:
+                    if bool(getattr(node, "touches_boundary", False)):
+                        continue
+                    area = int(getattr(node, "area", 0))
+                    if area < min_area:
+                        continue
+                    min_x = int(getattr(node, "bbox_min_x", -1))
+                    min_y = int(getattr(node, "bbox_min_y", -1))
+                    max_x = int(getattr(node, "bbox_max_x", -1))
+                    max_y = int(getattr(node, "bbox_max_y", -1))
+                    if min_x < 0 or min_y < 0 or max_x < 0 or max_y < 0:
+                        continue
+                    if min_x > max_x or min_y > max_y:
+                        continue
+                    if max_x >= width or max_y >= height:
+                        continue
+                    bbox_w = int(max_x - min_x + 1)
+                    bbox_h = int(max_y - min_y + 1)
+                    if bbox_w < 8 or bbox_h < 8:
+                        continue
+                    bbox_area = int(bbox_w * bbox_h)
+                    if bbox_area <= 0:
+                        continue
+                    fill_ratio = float(area) / float(max(1, bbox_area))
+                    if fill_ratio < 0.18:
+                        continue
+                    if seed_xy is not None:
+                        sx, sy = int(seed_xy[0]), int(seed_xy[1])
+                        if not (min_x <= sx <= max_x and min_y <= sy <= max_y):
+                            continue
+                    cx = int(getattr(node, "centroid_x", (min_x + max_x) // 2))
+                    cy = int(getattr(node, "centroid_y", (min_y + max_y) // 2))
+                except Exception:
+                    continue
+                center_dist = int(abs(cx - (width // 2)) + abs(cy - (height // 2)))
+                score = float(area) + (200.0 * float(fill_ratio)) - (0.35 * float(center_dist))
+                payload = {
+                    "digest": str(getattr(node, "digest", "")),
+                    "color": int(getattr(node, "color", -1)),
+                    "area": int(area),
+                    "bbox": [int(min_x), int(min_y), int(max_x), int(max_y)],
+                    "bbox_area": int(bbox_area),
+                    "fill_ratio": float(round(fill_ratio, 4)),
+                    "seed_required": bool(seed_xy is not None),
+                }
+                if best is None or score > float(best[0]):
+                    best = (float(score), payload)
+            return best
+
+        # Prefer an arena bounding box mask inferred from the representation itself.
+        # This keeps the full map visible to high-info detection (including remote effects),
+        # while excluding HUD/hub pixels outside the arena.
+        arena = _arena_bbox_candidate(current_representation) or _arena_bbox_candidate(
+            previous_representation
+        )
+        if arena is not None:
+            _, payload = arena
+            bbox = payload.get("bbox", [-1, -1, -1, -1])
+            if isinstance(bbox, list) and len(bbox) >= 4:
+                min_x, min_y, max_x, max_y = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+                margin = 2
+                min_x = int(max(0, min_x - margin))
+                min_y = int(max(0, min_y - margin))
+                max_x = int(min(width - 1, max_x + margin))
+                max_y = int(min(height - 1, max_y + margin))
+                mask = [[False for _ in range(width)] for _ in range(height)]
+                for y in range(min_y, max_y + 1):
+                    row = mask[y]
+                    for x in range(min_x, max_x + 1):
+                        row[x] = True
+                mask_pixels = int((max_x - min_x + 1) * (max_y - min_y + 1))
+                frame_pixels = int(max(1, height * width))
+                mask_ratio = float(mask_pixels) / float(frame_pixels)
+                if mask_ratio < 0.06:
+                    meta["reason"] = "arena_mask_too_small"
+                    meta["arena_object"] = dict(payload)
+                    meta["arena_bbox"] = [int(min_x), int(min_y), int(max_x), int(max_y)]
+                    if self._high_info_cached_arena_bbox is not None:
+                        # Fall back to the last known good bbox rather than disabling masking.
+                        cached = tuple(int(v) for v in self._high_info_cached_arena_bbox)
+                        cmin_x, cmin_y, cmax_x, cmax_y = cached
+                        mask = [[False for _ in range(width)] for _ in range(height)]
+                        for y in range(max(0, cmin_y), min(height - 1, cmax_y) + 1):
+                            row = mask[y]
+                            for x in range(max(0, cmin_x), min(width - 1, cmax_x) + 1):
+                                row[x] = True
+                        mask_pixels = int((cmax_x - cmin_x + 1) * (cmax_y - cmin_y + 1))
+                        frame_pixels = int(max(1, height * width))
+                        meta["enabled"] = True
+                        meta["method"] = "arena_bbox_cached_v1"
+                        meta["mask_pixels"] = int(mask_pixels)
+                        meta["mask_ratio"] = float(mask_pixels) / float(frame_pixels)
+                        meta["arena_bbox"] = [int(cmin_x), int(cmin_y), int(cmax_x), int(cmax_y)]
+                        meta["arena_margin"] = 0
+                        meta["reason"] = "fallback_cached_small"
+                        return mask, meta
+                    return None, meta
+                if mask_ratio > 0.80:
+                    meta["reason"] = "arena_mask_too_large"
+                    meta["arena_object"] = dict(payload)
+                    meta["arena_bbox"] = [int(min_x), int(min_y), int(max_x), int(max_y)]
+                    if self._high_info_cached_arena_bbox is not None:
+                        cached = tuple(int(v) for v in self._high_info_cached_arena_bbox)
+                        cmin_x, cmin_y, cmax_x, cmax_y = cached
+                        mask = [[False for _ in range(width)] for _ in range(height)]
+                        for y in range(max(0, cmin_y), min(height - 1, cmax_y) + 1):
+                            row = mask[y]
+                            for x in range(max(0, cmin_x), min(width - 1, cmax_x) + 1):
+                                row[x] = True
+                        mask_pixels = int((cmax_x - cmin_x + 1) * (cmax_y - cmin_y + 1))
+                        frame_pixels = int(max(1, height * width))
+                        meta["enabled"] = True
+                        meta["method"] = "arena_bbox_cached_v1"
+                        meta["mask_pixels"] = int(mask_pixels)
+                        meta["mask_ratio"] = float(mask_pixels) / float(frame_pixels)
+                        meta["arena_bbox"] = [int(cmin_x), int(cmin_y), int(cmax_x), int(cmax_y)]
+                        meta["arena_margin"] = 0
+                        meta["reason"] = "fallback_cached_large"
+                        return mask, meta
+                    return None, meta
+                meta["enabled"] = True
+                meta["method"] = "arena_bbox_v1"
+                meta["mask_pixels"] = int(mask_pixels)
+                meta["mask_ratio"] = float(mask_ratio)
+                meta["arena_object"] = dict(payload)
+                meta["arena_bbox"] = [int(min_x), int(min_y), int(max_x), int(max_y)]
+                meta["arena_margin"] = int(margin)
+                # Cache for future frames where segmentation may temporarily drift.
+                self._high_info_cached_arena_bbox = (
+                    int(min_x),
+                    int(min_y),
+                    int(max_x),
+                    int(max_y),
+                )
+                return mask, meta
+
+        # Fallback to the last known good arena bbox. This prevents HUD-driven global diffs
+        # from being treated as high-info when tracking temporarily drifts.
+        if self._high_info_cached_arena_bbox is not None:
+            cmin_x, cmin_y, cmax_x, cmax_y = (
+                int(self._high_info_cached_arena_bbox[0]),
+                int(self._high_info_cached_arena_bbox[1]),
+                int(self._high_info_cached_arena_bbox[2]),
+                int(self._high_info_cached_arena_bbox[3]),
+            )
+            cmin_x = int(max(0, min(width - 1, cmin_x)))
+            cmin_y = int(max(0, min(height - 1, cmin_y)))
+            cmax_x = int(max(0, min(width - 1, cmax_x)))
+            cmax_y = int(max(0, min(height - 1, cmax_y)))
+            if cmin_x <= cmax_x and cmin_y <= cmax_y:
+                mask = [[False for _ in range(width)] for _ in range(height)]
+                for y in range(cmin_y, cmax_y + 1):
+                    row = mask[y]
+                    for x in range(cmin_x, cmax_x + 1):
+                        row[x] = True
+                mask_pixels = int((cmax_x - cmin_x + 1) * (cmax_y - cmin_y + 1))
+                frame_pixels = int(max(1, height * width))
+                meta["enabled"] = True
+                meta["method"] = "arena_bbox_cached_v1"
+                meta["mask_pixels"] = int(mask_pixels)
+                meta["mask_ratio"] = float(mask_pixels) / float(frame_pixels)
+                meta["arena_bbox"] = [int(cmin_x), int(cmin_y), int(cmax_x), int(cmax_y)]
+                meta["arena_margin"] = 0
+                meta["reason"] = "fallback_cached_missing"
+                return mask, meta
+
         def _region_key_from_pixel(px: int, py: int) -> str:
             rx = int(max(0, min(7, int(px) // 8)))
             ry = int(max(0, min(7, int(py) // 8)))
@@ -2904,21 +3095,17 @@ class ActiveInferenceEFE(Agent):
             row = (int(route_distance), -int(count), str(key))
             if key in reachable_set or str(key) == str(anchor_region_key):
                 reachable_sorted.append(row)
-            elif bool(reachability_graph_ready):
-                unreachable_sorted.append(row)
             else:
+                # Treat non-reachable keys as unknown, even if the reachability graph is \"ready\".
+                # Empirical region graphs can be incomplete early in exploration; over-pruning here
+                # prevents the agent from following remote high-diff effects (e.g., trigger->exit).
                 unknown_sorted.append(row)
         reachable_sorted.sort()
         unknown_sorted.sort()
         unreachable_sorted.sort()
-        if bool(reachability_graph_ready):
-            changed_region_keys = [str(row[2]) for row in reachable_sorted]
-            if not changed_region_keys:
-                changed_region_keys = [str(row[2]) for row in unknown_sorted]
-        else:
-            changed_region_keys = [
-                str(row[2]) for row in (reachable_sorted + unknown_sorted + unreachable_sorted)
-            ]
+        changed_region_keys = [
+            str(row[2]) for row in (reachable_sorted + unknown_sorted + unreachable_sorted)
+        ]
         result["changed_region_keys"] = list(changed_region_keys)
         result["reachable_region_keys"] = [str(row[2]) for row in reachable_sorted]
         result["unknown_region_keys"] = [str(row[2]) for row in unknown_sorted]
@@ -3091,12 +3278,12 @@ class ActiveInferenceEFE(Agent):
                 expected_dist = int(abs(cx - int(expected_x)) + abs(cy - int(expected_y)))
                 score += 0.28 * float(expected_dist)
                 if expected_dist > 20:
-                    score += 10.0
+                    score += 80.0
             elif anchor_x is not None and anchor_y is not None:
                 anchor_dist = int(abs(cx - int(anchor_x)) + abs(cy - int(anchor_y)))
                 score += 0.22 * float(anchor_dist)
                 if anchor_dist > 16:
-                    score += 8.0
+                    score += 64.0
             if last_region is not None:
                 last_key = self._region_key_from_xy_v1(int(last_region[0]), int(last_region[1]))
                 candidate_key = self._region_key_from_xy_v1(
@@ -3252,6 +3439,14 @@ class ActiveInferenceEFE(Agent):
         priority_subqueue = state.get("priority_subqueue_keys", [])
         if not isinstance(priority_subqueue, list):
             priority_subqueue = []
+        inner_loop_queue = state.get("inner_loop_queue", [])
+        if not isinstance(inner_loop_queue, list):
+            inner_loop_queue = []
+        inner_loop_queue = [
+            str(v)
+            for v in inner_loop_queue
+            if self._parse_region_key_v1(str(v)) is not None
+        ][:16]
         novelty_related_region_keys = state.get("novelty_related_region_keys", [])
         if not isinstance(novelty_related_region_keys, list):
             novelty_related_region_keys = []
@@ -3441,6 +3636,14 @@ class ActiveInferenceEFE(Agent):
             "interaction_last_status": str(state.get("interaction_last_status", "idle")),
             "priority_subqueue_active": bool(state.get("priority_subqueue_active", False)),
             "priority_subqueue_keys": [str(v) for v in priority_subqueue[:16]],
+            "inner_loop_active": bool(
+                state.get("inner_loop_active", False) and bool(inner_loop_queue)
+            ),
+            "inner_loop_reason": str(state.get("inner_loop_reason", "NA")),
+            "inner_loop_queue": [str(v) for v in inner_loop_queue[:16]],
+            "inner_loop_current_target_region_key": str(
+                state.get("inner_loop_current_target_region_key", "NA")
+            ),
             "novelty_protocol_active": bool(state.get("novelty_protocol_active", False)),
             "novelty_source_region_key": str(state.get("novelty_source_region_key", "NA")),
             "novelty_related_region_keys": [str(v) for v in novelty_related_region_keys[:16]],
@@ -3868,6 +4071,16 @@ class ActiveInferenceEFE(Agent):
         current_region_key = str(raw_current_region_key)
         predicted_current_region_key = "NA"
         target_region_key = str(state.get("current_target_region_key", "NA"))
+        inner_loop_active = bool(state.get("inner_loop_active", False))
+        inner_loop_target_region_key = str(
+            state.get("inner_loop_current_target_region_key", "NA")
+        )
+        if (
+            inner_loop_active
+            and self._parse_region_key_v1(str(inner_loop_target_region_key)) is not None
+        ):
+            # Inner-loop target is authoritative while loop is active.
+            target_region_key = str(inner_loop_target_region_key)
         simultaneous_region_keys = state.get("simultaneous_changed_region_keys", [])
         if not isinstance(simultaneous_region_keys, list):
             simultaneous_region_keys = []
@@ -3918,7 +4131,13 @@ class ActiveInferenceEFE(Agent):
         raw_current_region_tuple = self._parse_region_key_v1(raw_current_region_key)
         predicted_current_region_tuple = self._parse_region_key_v1(predicted_current_region_key)
         if predicted_current_region_tuple is not None:
-            current_region_key = str(predicted_current_region_key)
+            if raw_current_region_tuple is None:
+                current_region_key = str(predicted_current_region_key)
+            else:
+                dx = int(abs(int(predicted_current_region_tuple[0]) - int(raw_current_region_tuple[0])))
+                dy = int(abs(int(predicted_current_region_tuple[1]) - int(raw_current_region_tuple[1])))
+                if max(dx, dy) <= 1:
+                    current_region_key = str(predicted_current_region_key)
         current_region_tuple = self._parse_region_key_v1(current_region_key)
         current_region_mismatch = bool(
             raw_current_region_tuple is not None
@@ -4595,6 +4814,10 @@ class ActiveInferenceEFE(Agent):
             state["novelty_trigger_count"] = 0
             state["novelty_last_action_counter"] = -1
             state["novelty_signature_stats"] = {}
+            state["inner_loop_active"] = False
+            state["inner_loop_reason"] = "NA"
+            state["inner_loop_queue"] = []
+            state["inner_loop_current_target_region_key"] = "NA"
             state["trigger_region_key_effective"] = str(
                 state.get("trigger_region_key", self.sequence_causal_trigger_region_key)
             )
@@ -4656,6 +4879,10 @@ class ActiveInferenceEFE(Agent):
             state["novelty_protocol_active"] = False
             state["novelty_source_region_key"] = "NA"
             state["novelty_related_region_keys"] = []
+            state["inner_loop_active"] = False
+            state["inner_loop_reason"] = "NA"
+            state["inner_loop_queue"] = []
+            state["inner_loop_current_target_region_key"] = "NA"
             state["timeout_count"] = int(state.get("timeout_count", 0) + 1)
             state["last_status"] = "timeout"
 
@@ -4747,6 +4974,20 @@ class ActiveInferenceEFE(Agent):
                 continue
             deduped_priority_subqueue.append(key)
         priority_subqueue_keys = list(deduped_priority_subqueue)
+        inner_loop_queue_raw = state.get("inner_loop_queue", [])
+        if not isinstance(inner_loop_queue_raw, list):
+            inner_loop_queue_raw = []
+        inner_loop_queue = [
+            str(v)
+            for v in inner_loop_queue_raw
+            if self._parse_region_key_v1(str(v)) is not None
+        ][:16]
+        inner_loop_active = bool(
+            state.get("inner_loop_active", False) and bool(inner_loop_queue)
+        )
+        inner_loop_reason = str(state.get("inner_loop_reason", "NA"))
+        if not inner_loop_active:
+            inner_loop_reason = "NA"
         pending_region_queue = state.get("pending_region_queue", [])
         if not isinstance(pending_region_queue, list):
             pending_region_queue = []
@@ -4943,6 +5184,61 @@ class ActiveInferenceEFE(Agent):
                     ),
                 )[: int(max(4, self.high_info_novelty_stats_max_entries))]
             }
+
+        def _flush_inner_loop_state_to_state() -> None:
+            state["inner_loop_active"] = bool(inner_loop_active and bool(inner_loop_queue))
+            state["inner_loop_reason"] = str(
+                inner_loop_reason if (inner_loop_active and inner_loop_queue) else "NA"
+            )
+            state["inner_loop_queue"] = [str(v) for v in inner_loop_queue[:16]]
+            state["inner_loop_current_target_region_key"] = (
+                str(inner_loop_queue[0])
+                if (inner_loop_active and inner_loop_queue)
+                else "NA"
+            )
+
+        def _activate_inner_loop_v1(region_keys: list[str], reason: str) -> bool:
+            nonlocal inner_loop_active
+            nonlocal inner_loop_reason
+            nonlocal inner_loop_queue
+            nonlocal priority_subqueue_active
+            nonlocal priority_subqueue_keys
+            nonlocal interaction_chain_active
+            nonlocal interaction_target_chain
+            nonlocal interaction_target_index
+            ordered: list[str] = []
+            for region_key in region_keys:
+                key = str(region_key)
+                if self._parse_region_key_v1(key) is None:
+                    continue
+                if key in ordered:
+                    continue
+                ordered.append(str(key))
+            if not ordered:
+                return False
+            inner_loop_active = True
+            inner_loop_reason = str(reason)
+            inner_loop_queue = list(ordered[:16])
+            priority_subqueue_active = True
+            priority_subqueue_keys = [str(inner_loop_queue[0])]
+            interaction_chain_active = False
+            interaction_target_chain = []
+            interaction_target_index = 0
+            _arm_chain_lock(str(inner_loop_queue[0]), f"inner_loop_{str(reason)}", focus_commit=True)
+            # Ensure inner-loop has enough budget to finish at least one source<->target cycle.
+            base_window = int(max(1, state.get("window_steps", self.high_info_focus_window_steps)))
+            desired_window = int(max(base_window, 12 + (6 * len(inner_loop_queue))))
+            state["window_steps"] = int(desired_window)
+            state["deadline_action_counter"] = int(
+                max(
+                    int(state.get("deadline_action_counter", -1)),
+                    int(current_counter + desired_window),
+                )
+            )
+            state["steps_remaining"] = int(
+                max(0, int(state.get("deadline_action_counter", current_counter)) - int(current_counter))
+            )
+            return True
 
         def _compact_novelty_stats_v1() -> None:
             nonlocal novelty_signature_stats
@@ -5314,12 +5610,39 @@ class ActiveInferenceEFE(Agent):
         simultaneous_pixels_now = int(
             max(0, simultaneous_info.get("changed_total_pixels", 0))
         )
+        remote_effect_detected = False
+        if simultaneous_changed_now:
+            # Detect "remote effects": an action in the source region causes a non-adjacent
+            # region to change in the same step. This is a strong causal signal even if the
+            # primary event type is a translation.
+            for region_key in simultaneous_changed_now:
+                key = str(region_key)
+                if self._parse_region_key_v1(key) is None:
+                    continue
+                if key == str(source_region_key):
+                    continue
+                src_parsed = self._parse_region_key_v1(str(source_region_key))
+                key_parsed = self._parse_region_key_v1(str(key))
+                if src_parsed is None or key_parsed is None:
+                    continue
+                # Treat near-neighbors (including diagonals and 2-step spillover) as "local";
+                # require Chebyshev distance >= 3 to qualify as a remote effect.
+                dx = int(abs(int(key_parsed[0]) - int(src_parsed[0])))
+                dy = int(abs(int(key_parsed[1]) - int(src_parsed[1])))
+                if max(dx, dy) >= 3:
+                    remote_effect_detected = True
+                    break
         simultaneous_refresh = bool(
-            should_trigger
-            and simultaneous_changed_now
+            simultaneous_changed_now
             and int(simultaneous_pixels_now) >= int(self.high_info_simultaneous_min_total_pixels)
+            and (len(simultaneous_changed_now) >= 2 or level_delta_now > 0)
+            # Even under a commit lock, we still want to capture simultaneous/remote effects
+            # (e.g., trigger region causing the exit region to change). These are the exact
+            # "high-info" events we want to chase after prepass.
             and (
-                len(simultaneous_changed_now) >= 2
+                should_trigger
+                or strong_event
+                or remote_effect_detected
                 or level_delta_now > 0
             )
         )
@@ -5383,9 +5706,31 @@ class ActiveInferenceEFE(Agent):
                 and bool(reachability_graph_ready)
             )
         ][: int(max(1, self.high_info_novelty_max_related_targets))]
+        # Keep only genuinely remote effects (Chebyshev distance >= 3). This prevents
+        # routine movement/shape spillover across adjacent regions from arming novelty.
+        if active_novelty_related_targets:
+            src_parsed = self._parse_region_key_v1(str(source_region_key))
+            if src_parsed is not None:
+                remote_only: list[str] = []
+                for region_key in active_novelty_related_targets:
+                    key = str(region_key)
+                    parsed = self._parse_region_key_v1(key)
+                    if parsed is None:
+                        continue
+                    dx = int(abs(int(parsed[0]) - int(src_parsed[0])))
+                    dy = int(abs(int(parsed[1]) - int(src_parsed[1])))
+                    if max(dx, dy) >= 3:
+                        remote_only.append(str(key))
+                if remote_only:
+                    active_novelty_related_targets = list(remote_only)[: int(max(1, self.high_info_novelty_max_related_targets))]
         novelty_event_detected = bool(
             self.high_info_novelty_protocol_enabled
-            and should_trigger
+            and (
+                should_trigger
+                or strong_event
+                or remote_effect_detected
+                or int(level_delta_now) > 0
+            )
             and self._parse_region_key_v1(str(source_region_key)) is not None
             and bool(active_novelty_related_targets)
             and (
@@ -5394,9 +5739,17 @@ class ActiveInferenceEFE(Agent):
                 or int(level_delta_now) > 0
                 or bool(str(obs_change_type) in ("GLOBAL_PATTERN_CHANGE", "CC_COUNT_CHANGE"))
             )
-            and int(max(changed_pixels, simultaneous_changed_total_pixels))
+            # Novelty protocol is only meaningful when there is evidence of a remote effect.
+            and (remote_effect_detected or int(level_delta_now) > 0)
+            and int(max(changed_pixels, simultaneous_changed_total_pixels, simultaneous_pixels_now))
             >= int(self.high_info_simultaneous_min_total_pixels)
         )
+        if novelty_event_detected and inner_loop_active and inner_loop_queue:
+            # Inner-loop isolation: do not let newly observed events preempt an active
+            # high-info verification loop. New evidence is still recorded and can be
+            # consumed after the current loop drains.
+            if str(source_region_key) not in set(str(v) for v in inner_loop_queue):
+                novelty_event_detected = False
         novelty_signature = "NA"
         if novelty_event_detected:
             novelty_signature = str(
@@ -5407,6 +5760,121 @@ class ActiveInferenceEFE(Agent):
                 + "|rel="
                 + ",".join(str(v) for v in active_novelty_related_targets[:3])
             )
+            # If we're already in a high-info lock window, arming the novelty protocol must not
+            # depend on re-triggering. Otherwise we'd miss the common pattern:
+            # "trigger region -> remote change" while locked on the trigger.
+            if bool(state.get("active", False)) and (not should_trigger):
+                novelty_protocol_active = True
+                novelty_source_region_key = str(source_region_key)
+                novelty_related_region_keys = list(active_novelty_related_targets)
+                last_novelty_signature = str(novelty_signature)
+                novelty_trigger_count = int(novelty_trigger_count + 1)
+                novelty_last_action_counter = int(current_counter)
+                _record_novelty_pattern_v1(
+                    str(novelty_signature),
+                    source_region_key_for_stats=str(source_region_key),
+                    related_region_keys_for_stats=list(active_novelty_related_targets),
+                    changed_pixels_for_stats=int(changed_pixels),
+                    simultaneous_pixels_for_stats=int(
+                        max(simultaneous_pixels_now, simultaneous_changed_total_pixels)
+                    ),
+                    progress_hit=bool(level_delta_now > 0),
+                )
+                # Verify-first: when a source action causes a remote effect, do not immediately
+                # force extra retriggers of the source. Retriggering without verification can
+                # destroy the causal state we're trying to exploit (e.g., cyclic toggles).
+                baseline_counts: dict[str, int] = {}
+                source_key = str(source_region_key)
+                source_sample_count = int(max(0, target_sample_counts.get(str(source_key), 0)))
+                # Count the triggering visit itself as a source sample so the protocol can
+                # immediately chase remote effects next.
+                source_sample_count = int(max(1, source_sample_count))
+                target_sample_counts[str(source_key)] = int(
+                    max(int(target_sample_counts.get(str(source_key), 0)), int(source_sample_count))
+                )
+                baseline_counts[str(source_key)] = int(source_sample_count)
+                target_required_samples[str(source_key)] = 1
+                score_memory[str(source_region_key)] = max(
+                    float(score_memory.get(str(source_region_key), 0.0)),
+                    0.90,
+                )
+                for region_key in active_novelty_related_targets:
+                    related_key = str(region_key)
+                    related_sample_count = int(
+                        max(0, target_sample_counts.get(str(related_key), 0))
+                    )
+                    baseline_counts[str(related_key)] = int(related_sample_count)
+                    related_required = int(
+                        max(
+                            _required_samples(str(related_key)),
+                            related_sample_count
+                            + int(1 + self.high_info_novelty_related_extra_samples),
+                        )
+                    )
+                    target_required_samples[str(related_key)] = int(
+                        max(
+                            target_required_samples.get(str(related_key), 0),
+                            related_required,
+                        )
+                    )
+                    score_memory[str(related_key)] = max(
+                        float(score_memory.get(str(related_key), 0.0)),
+                        0.88,
+                    )
+                state["novelty_baseline_sample_counts"] = dict(baseline_counts)
+                # Extend the focus window so the agent has enough budget to travel
+                # source <-> remote and satisfy the extra sampling requirements.
+                max_dist = 0
+                for key in active_novelty_related_targets[:6]:
+                    dist = int(self._region_distance_v1(str(source_region_key), str(key)))
+                    if dist > max_dist:
+                        max_dist = int(dist)
+                desired_window = int(max(int(state.get("window_steps", 0)), 6 * (max_dist + 1)))
+                desired_window = int(min(96, max(16, desired_window)))
+                state["window_steps"] = int(max(int(state.get("window_steps", 0)), desired_window))
+                state["deadline_action_counter"] = int(
+                    max(
+                        int(state.get("deadline_action_counter", -1)),
+                        int(current_counter + desired_window),
+                    )
+                )
+                # Immediate "remote effect" chase: if the current lock is on the source, retarget
+                # the lock to the most affected remote region.
+                if chain_lock_active and bool(active_novelty_related_targets):
+                    lock_key = str(chain_lock_target_region_key)
+                    remote_rows: list[tuple[int, int, int, str]] = []
+                    for region_key in active_novelty_related_targets:
+                        key = str(region_key)
+                        if self._parse_region_key_v1(key) is None:
+                            continue
+                        route_distance = int(
+                            self._region_route_distance_v1(
+                                region_adjacency,
+                                start_region_key=str(source_region_key),
+                                goal_region_key=str(key),
+                            )
+                        )
+                        if route_distance >= 10**6:
+                            route_distance = int(
+                                self._region_distance_v1(
+                                    str(source_region_key),
+                                    str(key),
+                                )
+                            )
+                        diff_pixels = int(max(0, region_recent_change_pixels.get(str(key), 0)))
+                        # Prefer genuinely remote effects (>=2 region steps away).
+                        remote_priority = 0 if route_distance >= 2 else 1
+                        remote_rows.append(
+                            (int(remote_priority), -int(diff_pixels), int(route_distance), str(key))
+                        )
+                    remote_rows.sort()
+                    best_remote = str(remote_rows[0][3]) if remote_rows else str("NA")
+                    if (
+                        self._parse_region_key_v1(best_remote) is not None
+                        and best_remote != lock_key
+                        and lock_key == str(source_region_key)
+                    ):
+                        _arm_chain_lock(best_remote, "novelty_remote_override", focus_commit=True)
         simultaneous_focus_candidates = [
             str(v)
             for v in simultaneous_changed_region_keys
@@ -6119,26 +6587,25 @@ class ActiveInferenceEFE(Agent):
                     ),
                     progress_hit=bool(level_delta_now > 0),
                 )
-                source_sample_count = int(max(0, target_sample_counts.get(str(source_region_key), 0)))
-                source_required = int(
-                    max(
-                        _required_samples(str(source_region_key)),
-                        source_sample_count + int(1 + self.high_info_novelty_retrigger_extra_samples),
-                    )
+                baseline_counts: dict[str, int] = {}
+                source_key = str(source_region_key)
+                source_sample_count = int(max(0, target_sample_counts.get(str(source_key), 0)))
+                source_sample_count = int(max(1, source_sample_count))
+                target_sample_counts[str(source_key)] = int(
+                    max(int(target_sample_counts.get(str(source_key), 0)), int(source_sample_count))
                 )
-                target_required_samples[str(source_region_key)] = int(
-                    max(
-                        target_required_samples.get(str(source_region_key), 0),
-                        source_required,
-                    )
-                )
+                baseline_counts[str(source_key)] = int(source_sample_count)
+                # Verify-first: keep the source satisfied initially so the next pending target
+                # becomes the remote region. Retriggers are scheduled later if verification fails.
+                target_required_samples[str(source_key)] = 1
                 merged_scores[str(source_region_key)] = max(
                     float(merged_scores.get(str(source_region_key), 0.0)),
-                    0.98,
+                    0.90,
                 )
                 for idx, region_key in enumerate(active_novelty_related_targets):
                     related_key = str(region_key)
                     related_sample_count = int(max(0, target_sample_counts.get(str(related_key), 0)))
+                    baseline_counts[str(related_key)] = int(related_sample_count)
                     related_required = int(
                         max(
                             _required_samples(str(related_key)),
@@ -6156,11 +6623,10 @@ class ActiveInferenceEFE(Agent):
                         float(merged_scores.get(str(related_key), 0.0)),
                         float(novelty_related_floor),
                     )
-                novelty_chain_keys = [
-                    str(source_region_key),
-                    *[str(v) for v in active_novelty_related_targets],
-                ]
-                if len(novelty_chain_keys) >= 2:
+                state["novelty_baseline_sample_counts"] = dict(baseline_counts)
+                # Prioritize chasing the remote effect region(s) immediately.
+                novelty_chain_keys = [str(v) for v in active_novelty_related_targets]
+                if len(novelty_chain_keys) >= 1:
                     priority_subqueue_active = True
                     priority_subqueue_keys = list(novelty_chain_keys[:16])
                     interaction_chain_active = True
@@ -6288,6 +6754,34 @@ class ActiveInferenceEFE(Agent):
                     int(current_counter + int(self.high_info_focus_window_steps)),
                 )
             )
+            # If a novelty/remote-effect event was detected, the default window (often small)
+            # is not enough to execute the required "source<->remote" travel + resampling.
+            # Extend the deadline dynamically based on region distance.
+            if novelty_event_detected or remote_effect_detected:
+                related = (
+                    list(active_novelty_related_targets)
+                    if active_novelty_related_targets
+                    else [
+                        str(k)
+                        for k in simultaneous_changed_now
+                        if self._parse_region_key_v1(str(k)) is not None
+                        and str(k) != str(source_region_key)
+                    ]
+                )
+                max_dist = 0
+                for key in related[:6]:
+                    dist = int(self._region_distance_v1(str(source_region_key), str(key)))
+                    if dist > max_dist:
+                        max_dist = int(dist)
+                desired_window = int(max(int(self.high_info_focus_window_steps), 6 * (max_dist + 1)))
+                desired_window = int(min(96, max(16, desired_window)))
+                state["window_steps"] = int(max(int(state.get("window_steps", 0)), desired_window))
+                state["deadline_action_counter"] = int(
+                    max(
+                        int(state.get("deadline_action_counter", -1)),
+                        int(current_counter + desired_window),
+                    )
+                )
             state["primary_coupled_region_key"] = str(primary_coupled_region_key)
             state["secondary_coupled_region_key"] = str(secondary_coupled_region_key)
             state["simultaneous_changed_region_keys"] = [
@@ -6410,7 +6904,88 @@ class ActiveInferenceEFE(Agent):
             )
 
         if not bool(state.get("active", False)):
-            if coupled_progress_locked:
+            # Evidence-driven rearm: if we have a pending high-info queue (e.g., collected during
+            # prepass or deferred under hard locks), start a new focus window from that queue.
+            if coupled_progress_locked and pending_region_queue and pending_region_scores:
+                rearm_scores: dict[str, float] = {}
+                for region_key in pending_region_queue[:16]:
+                    key = str(region_key)
+                    if self._parse_region_key_v1(key) is None:
+                        continue
+                    score = float(max(0.0, pending_region_scores.get(key, 0.0)))
+                    if score <= 0.0:
+                        continue
+                    rearm_scores[key] = float(score)
+                    target_sample_counts.setdefault(str(key), 0)
+                    target_required_samples[str(key)] = int(_required_samples(str(key)))
+                if rearm_scores:
+                    rearm_anchor = str(nav_region_key)
+                    if self._parse_region_key_v1(rearm_anchor) is None:
+                        rearm_anchor = str(source_region_key)
+                    rearm_queue = _rank_queue(
+                        rearm_scores,
+                        anchor_region_key=str(rearm_anchor),
+                        completed_recent=set(),
+                        sample_counts=target_sample_counts,
+                    )
+                    if rearm_queue:
+                        rearm_chain = _build_interaction_chain(
+                            list(rearm_queue),
+                            source_key=str(rearm_anchor),
+                        )
+                        interaction_chain_active = bool(len(rearm_chain) >= 2)
+                        state["active"] = True
+                        state["stage"] = "seek"
+                        state["window_steps"] = int(self.high_info_focus_window_steps)
+                        state["trigger_action_counter"] = int(current_counter)
+                        state["deadline_action_counter"] = int(
+                            max(
+                                int(state.get("deadline_action_counter", -1)),
+                                int(current_counter + int(self.high_info_focus_window_steps)),
+                            )
+                        )
+                        state["steps_remaining"] = int(
+                            max(0, int(state["deadline_action_counter"]) - int(current_counter))
+                        )
+                        state["source_region_key"] = str(rearm_anchor)
+                        state["trigger_event_type"] = "PENDING_REARM"
+                        state["target_miss_streak"] = 0
+                        state["current_target_region_key"] = str(rearm_queue[0])
+                        state["target_region_queue"] = list(rearm_queue)
+                        state["target_region_scores"] = dict(rearm_scores)
+                        state["target_sample_counts"] = dict(target_sample_counts)
+                        state["target_required_samples"] = dict(target_required_samples)
+                        state["completed_target_regions"] = list(completed_regions[-16:])
+                        # Arm a commit lock on the queue head to avoid immediate retarget churn.
+                        if self._parse_region_key_v1(str(rearm_queue[0])) is not None:
+                            _arm_chain_lock(str(rearm_queue[0]), "pending_rearm", focus_commit=True)
+                        state["interaction_chain_active"] = bool(interaction_chain_active)
+                        state["interaction_target_chain"] = list(rearm_chain[:16]) if interaction_chain_active else []
+                        state["interaction_target_index"] = 0
+                        state["interaction_last_status"] = (
+                            "pending_rearm_armed" if interaction_chain_active else "pending_rearm_singleton"
+                        )
+                        state["chain_lock_active"] = bool(chain_lock_active)
+                        state["chain_lock_window_steps"] = int(chain_lock_window_steps)
+                        state["chain_lock_steps_remaining"] = int(
+                            max(0, chain_lock_steps_remaining)
+                        )
+                        state["chain_lock_target_region_key"] = str(chain_lock_target_region_key)
+                        state["chain_lock_miss_limit"] = int(chain_lock_miss_limit)
+                        state["target_commit_active"] = bool(target_commit_active)
+                        state["target_commit_window_steps"] = int(target_commit_window_steps)
+                        state["target_commit_miss_limit"] = int(target_commit_miss_limit)
+                        state["chain_lock_last_status"] = str(chain_lock_last_status)
+                        state["priority_subqueue_active"] = False
+                        state["priority_subqueue_keys"] = []
+                        state["pending_region_queue"] = []
+                        state["pending_region_scores"] = {}
+                        _flush_inner_loop_state_to_state()
+                        _flush_novelty_regions_to_state()
+                        state["last_status"] = "pending_rearm"
+                        return
+
+            if self.high_info_idle_rearm_enabled and coupled_progress_locked:
                 rearm_scores: dict[str, float] = {}
                 if self._parse_region_key_v1(str(primary_coupled_region_key)) is not None:
                     rearm_scores[str(primary_coupled_region_key)] = float(
@@ -6550,6 +7125,7 @@ class ActiveInferenceEFE(Agent):
                         state["priority_subqueue_keys"] = []
                         state["pending_region_queue"] = []
                         state["pending_region_scores"] = {}
+                        _flush_inner_loop_state_to_state()
                         _flush_novelty_regions_to_state()
                         state["last_status"] = "idle_rearm"
                         return
@@ -6625,6 +7201,7 @@ class ActiveInferenceEFE(Agent):
             state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
             state["pending_region_queue"] = []
             state["pending_region_scores"] = {}
+            _flush_inner_loop_state_to_state()
             _flush_novelty_regions_to_state()
             return
 
@@ -6654,16 +7231,61 @@ class ActiveInferenceEFE(Agent):
                     float(protocol_floor),
                 )
             if protocol_pending:
-                priority_subqueue_active = True
-                priority_subqueue_keys = list(protocol_pending[:16])
-                _enqueue_pending_regions(
-                    list(protocol_pending),
-                    score_hint={str(k): float(v) for (k, v) in score_memory.items()},
+                _activate_inner_loop_v1(
+                    [str(v) for v in protocol_pending[:16]],
+                    "novelty_protocol",
                 )
+                state["last_status"] = "inner_loop_armed"
             else:
-                novelty_protocol_active = False
-                novelty_source_region_key = "NA"
-                novelty_related_region_keys = []
+                # If we didn't make progress, schedule a retrigger+verify cycle rather than
+                # immediately disabling the protocol.
+                progress_hit = bool(level_delta_now > 0 or str(obs_change_type) == "METADATA_PROGRESS_CHANGE")
+                if progress_hit:
+                    novelty_protocol_active = False
+                    novelty_source_region_key = "NA"
+                    novelty_related_region_keys = []
+                    inner_loop_active = False
+                    inner_loop_reason = "NA"
+                    inner_loop_queue = []
+                else:
+                    src_key = str(novelty_source_region_key)
+                    if self._parse_region_key_v1(src_key) is None:
+                        novelty_protocol_active = False
+                        novelty_source_region_key = "NA"
+                        novelty_related_region_keys = []
+                        inner_loop_active = False
+                        inner_loop_reason = "NA"
+                        inner_loop_queue = []
+                    else:
+                        src_count = int(max(0, target_sample_counts.get(src_key, 0)))
+                        target_required_samples[src_key] = int(
+                            max(
+                                int(target_required_samples.get(src_key, 0)),
+                                int(src_count + 1),
+                            )
+                        )
+                        score_memory[src_key] = max(float(score_memory.get(src_key, 0.0)), 0.92)
+                        for region_key in list(novelty_related_region_keys):
+                            key = str(region_key)
+                            if self._parse_region_key_v1(key) is None:
+                                continue
+                            related_count = int(max(0, target_sample_counts.get(key, 0)))
+                            target_required_samples[key] = int(
+                                max(
+                                    int(target_required_samples.get(key, 0)),
+                                    int(related_count + 1 + self.high_info_novelty_related_extra_samples),
+                                )
+                            )
+                            score_memory[key] = max(float(score_memory.get(key, 0.0)), 0.88)
+                        _activate_inner_loop_v1(
+                            [str(src_key)] + [str(v) for v in novelty_related_region_keys],
+                            "novelty_cycle",
+                        )
+                        _enqueue_pending_regions(
+                            [str(src_key)] + [str(v) for v in novelty_related_region_keys],
+                            score_hint={str(k): float(v) for (k, v) in score_memory.items()},
+                        )
+                        state["last_status"] = "novelty_cycle_extend"
         completed_recent = set(str(v) for v in completed_regions[-8:])
         anchor_key = str(nav_region_key)
         if self._parse_region_key_v1(anchor_key) is None:
@@ -6675,7 +7297,24 @@ class ActiveInferenceEFE(Agent):
             sample_counts=target_sample_counts,
         )
 
+        def _inner_loop_hard_active_v1() -> bool:
+            return bool(
+                inner_loop_active
+                and inner_loop_queue
+                and self._parse_region_key_v1(str(inner_loop_queue[0])) is not None
+            )
+
+        if _inner_loop_hard_active_v1():
+            inner_lock_key = str(inner_loop_queue[0])
+            # Keep an isolated target stream for the active inner loop.
+            queue = [str(inner_lock_key)] + [
+                str(v) for v in queue if str(v) != str(inner_lock_key)
+            ]
+            state["last_status"] = "inner_loop_queue_isolated"
+
         def _commit_lock_hard_active_v1() -> bool:
+            if _inner_loop_hard_active_v1():
+                return False
             return bool(
                 target_commit_active
                 and chain_lock_active
@@ -6686,6 +7325,31 @@ class ActiveInferenceEFE(Agent):
         def _force_hard_lock_queue_v1(status: str) -> bool:
             nonlocal queue
             nonlocal target_miss_streak
+            nonlocal priority_subqueue_active
+            nonlocal priority_subqueue_keys
+            nonlocal interaction_chain_active
+            nonlocal interaction_target_chain
+            nonlocal interaction_target_index
+            if inner_loop_active and inner_loop_queue:
+                lock_key = str(inner_loop_queue[0])
+                if self._parse_region_key_v1(lock_key) is None:
+                    return False
+                _arm_chain_lock(str(lock_key), "inner_loop_hard_lock", focus_commit=True)
+                deferred = [str(v) for v in queue if str(v) != str(lock_key)]
+                if deferred:
+                    _enqueue_pending_regions(
+                        deferred,
+                        score_hint={str(k): float(v) for (k, v) in score_memory.items()},
+                    )
+                queue = [str(lock_key)]
+                target_miss_streak = 0
+                priority_subqueue_active = True
+                priority_subqueue_keys = [str(lock_key)]
+                interaction_chain_active = False
+                interaction_target_chain = []
+                interaction_target_index = 0
+                state["last_status"] = f"{str(status)}_inner_loop"
+                return True
             if not _commit_lock_hard_active_v1():
                 return False
             lock_key = str(chain_lock_target_region_key)
@@ -6701,7 +7365,8 @@ class ActiveInferenceEFE(Agent):
             return True
 
         if (
-            chain_lock_active
+            (not _inner_loop_hard_active_v1())
+            and chain_lock_active
             and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
             and str(chain_lock_target_region_key) not in set(str(v) for v in queue)
         ):
@@ -6833,6 +7498,10 @@ class ActiveInferenceEFE(Agent):
             novelty_protocol_active = False
             novelty_source_region_key = "NA"
             novelty_related_region_keys = []
+            inner_loop_active = False
+            inner_loop_reason = "NA"
+            inner_loop_queue = []
+            _flush_inner_loop_state_to_state()
             _flush_novelty_regions_to_state()
             return
 
@@ -7086,6 +7755,12 @@ class ActiveInferenceEFE(Agent):
         _force_hard_lock_queue_v1("target_commit_hard_lock")
         if queue:
             target_region_key = str(queue[0])
+        if _inner_loop_hard_active_v1():
+            target_region_key = str(inner_loop_queue[0])
+            queue = [str(target_region_key)] + [
+                str(v) for v in queue if str(v) != str(target_region_key)
+            ]
+            state["last_status"] = "inner_loop_target_authoritative"
 
         deadline = int(state.get("deadline_action_counter", current_counter))
         state["steps_remaining"] = int(max(0, deadline - current_counter))
@@ -7094,6 +7769,7 @@ class ActiveInferenceEFE(Agent):
         state["target_region_queue"] = list(queue)
         state["target_region_scores"] = dict(score_memory)
         _flush_pending_regions_to_state()
+        _flush_inner_loop_state_to_state()
         _flush_novelty_regions_to_state()
         state["completed_target_regions"] = list(completed_regions[-16:])
         state["target_sample_counts"] = dict(target_sample_counts)
@@ -7163,6 +7839,7 @@ class ActiveInferenceEFE(Agent):
         state["chain_lock_last_status"] = str(chain_lock_last_status)
         state["priority_subqueue_active"] = bool(priority_subqueue_active)
         state["priority_subqueue_keys"] = [str(v) for v in priority_subqueue_keys[:16]]
+        state["inner_loop_queue_isolated"] = bool(_inner_loop_hard_active_v1())
         state["reachable_diff_priority_active"] = bool(reachable_diff_priority_active)
         state["reachable_diff_priority_key"] = str(reachable_diff_priority_key)
         state["stage"] = "seek"
@@ -7260,6 +7937,49 @@ class ActiveInferenceEFE(Agent):
                 required_samples = int(max(required_samples, 2))
             target_required_samples[str(target_region_key)] = int(required_samples)
             remaining_samples = int(max(0, int(required_samples) - sample_count))
+            if (
+                inner_loop_active
+                and inner_loop_queue
+                and str(target_region_key) == str(inner_loop_queue[0])
+                and remaining_samples <= 0
+            ):
+                inner_loop_queue = [str(v) for v in inner_loop_queue[1:]]
+                if inner_loop_queue:
+                    next_inner_target = str(inner_loop_queue[0])
+                    _arm_chain_lock(
+                        str(next_inner_target),
+                        "inner_loop_advance",
+                        focus_commit=True,
+                    )
+                    priority_subqueue_active = True
+                    priority_subqueue_keys = [str(next_inner_target)]
+                    interaction_chain_active = False
+                    interaction_target_chain = []
+                    interaction_target_index = 0
+                    state["last_status"] = "inner_loop_advance"
+                else:
+                    cycle_queue: list[str] = []
+                    if novelty_protocol_active and self._parse_region_key_v1(
+                        str(novelty_source_region_key)
+                    ) is not None:
+                        cycle_queue.append(str(novelty_source_region_key))
+                        for related_key in novelty_related_region_keys:
+                            key = str(related_key)
+                            if self._parse_region_key_v1(key) is None:
+                                continue
+                            if key in cycle_queue:
+                                continue
+                            cycle_queue.append(str(key))
+                    if cycle_queue:
+                        _activate_inner_loop_v1(list(cycle_queue), "novelty_cycle_rearm")
+                        state["last_status"] = "inner_loop_cycle_rearm"
+                    else:
+                        inner_loop_active = False
+                        inner_loop_reason = "NA"
+                        priority_subqueue_active = False
+                        priority_subqueue_keys = []
+                        _disable_chain_lock("inner_loop_completed")
+                        state["last_status"] = "inner_loop_completed"
             novelty_pending_related: list[str] = []
             novelty_rotate_to_related = False
             if novelty_protocol_active:
@@ -7286,7 +8006,7 @@ class ActiveInferenceEFE(Agent):
                         or str(target_region_key) in set(novelty_related_region_keys)
                     )
                 )
-                if novelty_rotate_to_related:
+                if novelty_rotate_to_related and (not inner_loop_active):
                     _disable_chain_lock("novelty_rotate")
                     target_commit_active = False
                     priority_subqueue_active = True
@@ -7388,7 +8108,8 @@ class ActiveInferenceEFE(Agent):
                         if str(v) not in set(priority_subqueue_keys)
                     ]
             if (
-                chain_lock_active
+                (not _inner_loop_hard_active_v1())
+                and chain_lock_active
                 and self._parse_region_key_v1(str(chain_lock_target_region_key)) is not None
             ):
                 if str(chain_lock_target_region_key) in set(str(v) for v in refreshed_queue):
@@ -7418,6 +8139,7 @@ class ActiveInferenceEFE(Agent):
                 state["target_sample_counts"] = dict(target_sample_counts)
                 state["target_required_samples"] = dict(target_required_samples)
                 _flush_pending_regions_to_state()
+                _flush_inner_loop_state_to_state()
                 _flush_novelty_regions_to_state()
                 state["interaction_chain_active"] = bool(interaction_chain_active)
                 state["interaction_target_chain"] = list(interaction_target_chain[:16])
@@ -7477,6 +8199,10 @@ class ActiveInferenceEFE(Agent):
                 novelty_protocol_active = False
                 novelty_source_region_key = "NA"
                 novelty_related_region_keys = []
+                inner_loop_active = False
+                inner_loop_reason = "NA"
+                inner_loop_queue = []
+                _flush_inner_loop_state_to_state()
                 _flush_novelty_regions_to_state()
                 state["completion_count"] = int(state.get("completion_count", 0) + 1)
                 state["last_status"] = "completed"
@@ -9607,20 +10333,9 @@ class ActiveInferenceEFE(Agent):
         best_metrics: dict[str, float] = {}
         if tracked_previous_nodes:
             best_pair, best_metrics = search(tracked_previous_nodes)
-            fallback_pair, fallback_metrics = search(previous_nodes)
-            if fallback_pair is not None:
-                fallback_score = float(fallback_metrics.get("score", 10**9))
-                tracked_score = float(best_metrics.get("score", 10**9))
-                tracked_alignment = float(best_metrics.get("direction_alignment", 0.0))
-                tracked_projection_error = float(best_metrics.get("projection_error", 10**9))
-                tracked_low_quality = bool(
-                    expected_dir is not None
-                    and (
-                        tracked_alignment < 0.0
-                        or tracked_projection_error > 14.0
-                    )
-                )
-                if tracked_low_quality or (fallback_score + 6.0 < tracked_score):
+            if best_pair is None:
+                fallback_pair, fallback_metrics = search(previous_nodes)
+                if fallback_pair is not None:
                     best_pair = fallback_pair
                     best_metrics = fallback_metrics
         else:
@@ -9653,6 +10368,11 @@ class ActiveInferenceEFE(Agent):
         )
         peripheral_ui_candidate = bool(peripheral_ui_score >= 0.75)
         if peripheral_ui_candidate:
+            anchor_x = -1
+            anchor_y = -1
+            if self._tracked_agent_anchor_xy is not None:
+                anchor_x = int(self._tracked_agent_anchor_xy[0])
+                anchor_y = int(self._tracked_agent_anchor_xy[1])
             return {
                 "schema_name": "active_inference_navigation_state_estimate_v1",
                 "schema_version": 1,
@@ -9661,12 +10381,12 @@ class ActiveInferenceEFE(Agent):
                 "peripheral_ui_candidate": True,
                 "peripheral_ui_likelihood": float(peripheral_ui_score),
                 "agent_pos_xy": {
-                    "x": int(getattr(current, "centroid_x", -1)),
-                    "y": int(getattr(current, "centroid_y", -1)),
+                    "x": int(anchor_x),
+                    "y": int(anchor_y),
                 },
                 "agent_pos_region": {
-                    "x": int(max(0, min(7, int(getattr(current, "centroid_x", -1)) // 8))),
-                    "y": int(max(0, min(7, int(getattr(current, "centroid_y", -1)) // 8))),
+                    "x": int(max(0, min(7, int(anchor_x) // 8))) if anchor_x >= 0 else -1,
+                    "y": int(max(0, min(7, int(anchor_y) // 8))) if anchor_y >= 0 else -1,
                 },
                 "candidate_centroid_xy": {
                     "x": int(getattr(current, "centroid_x", -1)),
