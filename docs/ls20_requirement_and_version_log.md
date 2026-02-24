@@ -104,6 +104,7 @@
 4. 保留“成功样本 trace + 最新失败样本 trace”作为对照对。
 5. 合并前至少做一次 A/B 对比，关注：`levels_completed`、链路命中率、循环占比。
 6. 提交前必须运行：`python tools/check_no_hardcoded_region_keys.py`，若检测到字面量 region 地址则禁止提交。
+7. 决策逻辑解释统一参考：`docs/policy_selection_waterfall.md`，日志回放按 `high_info_focus_probe_reason` 与 `tie_breaker_rule_applied` 对照。
 
 ## 7. 下阶段待办（按优先级）
 
