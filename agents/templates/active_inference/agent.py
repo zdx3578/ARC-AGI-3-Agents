@@ -8529,6 +8529,13 @@ class ActiveInferenceEFE(Agent):
                 and float(distance_before) > 0.0
             )
 
+        primary_rx = int(max(0, min(7, int(primary.get("centroid_x", -1)) // 8)))
+        primary_ry = int(max(0, min(7, int(primary.get("centroid_y", -1)) // 8)))
+        primary_region_key = self._region_key_from_xy_v1(int(primary_rx), int(primary_ry))
+
+        cross_region_key = "NA"
+        gate_region_key = "NA"
+
         cross_target = next(
             (row for row in targets if str(row.get("kind", "")) == "cross_like"),
             None,
@@ -8580,15 +8587,15 @@ class ActiveInferenceEFE(Agent):
                 "x": int(primary.get("centroid_x", -1)),
                 "y": int(primary.get("centroid_y", -1)),
             },
-            "target_region": {
-                "x": int(max(0, min(7, int(primary.get("centroid_x", -1)) // 8))),
-                "y": int(max(0, min(7, int(primary.get("centroid_y", -1)) // 8))),
-            },
+            "target_region": {"x": int(primary_rx), "y": int(primary_ry)},
+            "target_region_key": str(primary_region_key),
             "cross_like_enabled": bool(cross_like_enabled),
             "cross_like_target_region": dict(cross_like_target_region),
+            "cross_like_target_region_key": str(cross_region_key),
             "cross_like_target_region_visit_count": int(cross_like_target_region_visit_count),
             "gate_like_enabled": bool(gate_like_enabled),
             "gate_like_target_region": dict(gate_like_target_region),
+            "gate_like_target_region_key": str(gate_region_key),
             "gate_like_target_region_visit_count": int(gate_like_target_region_visit_count),
             "orientation_alignment_enabled": bool(orientation_alignment.get("enabled", False)),
             "orientation_alignment_detected": bool(

@@ -408,67 +408,82 @@ class ActiveInferencePolicyEvaluatorV1:
     def _region_graph_adjacency(
         self,
         snapshot: dict[str, Any] | None,
+        *,
+        min_edge_count: int = 2,
+        undirected: bool = False,
     ) -> dict[str, dict[str, int]]:
+        """Build a region adjacency map used by coverage BFS.
+
+        Notes:
+        - Region keys are encoded as 'row:col' (see `_region_key_from_xy`).
+        - The caller can lower `min_edge_count` to 1 during coverage / prepass,
+          otherwise the BFS can get stuck behind an overly strict `>=2` filter.
+        - When `undirected=True`, we add symmetric edges (A<->B) so the BFS can
+          route through sparsely observed regions more robustly.
+        """
+        threshold = max(1, int(min_edge_count))
         adjacency: dict[str, dict[str, int]] = {}
         if not isinstance(snapshot, dict):
             return adjacency
+
+        def _add_edge(source: str, target: str, count: int) -> None:
+            if self._parse_region_key(source) is None:
+                return
+            if self._parse_region_key(target) is None:
+                return
+            if str(source) == str(target):
+                return
+            if not self._region_step_plausible(
+                str(source),
+                str(target),
+                max_axis_step=1,
+            ):
+                return
+            if int(count) < int(threshold):
+                return
+            source_hist = adjacency.setdefault(str(source), {})
+            source_hist[str(target)] = max(
+                int(source_hist.get(str(target), 0)),
+                int(count),
+            )
+            if undirected:
+                target_hist = adjacency.setdefault(str(target), {})
+                target_hist[str(source)] = max(
+                    int(target_hist.get(str(source), 0)),
+                    int(count),
+                )
+
+        # 1) Prefer activity-derived 'walkable' edges when present.
         activity_index = self._region_graph_activity_edge_index(snapshot)
         if activity_index:
             for row in activity_index.values():
-                source = str(row.get("source_region_key", "NA"))
-                target = str(row.get("dominant_target_region_key", "NA"))
+                if not isinstance(row, dict):
+                    continue
                 status = self._normalize_activity_edge_status(row.get("status", "unknown"))
                 if status != "walkable":
                     continue
-                if self._parse_region_key(source) is None:
-                    continue
-                if self._parse_region_key(target) is None:
-                    continue
-                if not self._region_step_plausible(
-                    str(source),
-                    str(target),
-                    max_axis_step=1,
-                ):
-                    continue
-                if str(source) == str(target):
-                    continue
+                source = str(row.get("source_region_key", "NA"))
+                target = str(row.get("dominant_target_region_key", "NA"))
                 count = int(
                     max(
                         0,
                         row.get("dominant_target_count", row.get("moved_count", 0)),
                     )
                 )
-                if count <= 0:
-                    continue
-                source_hist = adjacency.setdefault(source, {})
-                source_hist[target] = max(int(source_hist.get(target, 0)), int(count))
-            if adjacency:
-                return adjacency
+                _add_edge(source, target, count)
+
+        # 2) Always also merge in observed transition edges (this can include edges
+        #    that have not yet been promoted to 'walkable' by the activity classifier).
         edges = snapshot.get("edges", [])
-        if not isinstance(edges, list):
-            return adjacency
-        for row in edges:
-            if not isinstance(row, dict):
-                continue
-            source = str(row.get("source_region_key", "NA"))
-            target = str(row.get("target_region_key", "NA"))
-            if self._parse_region_key(source) is None:
-                continue
-            if self._parse_region_key(target) is None:
-                continue
-            count = int(max(0, row.get("count", 0)))
-            if count <= 0:
-                continue
-            if not self._region_step_plausible(
-                str(source),
-                str(target),
-                max_axis_step=1,
-            ):
-                continue
-            if str(source) != str(target) and int(count) < 2:
-                continue
-            source_hist = adjacency.setdefault(source, {})
-            source_hist[target] = max(int(source_hist.get(target, 0)), int(count))
+        if isinstance(edges, list):
+            for row in edges:
+                if not isinstance(row, dict):
+                    continue
+                source = str(row.get("source_region_key", "NA"))
+                target = str(row.get("target_region_key", "NA"))
+                count = int(max(0, row.get("count", 0)))
+                _add_edge(source, target, count)
+
         return adjacency
 
     def _bfs_next_region_key(
@@ -504,6 +519,110 @@ class ActiveInferencePolicyEvaluatorV1:
                     return str(cursor)
                 queue.append(next_node)
         return "NA"
+
+    @classmethod
+    def _neighbor_region_key_for_action_v1(
+        cls,
+        source_region_key: str,
+        action_id: int,
+    ) -> str:
+        """Return 4-neighborhood region key implied by a navigation action."""
+        parsed = cls._parse_region_key(str(source_region_key))
+        if parsed is None:
+            return "NA"
+        col, row = int(parsed[0]), int(parsed[1])
+        aid = int(action_id)
+        if aid == 1:
+            row = int(row - 1)
+        elif aid == 2:
+            row = int(row + 1)
+        elif aid == 3:
+            col = int(col - 1)
+        elif aid == 4:
+            col = int(col + 1)
+        else:
+            return "NA"
+        return str(cls._region_key_from_xy(int(col), int(row)))
+
+    @staticmethod
+    def _make_undirected_adjacency_v1(
+        adjacency: dict[str, dict[str, int]],
+    ) -> dict[str, dict[str, int]]:
+        """Mirror directed edges to build an undirected adjacency."""
+        undirected: dict[str, dict[str, int]] = {
+            str(src): {str(dst): int(w) for dst, w in nbrs.items()}
+            for src, nbrs in (adjacency or {}).items()
+            if isinstance(nbrs, dict)
+        }
+        for src, nbrs in (adjacency or {}).items():
+            if not isinstance(nbrs, dict):
+                continue
+            for dst, w_raw in nbrs.items():
+                w = int(max(0, w_raw))
+                if w <= 0:
+                    continue
+                src_s = str(src)
+                dst_s = str(dst)
+                undirected.setdefault(src_s, {})
+                undirected.setdefault(dst_s, {})
+                dst_hist = undirected[dst_s]
+                dst_hist[src_s] = max(int(dst_hist.get(src_s, 0)), int(w))
+        return undirected
+
+    def _bfs_distance_region_key_v1(
+        self,
+        adjacency: dict[str, dict[str, int]],
+        *,
+        start_region_key: str,
+        goal_region_key: str,
+        max_nodes: int = 512,
+    ) -> int | None:
+        """Shortest path distance in hops, None if unreachable."""
+        start = str(start_region_key)
+        goal = str(goal_region_key)
+        if start == "NA" or goal == "NA":
+            return None
+        if start == goal:
+            return 0
+        if start not in adjacency:
+            return None
+        queue: deque[str] = deque([start])
+        dist: dict[str, int] = {start: 0}
+        while queue and len(dist) <= int(max_nodes):
+            node = str(queue.popleft())
+            base = int(dist.get(node, 0))
+            for neighbor in adjacency.get(node, {}).keys():
+                nxt = str(neighbor)
+                if nxt in dist:
+                    continue
+                dist[nxt] = int(base + 1)
+                if nxt == goal:
+                    return int(dist[nxt])
+                queue.append(nxt)
+        return None
+
+    def _bfs_reachable_region_keys_v1(
+        self,
+        adjacency: dict[str, dict[str, int]],
+        *,
+        start_region_key: str,
+        max_nodes: int = 512,
+    ) -> set[str]:
+        start = str(start_region_key)
+        reachable: set[str] = set()
+        if start == "NA" or start not in adjacency:
+            return reachable
+        queue: deque[str] = deque([start])
+        reachable.add(start)
+        while queue and len(reachable) <= int(max_nodes):
+            node = str(queue.popleft())
+            for neighbor in adjacency.get(node, {}).keys():
+                nxt = str(neighbor)
+                if nxt in reachable:
+                    continue
+                reachable.add(nxt)
+                queue.append(nxt)
+        return reachable
 
     @classmethod
     def _serpentine_region_rank(cls, region_key: str) -> int:
@@ -896,23 +1015,164 @@ class ActiveInferencePolicyEvaluatorV1:
             ),
         )
 
-        cross_under_visited = bool(
-            cross_region_key != "NA"
-            and self._parse_region_key(cross_region_key) is not None
-            and int(cross_region_visit_count) < int(visit_target)
-        )
-        if cross_under_visited:
-            goal_region_key = str(cross_region_key)
-        elif under_visited_regions:
-            goal_region_key = str(under_visited_regions[0][0])
+        diagnostics.setdefault("frontier_candidate_count", 0)
+        diagnostics.setdefault("frontier_parent_region_key", "NA")
+        diagnostics.setdefault("frontier_target_region_key", "NA")
+        diagnostics.setdefault("frontier_enter_action_id", 0)
+        diagnostics.setdefault("frontier_parent_distance", -1)
+        diagnostics.setdefault("frontier_status", "na")
+        diagnostics.setdefault("frontier_force_enter_action_id", 0)
+
+        # Frontier discovery: from known regions, probe unknown 4-neighbors.
+        known_region_keys: set[str] = set()
+        for region_key in normalized_region_visits.keys():
+            if self._parse_region_key(str(region_key)) is None:
+                continue
+            known_region_keys.add(str(region_key))
+        edges_raw = region_graph_snapshot.get("edges", [])
+        if isinstance(edges_raw, list):
+            for row in edges_raw:
+                if not isinstance(row, dict):
+                    continue
+                src = str(row.get("source_region_key", "NA"))
+                dst = str(row.get("target_region_key", "NA"))
+                if self._parse_region_key(src) is not None:
+                    known_region_keys.add(src)
+                if self._parse_region_key(dst) is not None:
+                    known_region_keys.add(dst)
+        activity_edges_raw = region_graph_snapshot.get("activity_edges", [])
+        if isinstance(activity_edges_raw, list):
+            for row in activity_edges_raw:
+                if not isinstance(row, dict):
+                    continue
+                src = str(row.get("source_region_key", "NA"))
+                dom = str(row.get("dominant_target_region_key", "NA"))
+                if self._parse_region_key(src) is not None:
+                    known_region_keys.add(src)
+                if self._parse_region_key(dom) is not None:
+                    known_region_keys.add(dom)
+
+        activity_index = self._region_graph_activity_edge_index(region_graph_snapshot)
+        frontier_candidates: list[tuple[str, str, int]] = []
+        for source_region_key in sorted(
+            known_region_keys,
+            key=lambda key: (
+                int(self._parse_region_key(str(key))[1]) if self._parse_region_key(str(key)) is not None else 10**6,
+                int(self._parse_region_key(str(key))[0]) if self._parse_region_key(str(key)) is not None else 10**6,
+                str(key),
+            ),
+        ):
+            if self._parse_region_key(str(source_region_key)) is None:
+                continue
+            for action_id in (1, 2, 3, 4):
+                neighbor_key = self._neighbor_region_key_for_action_v1(
+                    str(source_region_key),
+                    int(action_id),
+                )
+                if self._parse_region_key(str(neighbor_key)) is None:
+                    continue
+                if str(neighbor_key) in known_region_keys:
+                    continue
+                edge_row = activity_index.get((str(source_region_key), int(action_id)))
+                if isinstance(edge_row, dict):
+                    status = str(edge_row.get("status", "unknown"))
+                    attempts = int(max(0, edge_row.get("attempts", 0)))
+                    blocked_rate = float(edge_row.get("blocked_rate", 0.0))
+                    # Strong blocked evidence: do not keep forcing this frontier edge.
+                    if status == "blocked" and attempts >= 3 and blocked_rate >= 0.75:
+                        continue
+                frontier_candidates.append((str(source_region_key), str(neighbor_key), int(action_id)))
+        diagnostics["frontier_candidate_count"] = int(len(frontier_candidates))
+
+        goal_region_key = "NA"
+        frontier_force_enter_action_id = 0
+        best_frontier: tuple[tuple[int, int, int, str, str, int], tuple[str, str, int] | None] | None = None
+        if frontier_candidates and self._parse_region_key(current_region_key) is not None:
+            adjacency_frontier = self._make_undirected_adjacency_v1(
+                self._region_graph_adjacency(
+                    region_graph_snapshot,
+                    min_edge_count=1,
+                    undirected=False,
+                )
+            )
+            reachable_from_current = self._bfs_reachable_region_keys_v1(
+                adjacency_frontier,
+                start_region_key=str(current_region_key),
+            )
+            for parent_key, frontier_key, enter_action_id in frontier_candidates:
+                if str(parent_key) != str(current_region_key) and str(parent_key) not in reachable_from_current:
+                    continue
+                dist_to_parent = (
+                    0
+                    if str(parent_key) == str(current_region_key)
+                    else self._bfs_distance_region_key_v1(
+                        adjacency_frontier,
+                        start_region_key=str(current_region_key),
+                        goal_region_key=str(parent_key),
+                    )
+                )
+                if dist_to_parent is None:
+                    continue
+                score = (
+                    int(dist_to_parent),
+                    int(normalized_region_visits.get(str(parent_key), 0)),
+                    int(self._serpentine_region_rank(str(frontier_key))),
+                    str(frontier_key),
+                    str(parent_key),
+                    int(enter_action_id),
+                )
+                if best_frontier is None or score < best_frontier[0]:
+                    best_frontier = (score, (str(parent_key), str(frontier_key), int(enter_action_id)))
+
+        if best_frontier is not None and best_frontier[1] is not None:
+            parent_key, frontier_key, enter_action_id = best_frontier[1]
+            diagnostics["frontier_parent_region_key"] = str(parent_key)
+            diagnostics["frontier_target_region_key"] = str(frontier_key)
+            diagnostics["frontier_enter_action_id"] = int(enter_action_id)
+            diagnostics["frontier_parent_distance"] = int(best_frontier[0][0])
+            diagnostics["frontier_status"] = "selected"
+            diagnostics["mode"] = "prepass_frontier"
+            # If already at frontier parent, push toward unknown frontier neighbor directly.
+            if str(parent_key) == str(current_region_key):
+                goal_region_key = str(frontier_key)
+                frontier_force_enter_action_id = int(enter_action_id)
+                diagnostics["frontier_force_enter_action_id"] = int(enter_action_id)
+            else:
+                goal_region_key = str(parent_key)
         else:
-            diagnostics["enabled"] = True
-            diagnostics["mode"] = "prepass_complete"
-            diagnostics["prepass_complete"] = True
-            return None, diagnostics
+            diagnostics["frontier_status"] = "none"
+            cross_under_visited = bool(
+                cross_region_key != "NA"
+                and self._parse_region_key(cross_region_key) is not None
+                and int(cross_region_visit_count) < int(visit_target)
+            )
+            under_visited_non_current = [
+                (key, count)
+                for (key, count) in under_visited_regions
+                if str(key) != str(current_region_key)
+            ]
+            if cross_under_visited:
+                goal_region_key = str(cross_region_key)
+            elif under_visited_non_current:
+                goal_region_key = str(under_visited_non_current[0][0])
+            elif under_visited_regions:
+                goal_region_key = str(under_visited_regions[0][0])
+            else:
+                diagnostics["enabled"] = True
+                diagnostics["mode"] = "prepass_complete"
+                diagnostics["prepass_complete"] = True
+                return None, diagnostics
         diagnostics["goal_region_key"] = str(goal_region_key)
 
-        adjacency = self._region_graph_adjacency(region_graph_snapshot)
+        diagnostics["bfs_adjacency_min_edge_count"] = 1
+        diagnostics["bfs_adjacency_undirected"] = True
+        adjacency = self._make_undirected_adjacency_v1(
+            self._region_graph_adjacency(
+                region_graph_snapshot,
+                min_edge_count=1,
+                undirected=False,
+            )
+        )
         next_region_key = "NA"
         if (
             self._parse_region_key(current_region_key) is not None
@@ -980,6 +1240,15 @@ class ActiveInferencePolicyEvaluatorV1:
             )
             predicted_region_key = str(stats.get("predicted_region_key", "NA"))
             current_key = str(stats.get("current_region_key", "NA"))
+            frontier_enter_priority = (
+                0
+                if (
+                    int(frontier_force_enter_action_id) > 0
+                    and int(entry.candidate.action_id) == int(frontier_force_enter_action_id)
+                    and not direction_retry_saturated
+                )
+                else 1
+            )
             hard_skip = bool(
                 self._coverage_hard_skip(
                     profile=profile,
@@ -997,6 +1266,7 @@ class ActiveInferencePolicyEvaluatorV1:
             )
             return (
                 1 if hard_skip else 0,
+                int(frontier_enter_priority),
                 int(_activity_status_rank(candidate_id)),
                 0
                 if (
@@ -1055,7 +1325,7 @@ class ActiveInferencePolicyEvaluatorV1:
             candidate_entries = list(safe_entries)
         ordered_entries = sorted(candidate_entries, key=_hard_sort_key)
         diagnostics["enabled"] = True
-        diagnostics["mode"] = "bfs_two_pass"
+        diagnostics["mode"] = str(diagnostics.get("mode", "bfs_two_pass"))
         diagnostics["blocked_hard_skip_applied"] = bool(
             len(candidate_entries) < len(navigation_entries)
         )
