@@ -62,7 +62,7 @@ class ActiveInferencePolicyEvaluatorV1:
         coverage_blocked_edge_rate_threshold: float = 0.60,
         coverage_ui_side_effect_attempt_threshold: int = 8,
         coverage_ui_side_effect_rate_threshold: float = 0.60,
-        high_info_focus_release_after_first_pass: bool = True,
+        high_info_focus_release_after_first_pass: bool = False,
         high_info_focus_release_action_counter: int = -1,
         navigation_confidence_gating_enabled: bool = True,
         sequence_causal_term_enabled: bool = True,
@@ -631,12 +631,13 @@ class ActiveInferencePolicyEvaluatorV1:
         if int(traversal_step_counter) >= int(self.coverage_prepass_steps):
             diagnostics["mode"] = "prepass_window_exhausted"
             return None, diagnostics
+
         scripted_total_length = int(self._serpentine_prepass_length())
-        if int(traversal_step_counter) >= int(scripted_total_length):
-            diagnostics["enabled"] = True
-            diagnostics["mode"] = "deterministic_serpentine_complete"
-            diagnostics["prepass_complete"] = True
-            return None, diagnostics
+        # NOTE (coverage): do NOT end the prepass immediately after the deterministic
+        # serpentine script completes. If the scripted schedule finishes early (common
+        # when coverage_prepass_passes=1), we fall back to BFS-driven coverage inside
+        # the remaining prepass window (coverage_prepass_steps) so the agent can still
+        # reach under-visited / newly discovered regions (including the cross-like region).
 
         navigation_entries = [
             entry

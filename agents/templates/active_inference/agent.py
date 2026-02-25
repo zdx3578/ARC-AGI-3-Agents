@@ -3113,64 +3113,83 @@ class ActiveInferenceEFE(Agent):
         return result
 
     def _current_region_key_v1(self) -> str:
+        """Return the current coarse region key used for routing/coverage.
+
+        **Hard rule (stability):** when navigation tracking is matched and not flagged as a
+        peripheral UI candidate, prefer the navigation-derived region (agent_pos_region)
+        over the representation-derived observed region. The representation-derived region
+        is only used as a fallback when navigation tracking is unavailable or implausible.
+
+        This prevents region-key jitter near cell boundaries (e.g., centroid rounding) from
+        corrupting the region graph / route planning and causing long action loops.
+        """
         latest = (
             self._latest_navigation_state_estimate
             if isinstance(self._latest_navigation_state_estimate, dict)
             else {}
         )
+
+        # Representation-derived region (fallback only).
         observed_key = "NA"
         if self._latest_observed_agent_pos_region is not None:
             orx, ory = self._latest_observed_agent_pos_region
             observed_key = self._region_key_from_xy_v1(int(orx), int(ory))
+
+        # Navigation-derived region (preferred when matched).
+        latest_key = "NA"
         region = latest.get("agent_pos_region", {})
-        if bool(latest.get("matched", False)) and isinstance(region, dict):
+        nav_matched = bool(latest.get("matched", False)) and isinstance(region, dict)
+        nav_ui_candidate = bool(latest.get("peripheral_ui_candidate", False))
+        if nav_matched:
             rx = int(region.get("x", -1))
             ry = int(region.get("y", -1))
             if rx >= 0 and ry >= 0:
                 latest_key = self._region_key_from_xy_v1(int(rx), int(ry))
-                if (
-                    self._parse_region_key_v1(str(observed_key)) is not None
-                    and str(observed_key) != str(latest_key)
-                ):
-                    if self._last_known_agent_pos_region is not None:
-                        last_rx, last_ry = self._last_known_agent_pos_region
-                        last_key = self._region_key_from_xy_v1(int(last_rx), int(last_ry))
-                        latest_plausible = self._region_step_plausible_v1(
-                            str(last_key),
-                            str(latest_key),
-                            max_axis_step=1,
-                        )
-                        observed_plausible = self._region_step_plausible_v1(
-                            str(last_key),
-                            str(observed_key),
-                            max_axis_step=1,
-                        )
-                        if observed_plausible or (not latest_plausible):
-                            return str(observed_key)
-                    else:
-                        return str(observed_key)
-                if self._last_known_agent_pos_region is not None:
-                    last_rx, last_ry = self._last_known_agent_pos_region
-                    last_key = self._region_key_from_xy_v1(int(last_rx), int(last_ry))
-                    if not self._region_step_plausible_v1(
-                        str(last_key),
-                        str(latest_key),
-                        max_axis_step=1,
-                    ):
-                        if self._parse_region_key_v1(str(observed_key)) is not None:
-                            if self._region_step_plausible_v1(
-                                str(last_key),
-                                str(observed_key),
-                                max_axis_step=1,
-                            ):
-                                return str(observed_key)
-                        return str(last_key)
-                return str(latest_key)
-        if self._parse_region_key_v1(str(observed_key)) is not None:
-            return str(observed_key)
+
+        last_key = "NA"
         if self._last_known_agent_pos_region is not None:
-            rx, ry = self._last_known_agent_pos_region
-            return self._region_key_from_xy_v1(int(rx), int(ry))
+            last_rx, last_ry = self._last_known_agent_pos_region
+            last_key = self._region_key_from_xy_v1(int(last_rx), int(last_ry))
+
+        def _plausible_from_last(candidate_key: str) -> bool:
+            if self._parse_region_key_v1(str(candidate_key)) is None:
+                return False
+            if self._parse_region_key_v1(str(last_key)) is None:
+                return True
+            return bool(
+                self._region_step_plausible_v1(
+                    str(last_key),
+                    str(candidate_key),
+                    max_axis_step=1,
+                )
+            )
+
+        # Prefer navigation region when available (and not UI).
+        if (
+            nav_matched
+            and (not nav_ui_candidate)
+            and self._parse_region_key_v1(str(latest_key)) is not None
+        ):
+            if self._parse_region_key_v1(str(last_key)) is not None and not _plausible_from_last(
+                str(latest_key)
+            ):
+                # Navigation jumped implausibly; try observed if plausible, else stick to last.
+                if _plausible_from_last(str(observed_key)):
+                    return str(observed_key)
+                return str(last_key)
+            return str(latest_key)
+
+        # If navigation is missing/unreliable, fall back to representation-derived observed region.
+        if _plausible_from_last(str(observed_key)):
+            return str(observed_key)
+
+        # Final fallback: keep last-known region if available.
+        if self._parse_region_key_v1(str(last_key)) is not None:
+            return str(last_key)
+
+        if self._parse_region_key_v1(str(latest_key)) is not None:
+            return str(latest_key)
+
         return "NA"
 
     def _update_observed_agent_region_from_representation_v1(
