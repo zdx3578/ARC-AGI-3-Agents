@@ -41,22 +41,47 @@ def _color_value(cell_any: Any) -> int:
 
 
 def _normalize_frame_to_int_grid(frame_any: Any) -> list[list[int]]:
-    if not isinstance(frame_any, list):
-        return []
-    if not frame_any:
+    """Normalize a frame-like payload into a 2D int grid.
+
+    In ARC-AGI-3 / arcengine, `FrameData.frame` is typically a *frame chain*:
+        List[Frame], where Frame = List[List[int]].
+
+    We treat the **latest** frame in the chain as the canonical observation grid.
+
+    Some serializers can introduce redundant wrapper levels (e.g. `[[frame]]`); we unwrap
+    a small bounded number of times to get back to either a frame-chain or a 2D grid.
+    """
+
+    obj: Any = frame_any
+    if not isinstance(obj, list) or not obj:
         return []
 
-    # ARC payloads can occasionally add one redundant wrapping level.
+    # Unwrap redundant single-element wrappers (bounded).
+    for _ in range(3):
+        if isinstance(obj, list) and len(obj) == 1 and isinstance(obj[0], list):
+            obj = obj[0]
+            continue
+        break
+
+    # If this looks like a frame chain (list of frames), select the latest frame.
+    # Heuristic: chain[0][0] is a list (row list), whereas grid[0][0] is an int.
     if (
-        len(frame_any) == 1
-        and isinstance(frame_any[0], list)
-        and frame_any[0]
-        and isinstance(frame_any[0][0], list)
+        isinstance(obj, list)
+        and obj
+        and isinstance(obj[0], list)
+        and obj[0]
+        and isinstance(obj[0][0], list)
     ):
-        frame_any = frame_any[0]
+        obj = obj[-1]
+        # Unwrap again if the selected frame is itself wrapped.
+        for _ in range(2):
+            if isinstance(obj, list) and len(obj) == 1 and isinstance(obj[0], list):
+                obj = obj[0]
+                continue
+            break
 
     rows: list[list[int]] = []
-    for row_any in frame_any:
+    for row_any in obj:
         if isinstance(row_any, list):
             rows.append([_color_value(cell_any) for cell_any in row_any])
         else:
@@ -72,6 +97,7 @@ def _normalize_frame_to_int_grid(frame_any: Any) -> list[list[int]]:
             row = row + [0] * (max_width - len(row))
         padded.append(row)
     return padded
+
 
 
 def _frame_digest(frame: list[list[int]]) -> str:
@@ -186,16 +212,50 @@ def _frame_chain_summary(
     latest_frame_data: FrameData,
     frame_chain: list[FrameData] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
+    def _expand_frame_payload(frame_payload: Any) -> list[Any]:
+        obj: Any = frame_payload
+        if not isinstance(obj, list) or not obj:
+            return []
+
+        # Unwrap redundant single-element wrappers (bounded).
+        for _ in range(3):
+            if isinstance(obj, list) and len(obj) == 1 and isinstance(obj[0], list):
+                obj = obj[0]
+                continue
+            break
+
+        # If this looks like a frame-chain (list of frames), return it (each element is a frame grid).
+        # Heuristic: chain[0][0] is a list (row list), whereas grid[0][0] is an int.
+        if (
+            isinstance(obj, list)
+            and obj
+            and isinstance(obj[0], list)
+            and obj[0]
+            and isinstance(obj[0][0], list)
+        ):
+            return obj
+
+        return [obj]
+
     chain_frames: list[list[list[int]]] = []
     if frame_chain:
         for frame_data in frame_chain:
-            normalized = _normalize_frame_to_int_grid(getattr(frame_data, "frame", None))
+            for raw in _expand_frame_payload(getattr(frame_data, "frame", None)):
+                normalized = _normalize_frame_to_int_grid(raw)
+                if normalized:
+                    chain_frames.append(normalized)
+
+        # Add the *latest* frame as an anchor (avoid accidental undercounting if the caller
+        # supplied only prior micro-frames in `frame_chain`).
+        latest_normalized = _normalize_frame_to_int_grid(getattr(latest_frame_data, "frame", None))
+        if latest_normalized:
+            chain_frames.append(latest_normalized)
+    else:
+        for raw in _expand_frame_payload(getattr(latest_frame_data, "frame", None)):
+            normalized = _normalize_frame_to_int_grid(raw)
             if normalized:
                 chain_frames.append(normalized)
 
-    latest_normalized = _normalize_frame_to_int_grid(getattr(latest_frame_data, "frame", None))
-    if latest_normalized:
-        chain_frames.append(latest_normalized)
 
     dedup_frames: list[list[list[int]]] = []
     dedup_digests: list[str] = []

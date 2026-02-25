@@ -7334,7 +7334,7 @@ class ActiveInferenceEFE(Agent):
                 lock_key = str(inner_loop_queue[0])
                 if self._parse_region_key_v1(lock_key) is None:
                     return False
-                _arm_chain_lock(str(lock_key), "inner_loop_hard_lock", focus_commit=True)
+                # NOTE: inner-loop hard lock is armed on activation; do not re-arm here (prevents miss/timeout from working).
                 deferred = [str(v) for v in queue if str(v) != str(lock_key)]
                 if deferred:
                     _enqueue_pending_regions(
@@ -7342,7 +7342,6 @@ class ActiveInferenceEFE(Agent):
                         score_hint={str(k): float(v) for (k, v) in score_memory.items()},
                     )
                 queue = [str(lock_key)]
-                target_miss_streak = 0
                 priority_subqueue_active = True
                 priority_subqueue_keys = [str(lock_key)]
                 interaction_chain_active = False
@@ -7680,7 +7679,19 @@ class ActiveInferenceEFE(Agent):
                     _disable_chain_lock("window_expired")
                 elif not nav_in_lock_target:
                     if int(target_miss_streak) >= int(chain_lock_miss_limit):
-                        if target_commit_active:
+                        if inner_loop_active:
+                            # Inner-loop is a *hard focus*; if we cannot re-enter the target region for too long,
+                            # we must drop the lock to avoid infinite attractors.
+                            missed_key = str(chain_lock_target)
+                            _disable_chain_lock("inner_loop_miss_limit")
+                            if missed_key and missed_key not in pending_region_queue:
+                                pending_region_queue.append(missed_key)
+                            inner_loop_active = False
+                            inner_loop_reason = "miss_limit"
+                            inner_loop_queue = []
+                            inner_loop_current_target_region_key = "NA"
+                            chain_lock_last_status = "tracking_inner_loop_miss_limit_disabled"
+                        elif target_commit_active:
                             chain_lock_last_status = "tracking_commit_hold"
                         else:
                             _disable_chain_lock("miss_limit")
