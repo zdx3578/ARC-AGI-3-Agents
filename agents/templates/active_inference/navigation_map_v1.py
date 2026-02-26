@@ -298,6 +298,7 @@ def build_navigation_map_snapshot_v1(
     frame_any: Any,
     *,
     agent_pos_xy: tuple[int, int] | None,
+    movement_step_pixels: int | None = None,
     region_size: int = 8,
     walkable_ratio_threshold: float = 0.02,
 ) -> dict[str, Any]:
@@ -307,6 +308,11 @@ def build_navigation_map_snapshot_v1(
         "enabled": False,
         "region_size": int(region_size),
         "walkable_ratio_threshold": float(walkable_ratio_threshold),
+        "movement_step_pixels_estimate": (
+            int(movement_step_pixels)
+            if isinstance(movement_step_pixels, int) and int(movement_step_pixels) > 0
+            else None
+        ),
         "anchor_xy": {"x": -1, "y": -1},
         "mask_digest": "na",
         "walkable_component_meta_v1": {},

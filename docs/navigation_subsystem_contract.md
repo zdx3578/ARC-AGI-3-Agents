@@ -15,8 +15,9 @@
 
 ## 3. 地图单位原则（强制）
 - 地图基本运动单位定义为：**1 个 agent 行动距离**。
-- 当前游戏（ls20）按约定为：**5x5 像素步长单位**。
-- 导航模块必须支持该单位作为网格尺度输入参数。
+- agent 大小/步长**不得写死**（不得固定成 5x5）。
+- 步长必须由在线行动结果估计：依据导航匹配后的 `displacement_manhattan` 统计主峰值。
+- 导航模块必须支持“估计步长”作为网格尺度输入参数。
 - 若因兼容历史逻辑临时使用其他尺度，必须在诊断里明确记录，并给出迁移计划。
 
 ## 4. 导航子系统分层接口
@@ -49,6 +50,7 @@
 
 ## 5. 审计字段（必须写日志）
 - `navigation_map_snapshot_v1`
+  - `movement_step_pixels_estimate`
 - `walkable_component_meta_v1`
 - `walkable_region_ratio_v1`
 - `walkable_region_adjacency_v1`
@@ -76,5 +78,5 @@
   - `policy.py` 优先调用 `nav_prepass_v1`
 
 ## 8. 下一步迁移
-- 把历史 8x8 coarse region 全部迁移到“agent 行动单位网格（5x5）”。
+- 把历史 8x8 coarse region 全部迁移到“agent 行动单位网格（在线估计步长）”。
 - 迁移完成前，所有尺度不一致必须在 trace 中显式记录，不允许隐式混用。

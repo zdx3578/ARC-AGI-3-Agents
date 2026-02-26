@@ -541,6 +541,11 @@ class ActiveInferenceEFE(Agent):
         self._last_known_agent_pos_region: tuple[int, int] | None = None
         self._latest_observed_agent_pos_region: tuple[int, int] | None = None
         self._latest_navigation_state_estimate: dict[str, Any] = {}
+        self._navigation_step_displacement_history_window = max(
+            32,
+            _cfg_int("ACTIVE_INFERENCE_NAVIGATION_STEP_HISTORY_WINDOW", 128),
+        )
+        self._navigation_step_displacement_history: list[int] = []
         self._action_select_count: dict[int, int] = {}
         self._candidate_select_count: dict[str, int] = {}
         self._cluster_select_count: dict[str, int] = {}
@@ -8256,6 +8261,45 @@ class ActiveInferenceEFE(Agent):
                     dy = 0
         return (int(dx), int(dy))
 
+    def _update_navigation_step_displacement_history_v1(
+        self,
+        navigation_state_estimate: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(navigation_state_estimate, dict):
+            return
+        if not bool(navigation_state_estimate.get("matched", False)):
+            return
+        action_id = int(navigation_state_estimate.get("action_id", 0))
+        if action_id not in (1, 2, 3, 4):
+            return
+        displacement = int(max(0, navigation_state_estimate.get("displacement_manhattan", 0)))
+        # Ignore sub-pixel / tracker jitter; we only keep meaningful movement quanta.
+        if displacement < 2 or displacement > 32:
+            return
+        self._navigation_step_displacement_history.append(int(displacement))
+        window = int(self._navigation_step_displacement_history_window)
+        if len(self._navigation_step_displacement_history) > int(window):
+            self._navigation_step_displacement_history = self._navigation_step_displacement_history[
+                -int(window) :
+            ]
+
+    def _navigation_step_pixels_estimate_v1(self) -> int | None:
+        if not self._navigation_step_displacement_history:
+            return None
+        histogram: dict[int, int] = {}
+        for value in self._navigation_step_displacement_history:
+            step = int(max(0, value))
+            if step <= 0:
+                continue
+            histogram[step] = int(histogram.get(step, 0) + 1)
+        if not histogram:
+            return None
+        best_step = sorted(
+            histogram.items(),
+            key=lambda item: (-int(item[1]), int(item[0])),
+        )[0][0]
+        return int(best_step)
+
     def _current_agent_position_xy_v1(
         self,
         representation: RepresentationStateV1,
@@ -10870,6 +10914,7 @@ class ActiveInferenceEFE(Agent):
                     executed_candidate=self._previous_action_candidate,
                 )
                 self._latest_navigation_state_estimate = dict(navigation_state_estimate)
+                self._update_navigation_step_displacement_history_v1(navigation_state_estimate)
                 progress_proxy_event = self._is_progress_proxy_event(causal_signature)
                 if str(causal_signature.obs_change_type) == "NO_CHANGE":
                     self._no_change_streak += 1
@@ -11178,6 +11223,7 @@ class ActiveInferenceEFE(Agent):
                         navigation_map_snapshot_v1 = build_navigation_map_snapshot_v1(
                             packet.frame,
                             agent_pos_xy=agent_pos_xy_for_nav_map,
+                            movement_step_pixels=self._navigation_step_pixels_estimate_v1(),
                             region_size=8,
                             walkable_ratio_threshold=0.02,
                         )
