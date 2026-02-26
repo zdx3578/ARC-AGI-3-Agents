@@ -57,6 +57,9 @@ class TraceStepInfo:
     agent_pos: tuple[int, int] | None  # (x, y)
     tracked_bbox: tuple[int, int, int, int] | None  # (x0, y0, x1, y1)
     selected_action_id: int | None
+    nav_matched: bool
+    peripheral_ui_candidate: bool
+    nav_region_key: str
 
 
 @dataclass
@@ -64,6 +67,7 @@ class ReconstructionResult:
     modal_frame: np.ndarray
     walkable_mask: np.ndarray
     agent_path_xy: list[tuple[int, int]]
+    action_path_xy: list[tuple[int, int]]
     action_path_steps: list[int]
     action_path_ids: list[int]
     floor_color: int
@@ -192,11 +196,40 @@ def _load_trace_steps(trace_path: Path) -> dict[int, TraceStepInfo]:
                 except (TypeError, ValueError):
                     selected_action_id = None
 
+            nav = row.get("navigation_state_estimate_v1") or {}
+            nav_matched = bool(nav.get("matched", False)) if isinstance(nav, dict) else False
+            peripheral_ui_candidate = (
+                bool(nav.get("peripheral_ui_candidate", False))
+                if isinstance(nav, dict)
+                else False
+            )
+            nav_region_key = "NA"
+            if isinstance(nav, dict):
+                nav_region = nav.get("agent_pos_region") or {}
+                try:
+                    col_y = int(nav_region.get("x", -1))
+                    row_x = int(nav_region.get("y", -1))
+                    if col_y >= 0 and row_x >= 0:
+                        nav_region_key = f"{row_x}:{col_y}"
+                except (TypeError, ValueError):
+                    nav_region_key = "NA"
+                nav_pos = nav.get("agent_pos_xy") or {}
+                try:
+                    nav_x = int(nav_pos.get("x", -1))
+                    nav_y = int(nav_pos.get("y", -1))
+                    if nav_matched and (not peripheral_ui_candidate) and nav_x >= 0 and nav_y >= 0:
+                        agent_pos = (nav_x, nav_y)
+                except (TypeError, ValueError):
+                    pass
+
             steps[int(action_counter)] = TraceStepInfo(
                 action_counter=int(action_counter),
                 agent_pos=agent_pos,
                 tracked_bbox=tracked_bbox,
                 selected_action_id=selected_action_id,
+                nav_matched=bool(nav_matched),
+                peripheral_ui_candidate=bool(peripheral_ui_candidate),
+                nav_region_key=str(nav_region_key),
             )
     return steps
 
@@ -330,19 +363,38 @@ def reconstruct_map(recording_path: Path, trace_path: Path) -> ReconstructionRes
     modal, agent_colors = _temporal_mode_excluding_agent(frames, trace_steps)
 
     agent_path_xy: list[tuple[int, int]] = []
+    action_path_xy: list[tuple[int, int]] = []
     action_path_steps: list[int] = []
     action_path_ids: list[int] = []
     tracked_bboxes: list[tuple[int, int, int, int]] = []
+    region_size = 8
     for i in range(len(frames)):
         step = trace_steps.get(i)
         if step and step.agent_pos:
             agent_path_xy.append(step.agent_pos)
-            action_path_steps.append(int(step.action_counter))
-            action_path_ids.append(
+            action_id = (
                 int(step.selected_action_id)
                 if step.selected_action_id is not None
                 else -1
             )
+            if (
+                int(action_id) in (1, 2, 3, 4)
+                and bool(step.nav_matched)
+                and (not bool(step.peripheral_ui_candidate))
+                and isinstance(step.nav_region_key, str)
+                and ":" in step.nav_region_key
+            ):
+                left, right = step.nav_region_key.split(":", 1)
+                try:
+                    row_x = int(left)
+                    col_y = int(right)
+                    cx = int(col_y * region_size + (region_size // 2))
+                    cy = int(row_x * region_size + (region_size // 2))
+                    action_path_xy.append((cx, cy))
+                    action_path_steps.append(int(step.action_counter))
+                    action_path_ids.append(int(action_id))
+                except (TypeError, ValueError):
+                    pass
         if step and step.tracked_bbox:
             tracked_bboxes.append(step.tracked_bbox)
 
@@ -355,6 +407,7 @@ def reconstruct_map(recording_path: Path, trace_path: Path) -> ReconstructionRes
         modal_frame=modal,
         walkable_mask=walkable,
         agent_path_xy=agent_path_xy,
+        action_path_xy=action_path_xy,
         action_path_steps=action_path_steps,
         action_path_ids=action_path_ids,
         floor_color=int(floor_color),
@@ -413,9 +466,9 @@ def _draw_outputs(
     walk_alpha = np.zeros_like(walk, dtype=np.float32)
     walk_alpha[walk] = 1.0
     ax3.imshow(walk_alpha, cmap="Blues", interpolation="nearest", alpha=0.16)
-    if result.agent_path_xy:
+    if result.action_path_xy:
         segments = _build_action_path_segments(
-            result.agent_path_xy,
+            result.action_path_xy,
             result.action_path_steps,
             width=int(base_rgb.shape[1]),
             height=int(base_rgb.shape[0]),
@@ -498,7 +551,7 @@ def main() -> None:
     print(f"trace: {trace_path}")
     print(f"steps: {result.action_count}")
     print(f"floor_color: {result.floor_color}")
-    print(f"path_points: {len(result.agent_path_xy)}")
+    print(f"path_points: {len(result.action_path_xy)}")
     print(f"map: {map_only_path}")
     print(f"walkable: {walkable_path}")
     print(f"overlay: {overlay_path}")

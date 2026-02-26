@@ -451,8 +451,7 @@ class ActiveInferencePolicyEvaluatorV1:
             diagnostics["mode"] = "levels_progressed"
             return None, diagnostics
         if int(traversal_step_counter) >= int(self.coverage_prepass_steps):
-            diagnostics["mode"] = "prepass_window_exhausted"
-            return None, diagnostics
+            diagnostics["prepass_window_exhausted_soft"] = True
 
         navigation_entries = [
             entry
@@ -468,7 +467,7 @@ class ActiveInferencePolicyEvaluatorV1:
             entries,
             config=NavPrepassConfigV1(
                 region_size=8,
-                walkable_ratio_threshold=0.02,
+                walkable_ratio_threshold=0.08,
                 frontier_block_confirm_attempts=2,
                 frontier_blocked_rate_threshold=0.85,
                 confirmed_block_reprobe_interval_steps=24,

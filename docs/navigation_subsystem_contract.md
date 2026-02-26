@@ -84,6 +84,24 @@
   - 区域级最远两点最短路径距离（`region_diameter.distance_steps`）
 - 对外报告坐标统一使用**行x列y**，禁止 `(line y)` 等旧格式。
 
+### 6.1 覆盖闸门验证（强制）
+- 在任何“high-info / sequence / EFE 利用阶段”之前，必须先通过覆盖闸门：
+  - `full_coverage_once == true`
+  - `full_coverage_twice == true`
+- 闸门脚本：
+  - `python tools/verify_navigation_coverage_gate.py --trace <trace.jsonl>`
+- 输出文件：
+  - `recordings/navigation_checks/<trace_stem>_coverage_gate.summary.json`
+- 闸门输出字段（最小集）：
+  - `gate_pass`
+  - `reachable_region_count`
+  - `coverage_once_ratio`
+  - `coverage_twice_ratio`
+  - `missing_once_regions_human`（行x列y）
+  - `missing_twice_regions_human`（行x列y）
+  - `reachable_region_diameter.distance_steps`
+  - `reachable_region_diameter.point_a / point_b`（行x列y）
+
 ## 7. 结构约束
 - EFE / high-info / sequence 模块**不能**直接实现坐标解析、BFS、frontier 排序。
 - 这些模块只允许：

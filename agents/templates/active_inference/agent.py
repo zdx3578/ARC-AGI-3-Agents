@@ -3223,18 +3223,13 @@ class ActiveInferenceEFE(Agent):
             )
 
         # Prefer navigation region when available (and not UI).
+        # Do not gate this by last-key plausibility: stale last-key states can otherwise
+        # hard-lock coverage at a wrong region and create long single-action loops.
         if (
             nav_matched
             and (not nav_ui_candidate)
             and self._parse_region_key_v1(str(latest_key)) is not None
         ):
-            if self._parse_region_key_v1(str(last_key)) is not None and not _plausible_from_last(
-                str(latest_key)
-            ):
-                # Navigation jumped implausibly; try observed if plausible, else stick to last.
-                if _plausible_from_last(str(observed_key)):
-                    return str(observed_key)
-                return str(last_key)
             return str(latest_key)
 
         # If navigation is missing/unreliable, fall back to representation-derived observed region.
@@ -8356,12 +8351,21 @@ class ActiveInferenceEFE(Agent):
     ) -> tuple[int, int] | None:
         latest = self._latest_navigation_state_estimate
         if isinstance(latest, dict):
+            nav_matched = bool(latest.get("matched", False))
+            nav_ui_candidate = bool(latest.get("peripheral_ui_candidate", False))
             pos = latest.get("agent_pos_xy", {})
             if isinstance(pos, dict):
                 x = int(pos.get("x", -1))
                 y = int(pos.get("y", -1))
-                if x >= 0 and y >= 0:
+                if nav_matched and (not nav_ui_candidate) and x >= 0 and y >= 0:
                     return (int(x), int(y))
+        if self._latest_observed_agent_pos_region is not None:
+            rx = int(self._latest_observed_agent_pos_region[0])
+            ry = int(self._latest_observed_agent_pos_region[1])
+            return (
+                int((int(rx) * 8) + 4),
+                int((int(ry) * 8) + 4),
+            )
         if self._tracked_agent_token_digest:
             matched = self._find_object_by_digest_v1(
                 representation,
@@ -8372,6 +8376,11 @@ class ActiveInferenceEFE(Agent):
                     int(matched.get("centroid_x", -1)),
                     int(matched.get("centroid_y", -1)),
                 )
+        if self._tracked_agent_anchor_xy is not None:
+            return (
+                int(self._tracked_agent_anchor_xy[0]),
+                int(self._tracked_agent_anchor_xy[1]),
+            )
         return None
 
     def _navigation_key_targets_v1(
@@ -8726,10 +8735,12 @@ class ActiveInferenceEFE(Agent):
         }
 
     def _region_graph_snapshot_v1(self, *, max_edges: int = 256) -> dict[str, Any]:
-        current_region_key = "NA"
-        if self._last_known_agent_pos_region is not None:
-            rx, ry = self._last_known_agent_pos_region
-            current_region_key = self._region_key_from_xy_v1(int(rx), int(ry))
+        current_region_key = str(self._current_region_key_v1())
+        if self._parse_region_key_v1(str(current_region_key)) is None:
+            current_region_key = "NA"
+            if self._last_known_agent_pos_region is not None:
+                rx, ry = self._last_known_agent_pos_region
+                current_region_key = self._region_key_from_xy_v1(int(rx), int(ry))
 
         edges: list[dict[str, Any]] = []
         for region_action_key, target_histogram in self._region_action_transition_counts.items():
@@ -9887,15 +9898,13 @@ class ActiveInferenceEFE(Agent):
                                     max_axis_step=1,
                                 )
                             )
-                        if plausible_transition:
+                        def _commit_region_transition_update() -> None:
                             self._last_known_agent_pos_region = (rx, ry)
                             self._region_visit_counts[target_region_key] = int(
                                 self._region_visit_counts.get(target_region_key, 0) + 1
                             )
                             if str(edge_source_region_key) != "NA":
-                                region_action_key = (
-                                    f"{str(edge_source_region_key)}|a{action_id}"
-                                )
+                                region_action_key = f"{str(edge_source_region_key)}|a{action_id}"
                                 target_histogram = self._region_action_transition_counts.setdefault(
                                     region_action_key,
                                     {},
@@ -9903,10 +9912,36 @@ class ActiveInferenceEFE(Agent):
                                 target_histogram[target_region_key] = int(
                                     target_histogram.get(target_region_key, 0) + 1
                                 )
+
+                        if plausible_transition:
+                            _commit_region_transition_update()
                         else:
                             self._navigation_implausible_transition_count = int(
                                 self._navigation_implausible_transition_count + 1
                             )
+                            source_tuple = self._parse_region_key_v1(str(edge_source_region_key))
+                            source_axis_step = 0
+                            if source_tuple is not None:
+                                sx, sy = source_tuple
+                                source_axis_step = int(
+                                    max(abs(int(rx) - int(sx)), abs(int(ry) - int(sy)))
+                                )
+                            projection_error = float(
+                                max(0.0, navigation_state_estimate.get("projection_error", 10**6))
+                            )
+                            recovery_allowed = bool(
+                                nav_matched
+                                and (not nav_peripheral_ui)
+                                and (
+                                    source_tuple is None
+                                    or int(source_axis_step) <= 2
+                                )
+                                and float(projection_error) <= 12.0
+                            )
+                            if recovery_allowed:
+                                # Recovery path: allow one coarse-step mismatch to re-sync
+                                # region tracking after stale-source drift.
+                                _commit_region_transition_update()
             else:
                 self._navigation_blocked_count += 1
                 action_stats["blocked"] = int(action_stats.get("blocked", 0) + 1)
@@ -11270,12 +11305,48 @@ class ActiveInferenceEFE(Agent):
                         agent_pos_xy_for_nav_map = self._current_agent_position_xy_v1(
                             representation
                         )
+                        nav_anchor_source = "agent_pos_xy"
+                        nav_state_any = getattr(
+                            self,
+                            "_latest_navigation_state_estimate_v1",
+                            {},
+                        )
+                        nav_state_for_anchor = (
+                            nav_state_any if isinstance(nav_state_any, dict) else {}
+                        )
+                        nav_anchor_trusted = bool(
+                            bool(nav_state_for_anchor.get("matched", False))
+                            and not bool(nav_state_for_anchor.get("peripheral_ui_candidate", False))
+                            and isinstance(agent_pos_xy_for_nav_map, tuple)
+                        )
+                        current_region_for_nav_map = str(
+                            region_graph_snapshot.get("current_region_key", "NA")
+                        )
+                        parsed_current_region = self._parse_region_key_v1(
+                            current_region_for_nav_map
+                        )
+                        if parsed_current_region is not None:
+                            row_x, col_y = parsed_current_region
+                            region_center_xy = (
+                                int((int(col_y) * 8) + 4),
+                                int((int(row_x) * 8) + 4),
+                            )
+                            if agent_pos_xy_for_nav_map is None:
+                                agent_pos_xy_for_nav_map = region_center_xy
+                                nav_anchor_source = "region_center_fallback"
+                            elif not bool(nav_anchor_trusted):
+                                # Keep observed anchor unless it's missing; stale region-center fallback
+                                # can push map extraction into UI zones.
+                                nav_anchor_source = "agent_pos_xy_untrusted"
                         navigation_map_snapshot_v1 = build_navigation_map_snapshot_v1(
                             packet.frame,
                             agent_pos_xy=agent_pos_xy_for_nav_map,
                             movement_step_pixels=self._navigation_step_pixels_estimate_v1(),
                             region_size=8,
-                            walkable_ratio_threshold=0.02,
+                            walkable_ratio_threshold=0.08,
+                        )
+                        navigation_map_snapshot_v1["anchor_source_v1"] = str(
+                            nav_anchor_source
                         )
                         self._latest_navigation_map_snapshot_v1 = dict(
                             navigation_map_snapshot_v1
@@ -11688,12 +11759,19 @@ class ActiveInferenceEFE(Agent):
             if isinstance(self._latest_navigation_state_estimate, dict)
             else {}
         )
+        nav_matched = bool(latest.get("matched", False))
+        nav_ui_candidate = bool(latest.get("peripheral_ui_candidate", False))
         pos = latest.get("agent_pos_xy", {})
         if isinstance(pos, dict):
             x = int(pos.get("x", -1))
             y = int(pos.get("y", -1))
-            if x >= 0 and y >= 0:
+            if nav_matched and (not nav_ui_candidate) and x >= 0 and y >= 0:
                 return (int(x), int(y))
+        if self._tracked_agent_anchor_xy is not None:
+            return (
+                int(self._tracked_agent_anchor_xy[0]),
+                int(self._tracked_agent_anchor_xy[1]),
+            )
         return None
 
     def _run_navigation_map_audit_on_cleanup_v1(self) -> dict[str, Any]:

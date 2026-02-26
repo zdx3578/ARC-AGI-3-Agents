@@ -9,7 +9,7 @@ from .contracts import FreeEnergyLedgerEntryV1
 @dataclass(slots=True)
 class NavPrepassConfigV1:
     region_size: int = 8
-    walkable_ratio_threshold: float = 0.02
+    walkable_ratio_threshold: float = 0.08
     # Hard rule: boundary/wall must be confirmed by repeated blocked attempts.
     frontier_block_confirm_attempts: int = 2
     frontier_blocked_rate_threshold: float = 0.85
@@ -124,6 +124,27 @@ def _bfs_next_step(adjacency: dict[str, dict[str, int]], *, start: str, goal: st
                 return str(cur)
             queue.append(nbr)
     return None
+
+
+def _bfs_reachable_nodes(adjacency: dict[str, dict[str, int]], *, start: str) -> set[str]:
+    start_key = str(start)
+    if _parse_region_key(start_key) is None:
+        return set()
+    seen: set[str] = {start_key}
+    if start_key not in adjacency:
+        return seen
+    queue: list[str] = [start_key]
+    head = 0
+    while head < len(queue):
+        node = queue[head]
+        head += 1
+        for nbr in adjacency.get(node, {}).keys():
+            nbr_key = str(nbr)
+            if _parse_region_key(nbr_key) is None or nbr_key in seen:
+                continue
+            seen.add(nbr_key)
+            queue.append(nbr_key)
+    return seen
 
 
 def _extract_region_graph_snapshot(entries: list[FreeEnergyLedgerEntryV1]) -> dict[str, Any]:
@@ -380,14 +401,23 @@ def select_prepass_recommended_action_v1(
             except Exception:
                 continue
 
-    known_regions: set[str] = set(region_visits.keys())
-    known_regions.add(current_region_key)
+    known_regions_all: set[str] = set(region_visits.keys())
+    known_regions_all.add(current_region_key)
     for src, nbrs in adjacency.items():
         if _parse_region_key(str(src)) is not None:
-            known_regions.add(str(src))
+            known_regions_all.add(str(src))
         for dst in (nbrs or {}).keys():
             if _parse_region_key(str(dst)) is not None:
-                known_regions.add(str(dst))
+                known_regions_all.add(str(dst))
+
+    reachable_regions = _bfs_reachable_nodes(adjacency, start=current_region_key)
+    known_regions: set[str] = set(
+        region_key
+        for region_key in known_regions_all
+        if region_key in reachable_regions
+    )
+    if not known_regions:
+        known_regions = {str(current_region_key)}
 
     activity_index = _extract_activity_index(region_graph)
     region_action_counts = _extract_region_action_counts(region_graph)
@@ -458,6 +488,8 @@ def select_prepass_recommended_action_v1(
     diagnostics["enabled"] = True
     diagnostics["mode"] = "frontier"
     diagnostics["current_region_key"] = str(current_region_key)
+    diagnostics["known_region_count"] = int(len(known_regions))
+    diagnostics["reachable_region_count"] = int(len(reachable_regions))
     diagnostics["frontier_candidate_count"] = int(len(frontier_candidates))
     diagnostics["boundary_confirmed_edge_count"] = int(boundary_confirmed_count)
     diagnostics["boundary_pending_edge_count"] = int(boundary_pending_count)

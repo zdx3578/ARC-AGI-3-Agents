@@ -73,7 +73,8 @@ def compute_walkable_component_mask_from_anchor_v1(
     anchor_y: int,
     search_radius: int = 6,
     min_component_pixels: int = 80,
-    dilation_steps: int = 3,
+    dilation_steps: int = 0,
+    max_component_ratio: float = 0.72,
 ) -> WalkableComponentResultV1:
     meta: dict[str, Any] = {
         "schema_name": "active_inference_walkable_component_meta_v1",
@@ -88,6 +89,9 @@ def compute_walkable_component_mask_from_anchor_v1(
         "search_radius": int(search_radius),
         "min_component_pixels": int(min_component_pixels),
         "dilation_steps": int(dilation_steps),
+        "max_component_ratio": float(max_component_ratio),
+        "component_ratio": 0.0,
+        "border_touch_pixels": 0,
     }
 
     frame = _frame_to_grid(frame_any)
@@ -123,6 +127,22 @@ def compute_walkable_component_mask_from_anchor_v1(
     def _mask_pixels(mask: list[list[bool]]) -> int:
         return int(sum(1 for row in mask for v in row if bool(v)))
 
+    def _mask_border_touch_pixels(mask: list[list[bool]]) -> int:
+        if not mask:
+            return 0
+        touch = 0
+        for x in range(width):
+            if bool(mask[0][x]):
+                touch += 1
+            if height > 1 and bool(mask[height - 1][x]):
+                touch += 1
+        for y in range(1, max(1, height - 1)):
+            if bool(mask[y][0]):
+                touch += 1
+            if width > 1 and bool(mask[y][width - 1]):
+                touch += 1
+        return int(touch)
+
     center_color = int(frame[int(anchor_y)][int(anchor_x)])
     color_hist: dict[int, int] = {}
     nearest_xy_by_color: dict[int, tuple[int, int, int]] = {}
@@ -155,6 +175,9 @@ def compute_walkable_component_mask_from_anchor_v1(
     best_mask: list[list[bool]] | None = None
     best_pixels = 0
     best_color = -1
+    best_border_touch = 0
+    best_score: tuple[int, int, int, int, int] | None = None
+    frame_pixels = int(max(1, height * width))
 
     for color in candidate_colors:
         if int(color) in nearest_xy_by_color:
@@ -176,10 +199,26 @@ def compute_walkable_component_mask_from_anchor_v1(
 
         mask = _component_mask_for_seed(int(sx), int(sy), int(color))
         pixels = _mask_pixels(mask)
-        if pixels > int(best_pixels):
+        if int(pixels) <= 0:
+            continue
+        ratio = float(pixels) / float(frame_pixels)
+        border_touch = int(_mask_border_touch_pixels(mask))
+        nearest_dist = int(nearest_xy_by_color.get(int(color), (search_radius + 1, 0, 0))[0])
+        oversized = 1 if float(ratio) > float(max_component_ratio) else 0
+        too_small = 1 if int(pixels) < int(min_component_pixels) else 0
+        score = (
+            int(too_small),
+            int(oversized),
+            int(border_touch),
+            int(-pixels),
+            int(nearest_dist),
+        )
+        if best_score is None or score < best_score:
+            best_score = score
             best_pixels = int(pixels)
             best_mask = mask
             best_color = int(color)
+            best_border_touch = int(border_touch)
 
     if best_mask is None or int(best_pixels) < int(min_component_pixels):
         meta["reason"] = "component_too_small"
@@ -198,6 +237,9 @@ def compute_walkable_component_mask_from_anchor_v1(
                     ny = int(y + dy)
                     if nx < 0 or ny < 0 or nx >= width or ny >= height:
                         continue
+                    # Keep map geometry conservative: do not expand through arbitrary colors.
+                    if int(frame[ny][nx]) != int(best_color):
+                        continue
                     expanded[ny][nx] = True
         dilated = expanded
 
@@ -205,6 +247,8 @@ def compute_walkable_component_mask_from_anchor_v1(
     meta["reason"] = "ok"
     meta["selected_color"] = int(best_color)
     meta["component_pixels"] = int(best_pixels)
+    meta["component_ratio"] = float(best_pixels) / float(frame_pixels)
+    meta["border_touch_pixels"] = int(best_border_touch)
     meta["dilated_pixels"] = int(_mask_pixels(dilated))
     return WalkableComponentResultV1(True, dilated, meta)
 
@@ -300,13 +344,18 @@ def build_navigation_map_snapshot_v1(
     agent_pos_xy: tuple[int, int] | None,
     movement_step_pixels: int | None = None,
     region_size: int = 8,
-    walkable_ratio_threshold: float = 0.02,
+    walkable_ratio_threshold: float = 0.08,
 ) -> dict[str, Any]:
+    resolved_region_size = int(max(4, int(region_size)))
+    if isinstance(movement_step_pixels, int) and int(movement_step_pixels) > 0:
+        inferred_region_size = int(round(float(movement_step_pixels) * 1.6))
+        resolved_region_size = int(min(12, max(6, inferred_region_size)))
+
     payload: dict[str, Any] = {
         "schema_name": "active_inference_navigation_map_snapshot_v1",
         "schema_version": 1,
         "enabled": False,
-        "region_size": int(region_size),
+        "region_size": int(resolved_region_size),
         "walkable_ratio_threshold": float(walkable_ratio_threshold),
         "movement_step_pixels_estimate": (
             int(movement_step_pixels)
@@ -332,6 +381,8 @@ def build_navigation_map_snapshot_v1(
         frame_any,
         anchor_x=int(ax),
         anchor_y=int(ay),
+        dilation_steps=0,
+        max_component_ratio=0.72,
     )
     payload["walkable_component_meta_v1"] = dict(component.meta)
     if not component.enabled or component.mask is None:
@@ -340,11 +391,11 @@ def build_navigation_map_snapshot_v1(
 
     payload["enabled"] = True
     payload["mask_digest"] = str(_mask_digest_v1(component.mask))
-    ratios = compute_region_walkable_ratio_v1(component.mask, region_size=int(region_size))
+    ratios = compute_region_walkable_ratio_v1(component.mask, region_size=int(resolved_region_size))
     payload["walkable_region_ratio_v1"] = {
         str(k): float(v) for (k, v) in ratios.items()
     }
-    adjacency = compute_region_adjacency_from_mask_v1(component.mask, region_size=int(region_size))
+    adjacency = compute_region_adjacency_from_mask_v1(component.mask, region_size=int(resolved_region_size))
     payload["walkable_region_adjacency_v1"] = {
         str(src): {str(dst): int(w) for (dst, w) in nbrs.items()}
         for (src, nbrs) in adjacency.items()
