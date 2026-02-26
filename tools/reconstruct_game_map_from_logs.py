@@ -56,6 +56,7 @@ class TraceStepInfo:
     action_counter: int
     agent_pos: tuple[int, int] | None  # (x, y)
     tracked_bbox: tuple[int, int, int, int] | None  # (x0, y0, x1, y1)
+    selected_action_id: int | None
 
 
 @dataclass
@@ -63,8 +64,61 @@ class ReconstructionResult:
     modal_frame: np.ndarray
     walkable_mask: np.ndarray
     agent_path_xy: list[tuple[int, int]]
+    action_path_steps: list[int]
+    action_path_ids: list[int]
     floor_color: int
     action_count: int
+
+
+def _estimate_action_step_pixels(agent_path_xy: list[tuple[int, int]]) -> int:
+    deltas: list[int] = []
+    for i in range(1, len(agent_path_xy)):
+        px, py = agent_path_xy[i - 1]
+        cx, cy = agent_path_xy[i]
+        d = int(abs(cx - px) + abs(cy - py))
+        if d > 0:
+            deltas.append(d)
+    if not deltas:
+        return 5
+    deltas.sort()
+    return int(max(1, deltas[len(deltas) // 2]))
+
+
+def _build_action_path_segments(
+    agent_path_xy: list[tuple[int, int]],
+    action_path_steps: list[int],
+    *,
+    width: int,
+    height: int,
+) -> list[list[tuple[float, float, int]]]:
+    if not agent_path_xy:
+        return []
+    step_pixels = int(max(1, _estimate_action_step_pixels(agent_path_xy)))
+    jump_threshold = int(max(10, step_pixels * 3))
+    segments: list[list[tuple[float, float, int]]] = []
+    current: list[tuple[float, float, int]] = []
+    prev_pos: tuple[int, int] | None = None
+    for idx, (x, y) in enumerate(agent_path_xy):
+        if not (0 <= x < width and 0 <= y < height):
+            if len(current) >= 1:
+                segments.append(current)
+            current = []
+            prev_pos = None
+            continue
+        step_id = int(action_path_steps[idx]) if idx < len(action_path_steps) else int(idx)
+        if prev_pos is not None:
+            dx = int(abs(x - prev_pos[0]))
+            dy = int(abs(y - prev_pos[1]))
+            manhattan = int(dx + dy)
+            if manhattan > jump_threshold:
+                if len(current) >= 1:
+                    segments.append(current)
+                current = []
+        current.append((float(x) + 0.5, float(y) + 0.5, int(step_id)))
+        prev_pos = (int(x), int(y))
+    if len(current) >= 1:
+        segments.append(current)
+    return segments
 
 
 def _load_recording_frames(recording_path: Path) -> list[np.ndarray]:
@@ -117,10 +171,21 @@ def _load_trace_steps(trace_path: Path) -> dict[int, TraceStepInfo]:
                 if x1 >= x0 and y1 >= y0:
                     tracked_bbox = (x0, y0, x1, y1)
 
+            selected_action_id: int | None = None
+            selected_candidate = row.get("selected_candidate") or {}
+            if isinstance(selected_candidate, dict):
+                raw_action_id = selected_candidate.get("action_id")
+                try:
+                    if raw_action_id is not None:
+                        selected_action_id = int(raw_action_id)
+                except (TypeError, ValueError):
+                    selected_action_id = None
+
             steps[int(action_counter)] = TraceStepInfo(
                 action_counter=int(action_counter),
                 agent_pos=agent_pos,
                 tracked_bbox=tracked_bbox,
+                selected_action_id=selected_action_id,
             )
     return steps
 
@@ -195,7 +260,19 @@ def _pick_floor_color(
 
     blocked_colors = set(v for v, _ in agent_colors.most_common(4))
     blocked_colors.update({8, 9, 10, 11, 12, 0, 1, 2, 5})  # dynamic/ui/void-like colors
+    blocked_colors.discard(3)
+    blocked_colors.discard(4)
     for color, _ in votes.most_common():
+        if color not in blocked_colors:
+            return int(color)
+
+    vals, freqs = np.unique(modal, return_counts=True)
+    freq_pairs = sorted(
+        ((int(v), int(c)) for v, c in zip(vals.tolist(), freqs.tolist())),
+        key=lambda p: p[1],
+        reverse=True,
+    )
+    for color, _ in freq_pairs:
         if color not in blocked_colors:
             return int(color)
 
@@ -242,11 +319,19 @@ def reconstruct_map(recording_path: Path, trace_path: Path) -> ReconstructionRes
     modal, agent_colors = _temporal_mode_excluding_agent(frames, trace_steps)
 
     agent_path_xy: list[tuple[int, int]] = []
+    action_path_steps: list[int] = []
+    action_path_ids: list[int] = []
     tracked_bboxes: list[tuple[int, int, int, int]] = []
     for i in range(len(frames)):
         step = trace_steps.get(i)
         if step and step.agent_pos:
             agent_path_xy.append(step.agent_pos)
+            action_path_steps.append(int(step.action_counter))
+            action_path_ids.append(
+                int(step.selected_action_id)
+                if step.selected_action_id is not None
+                else -1
+            )
         if step and step.tracked_bbox:
             tracked_bboxes.append(step.tracked_bbox)
 
@@ -259,6 +344,8 @@ def reconstruct_map(recording_path: Path, trace_path: Path) -> ReconstructionRes
         modal_frame=modal,
         walkable_mask=walkable,
         agent_path_xy=agent_path_xy,
+        action_path_steps=action_path_steps,
+        action_path_ids=action_path_ids,
         floor_color=int(floor_color),
         action_count=len(frames),
     )
@@ -309,20 +396,55 @@ def _draw_outputs(
     fig2.savefig(walkable_path, dpi=180)
     plt.close(fig2)
 
-    # 3) overlay trajectory
+    # 3) overlay trajectory (action-level path)
     fig3, ax3 = plt.subplots(figsize=(8, 8), constrained_layout=True)
     ax3.imshow(base_rgb, interpolation="nearest")
-    ys, xs = np.where(walk)
-    ax3.scatter(xs, ys, s=1.0, c="#71d7ff", alpha=0.08)
+    walk_alpha = np.zeros_like(walk, dtype=np.float32)
+    walk_alpha[walk] = 1.0
+    ax3.imshow(walk_alpha, cmap="Blues", interpolation="nearest", alpha=0.16)
     if result.agent_path_xy:
-        xs_path = np.array([p[0] for p in result.agent_path_xy], dtype=float)
-        ys_path = np.array([p[1] for p in result.agent_path_xy], dtype=float)
-        t = np.linspace(0.0, 1.0, len(xs_path))
-        ax3.scatter(xs_path, ys_path, c=t, cmap="autumn", s=9, alpha=0.9, linewidths=0)
-        ax3.scatter(xs_path[0], ys_path[0], c="lime", s=50, marker="o", label="start")
-        ax3.scatter(xs_path[-1], ys_path[-1], c="red", s=55, marker="X", label="end")
+        segments = _build_action_path_segments(
+            result.agent_path_xy,
+            result.action_path_steps,
+            width=int(base_rgb.shape[1]),
+            height=int(base_rgb.shape[0]),
+        )
+        all_points: list[tuple[float, float, int]] = []
+        for seg in segments:
+            if not seg:
+                continue
+            xs = np.array([p[0] for p in seg], dtype=float)
+            ys = np.array([p[1] for p in seg], dtype=float)
+            t = np.linspace(0.0, 1.0, len(xs))
+            ax3.plot(xs, ys, color="#ffd27a", linewidth=1.3, alpha=0.88)
+            ax3.scatter(
+                xs,
+                ys,
+                c=t,
+                cmap="autumn",
+                s=14,
+                alpha=0.95,
+                linewidths=0,
+                edgecolors="none",
+                label="action-step path" if not all_points else None,
+            )
+            all_points.extend(seg)
+            stride = max(1, len(seg) // 8)
+            for idx in range(0, len(seg), stride):
+                x, y, step_id = seg[idx]
+                ax3.text(
+                    x + 0.4,
+                    y - 0.4,
+                    str(int(step_id)),
+                    color="#ffeb99",
+                    fontsize=6,
+                    alpha=0.82,
+                )
+        if all_points:
+            ax3.scatter(all_points[0][0], all_points[0][1], c="lime", s=50, marker="o", label="start")
+            ax3.scatter(all_points[-1][0], all_points[-1][1], c="red", s=55, marker="X", label="end")
         ax3.legend(loc="upper right", framealpha=0.9)
-    ax3.set_title("Reconstructed Map + Agent Trajectory")
+    ax3.set_title("Reconstructed Map + Agent Action Path")
     ax3.set_xlabel("col y")
     ax3.set_ylabel("row x")
     ax3.set_xticks([])

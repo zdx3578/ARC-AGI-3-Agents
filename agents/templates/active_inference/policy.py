@@ -2954,12 +2954,26 @@ class ActiveInferencePolicyEvaluatorV1:
                         high_info_state_inner_loop_target_region = "NA"
 
         high_info_rows: list[dict[str, Any]] = []
+        high_info_unreachable_filtered = 0
+
+        def _high_info_target_unreachable(features: dict[str, Any]) -> bool:
+            if not isinstance(features, dict):
+                return True
+            if bool(features.get("target_is_unreachable_simultaneous", False)):
+                return True
+            route_after = int(features.get("target_route_distance_after", 10**6))
+            if route_after >= 10**6 and not bool(features.get("reaches_target_region", False)):
+                return True
+            return False
+
         for entry in entries:
             focus = self._candidate_high_info_focus_features(entry.candidate)
+            if _high_info_target_unreachable(focus):
+                high_info_unreachable_filtered += 1
+                continue
             is_reachable_change_target = bool(
                 int(entry.candidate.action_id) in (1, 2, 3, 4)
                 and bool(focus.get("target_is_reachable_simultaneous", False))
-                and not bool(focus.get("target_is_unreachable_simultaneous", False))
                 and int(max(0, focus.get("target_recent_change_pixels", 0))) > 0
             )
             is_high_info_active = bool(
@@ -2999,9 +3013,9 @@ class ActiveInferencePolicyEvaluatorV1:
                 return False
             if int(entry_obj.candidate.action_id) not in (1, 2, 3, 4):
                 return False
-            if not bool(features.get("target_is_reachable_simultaneous", False)):
+            if _high_info_target_unreachable(features):
                 return False
-            if bool(features.get("target_is_unreachable_simultaneous", False)):
+            if not bool(features.get("target_is_reachable_simultaneous", False)):
                 return False
             has_fresh_diff = int(max(0, features.get("target_recent_change_pixels", 0))) > 0
             in_novelty_cycle = bool(
@@ -3416,6 +3430,7 @@ class ActiveInferencePolicyEvaluatorV1:
             "high_info_focus_hard_priority_available": bool(
                 high_info_focus_hard_priority_available
             ),
+            "high_info_unreachable_filtered_count": int(high_info_unreachable_filtered),
             "high_info_after_first_pass_gate_open": bool(high_info_after_first_pass_gate_open),
             "high_info_release_action_counter": int(high_info_release_action_counter),
             "high_info_state_active": bool(high_info_state_active),

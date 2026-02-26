@@ -6398,12 +6398,8 @@ class ActiveInferenceEFE(Agent):
                 ):
                     continue
                 reachable_or_frontier = bool(_reachable_or_frontier_region_v1(str(region_key)))
-                if (
-                    (not reachable_or_frontier)
-                    and region_key not in simultaneous_priority_set
-                    and region_key not in coupled_region_keys
-                    and region_key not in region_event_priority_keys
-                ):
+                # Hard gate: unreachable regions do not enter high-info planning queue.
+                if not reachable_or_frontier:
                     continue
                 score_value = float(score)
                 if score_value <= 0.0:
@@ -6455,20 +6451,15 @@ class ActiveInferenceEFE(Agent):
                     adjusted_score = float(adjusted_score + 0.36)
                 if (not reachable_or_frontier) and region_key in coupled_region_keys:
                     adjusted_score = float(adjusted_score - 0.18)
-                route_distance = int(
+                route_distance_graph = int(
                     self._region_route_distance_v1(
                         region_adjacency,
                         start_region_key=str(anchor_region_key),
                         goal_region_key=str(region_key),
                     )
                 )
-                if route_distance >= 10**6:
-                    route_distance = int(
-                        self._region_distance_v1(
-                            str(anchor_region_key),
-                            str(region_key),
-                        )
-                    )
+                if route_distance_graph >= 10**6:
+                    continue
                 rows.append(
                     (
                         0 if sudden_priority_active else 1,
@@ -6481,7 +6472,7 @@ class ActiveInferenceEFE(Agent):
                         int(completed_priority),
                         float(-dynamic_change_score),
                         float(-adjusted_score),
-                        int(route_distance),
+                        int(route_distance_graph),
                         int(self._region_visit_counts.get(region_key, 0)),
                         region_key,
                     )
