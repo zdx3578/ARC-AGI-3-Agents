@@ -6,6 +6,7 @@ import math
 import os
 import traceback
 import uuid
+from pathlib import Path
 from typing import Any
 
 from arcengine import FrameData, GameAction, GameState
@@ -35,6 +36,7 @@ from .representation import (
     build_observation_packet_v1,
     build_representation_state_v1,
 )
+from .navigation_audit_v1 import run_navigation_map_audit_v1
 from .navigation_map_v1 import build_navigation_map_snapshot_v1
 from .trace import ActiveInferenceTraceRecorderV1
 
@@ -709,6 +711,20 @@ class ActiveInferenceEFE(Agent):
         self.trace_enabled = _cfg_bool("ACTIVE_INFERENCE_TRACE_ENABLED", True)
         self.trace_recorder: ActiveInferenceTraceRecorderV1 | None = None
         self._trace_closed = False
+        self.navigation_map_audit_enabled = _cfg_bool(
+            "ACTIVE_INFERENCE_NAVIGATION_MAP_AUDIT_ENABLED",
+            True,
+        )
+        self.navigation_map_audit_subdir = str(
+            _cfg_value("ACTIVE_INFERENCE_NAVIGATION_MAP_AUDIT_SUBDIR", "navigation_checks")
+        )
+        self._latest_navigation_map_snapshot_v1: dict[str, Any] = {}
+        self._latest_navigation_map_audit_v1: dict[str, Any] = {
+            "schema_name": "active_inference_navigation_map_audit_v1",
+            "schema_version": 1,
+            "enabled": False,
+            "reason": "uninitialized",
+        }
         if self.trace_enabled:
             trace_root = get_runtime_str("RECORDINGS_DIR", "recordings", section="runtime")
             self.trace_recorder = ActiveInferenceTraceRecorderV1(
@@ -11227,6 +11243,9 @@ class ActiveInferenceEFE(Agent):
                             region_size=8,
                             walkable_ratio_threshold=0.02,
                         )
+                        self._latest_navigation_map_snapshot_v1 = dict(
+                            navigation_map_snapshot_v1
+                        )
                         for candidate in candidates:
                             action_key = str(int(candidate.action_id))
                             action_posterior = dict(control_schema.get(action_key, {}))
@@ -11596,7 +11615,88 @@ class ActiveInferenceEFE(Agent):
 
         return action
 
+    def _navigation_map_audit_run_name_v1(self) -> str:
+        if self.trace_recorder is not None:
+            try:
+                trace_path = Path(str(self.trace_recorder.path)).resolve()
+                filename = str(trace_path.name)
+                if filename.endswith(".trace.jsonl"):
+                    filename = filename[: -len(".trace.jsonl")]
+                elif filename.endswith(".jsonl"):
+                    filename = filename[: -len(".jsonl")]
+                if filename:
+                    safe = "".join(
+                        ch if (ch.isalnum() or ch in "._-") else "_"
+                        for ch in str(filename)
+                    ).strip("._-")
+                    if safe:
+                        return str(safe)
+            except Exception:
+                pass
+        fallback = f"{str(self.game_id)}.{str(self.card_id)}.{int(self.action_counter)}"
+        return "".join(
+            ch if (ch.isalnum() or ch in "._-") else "_"
+            for ch in str(fallback)
+        ).strip("._-") or "navigation_map_audit"
+
+    def _navigation_map_audit_anchor_xy_v1(self) -> tuple[int, int] | None:
+        if self._previous_representation is not None:
+            try:
+                anchor_xy = self._current_agent_position_xy_v1(
+                    self._previous_representation
+                )
+                if anchor_xy is not None:
+                    return (int(anchor_xy[0]), int(anchor_xy[1]))
+            except Exception:
+                pass
+        latest = (
+            self._latest_navigation_state_estimate
+            if isinstance(self._latest_navigation_state_estimate, dict)
+            else {}
+        )
+        pos = latest.get("agent_pos_xy", {})
+        if isinstance(pos, dict):
+            x = int(pos.get("x", -1))
+            y = int(pos.get("y", -1))
+            if x >= 0 and y >= 0:
+                return (int(x), int(y))
+        return None
+
+    def _run_navigation_map_audit_on_cleanup_v1(self) -> dict[str, Any]:
+        disabled_summary: dict[str, Any] = {
+            "schema_name": "active_inference_navigation_map_audit_v1",
+            "schema_version": 1,
+            "enabled": False,
+            "reason": "disabled",
+        }
+        if not bool(self.navigation_map_audit_enabled):
+            self._latest_navigation_map_audit_v1 = dict(disabled_summary)
+            self._latest_navigation_map_audit_v1["reason"] = "disabled_by_config"
+            return dict(self._latest_navigation_map_audit_v1)
+        packet = self._previous_packet
+        if packet is None or not packet.frame:
+            self._latest_navigation_map_audit_v1 = dict(disabled_summary)
+            self._latest_navigation_map_audit_v1["reason"] = "missing_frame"
+            return dict(self._latest_navigation_map_audit_v1)
+        anchor_xy = self._navigation_map_audit_anchor_xy_v1()
+        recordings_root = Path(
+            get_runtime_str("RECORDINGS_DIR", "recordings", section="runtime")
+        ).resolve()
+        subdir_raw = str(self.navigation_map_audit_subdir).strip()
+        subdir_clean = subdir_raw.strip("/\\") or "navigation_checks"
+        output_dir = (recordings_root / subdir_clean).resolve()
+        summary = run_navigation_map_audit_v1(
+            frame_any=packet.frame,
+            anchor_xy=anchor_xy,
+            navigation_map_snapshot_v1=dict(self._latest_navigation_map_snapshot_v1),
+            output_dir=output_dir,
+            run_name=self._navigation_map_audit_run_name_v1(),
+        )
+        self._latest_navigation_map_audit_v1 = dict(summary)
+        return dict(self._latest_navigation_map_audit_v1)
+
     def cleanup(self, scorecard: Any = None) -> None:
+        final_navigation_map_audit_v1 = self._run_navigation_map_audit_on_cleanup_v1()
         if self.trace_recorder is not None and not self._trace_closed:
             self.trace_recorder.write(
                 {
@@ -11636,6 +11736,12 @@ class ActiveInferenceEFE(Agent):
                     ),
                     "final_navigation_state_estimate_v1": dict(
                         self._latest_navigation_state_estimate
+                    ),
+                    "final_navigation_map_snapshot_v1": dict(
+                        self._latest_navigation_map_snapshot_v1
+                    ),
+                    "final_navigation_map_audit_v1": dict(
+                        final_navigation_map_audit_v1
                     ),
                     "final_transition_record_previous_step_v1": dict(
                         self._latest_transition_record

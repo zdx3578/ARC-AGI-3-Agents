@@ -66,8 +66,25 @@
   - `frontier_target_region_key`
   - `recommended_action_id`
   - `reason`
+- `final_navigation_map_audit_v1`
+  - `anchor`（行x列y）
+  - `pixel_diameter.distance_steps`
+  - `pixel_diameter.point_a / point_b`（行x列y）
+  - `region_diameter.distance_steps`
+  - `region_diameter.point_a / point_b`（行x列y + region_key）
+  - `map_png_path`
+  - `summary_json_path`
 
-## 6. 结构约束
+## 6. 每次实验关键检查点（强制）
+- 每次实验结束必须自动产出导航检查文件（程序内自动执行）：
+  - `recordings/navigation_checks/<run_name>_navigation_map_check.png`
+  - `recordings/navigation_checks/<run_name>_navigation_map_check.summary.json`
+- 必须检查并输出“最远两点距离”：
+  - 像素级最远两点最短路径距离（`pixel_diameter.distance_steps`）
+  - 区域级最远两点最短路径距离（`region_diameter.distance_steps`）
+- 对外报告坐标统一使用**行x列y**，禁止 `(line y)` 等旧格式。
+
+## 7. 结构约束
 - EFE / high-info / sequence 模块**不能**直接实现坐标解析、BFS、frontier 排序。
 - 这些模块只允许：
   - 提交目标（目标区域）
@@ -75,14 +92,16 @@
 - 导航子系统可被完整替换（同接口）而不影响 EFE 逻辑。
 - `policy` 的 prepass 入口只能调用 `nav_prepass_v1`，禁止保留旧的内联 BFS/serpentine 选择路径。
 
-## 7. 当前实现状态
+## 8. 当前实现状态
 - 已新增独立模块：
   - `agents/templates/active_inference/navigation_map_v1.py`
   - `agents/templates/active_inference/nav_prepass_v1.py`
+  - `agents/templates/active_inference/navigation_audit_v1.py`
 - 已接入：
   - `agent.py` 注入 `navigation_map_snapshot_v1`
+  - `agent.py` 在 cleanup 自动执行 `navigation_map_audit_v1` 并写入最终 trace
   - `policy.py` prepass 仅调用 `nav_prepass_v1`（旧 prepass 内联路由代码已删除）
 
-## 8. 下一步迁移
+## 9. 下一步迁移
 - 把历史 8x8 coarse region 全部迁移到“agent 行动单位网格（在线估计步长）”。
 - 迁移完成前，所有尺度不一致必须在 trace 中显式记录，不允许隐式混用。
