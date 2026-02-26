@@ -2050,6 +2050,9 @@ class ActiveInferencePolicyEvaluatorV1:
             "target_route_distance_after": int(
                 raw.get("target_route_distance_after", 10**6)
             ),
+            "target_route_distance_cap": int(
+                max(0, raw.get("target_route_distance_cap", 0))
+            ),
             "alternate_coupled_distance": int(
                 raw.get("alternate_coupled_distance", 10**6)
             ),
@@ -2962,7 +2965,10 @@ class ActiveInferencePolicyEvaluatorV1:
             if bool(features.get("target_is_unreachable_simultaneous", False)):
                 return True
             route_after = int(features.get("target_route_distance_after", 10**6))
-            if route_after >= 10**6 and not bool(features.get("reaches_target_region", False)):
+            route_cap = int(max(0, features.get("target_route_distance_cap", 0)))
+            if int(route_after) > int(route_cap) and not bool(
+                features.get("reaches_target_region", False)
+            ):
                 return True
             return False
 

@@ -2374,6 +2374,42 @@ class ActiveInferenceEFE(Agent):
                 queue.append((str(neighbor), int(next_distance)))
         return 10**6
 
+    def _region_graph_max_pair_distance_v1(
+        self,
+        adjacency: dict[str, dict[str, int]],
+    ) -> int:
+        if not isinstance(adjacency, dict) or not adjacency:
+            return 0
+        nodes = [
+            str(node)
+            for node in adjacency.keys()
+            if self._parse_region_key_v1(str(node)) is not None
+        ]
+        if not nodes:
+            return 0
+        max_distance = 0
+        for start_key in nodes:
+            queue: list[tuple[str, int]] = [(str(start_key), 0)]
+            visited: set[str] = {str(start_key)}
+            cursor = 0
+            while cursor < len(queue):
+                node, distance = queue[cursor]
+                cursor += 1
+                if int(distance) > int(max_distance):
+                    max_distance = int(distance)
+                neighbors = adjacency.get(str(node), {})
+                if not isinstance(neighbors, dict):
+                    continue
+                for neighbor_key in neighbors.keys():
+                    neighbor = str(neighbor_key)
+                    if self._parse_region_key_v1(neighbor) is None:
+                        continue
+                    if neighbor in visited:
+                        continue
+                    visited.add(neighbor)
+                    queue.append((neighbor, int(distance + 1)))
+        return int(max_distance)
+
     def _changed_region_diff_map_v1(
         self,
         *,
@@ -4186,6 +4222,9 @@ class ActiveInferenceEFE(Agent):
             and str(raw_current_region_key) != str(predicted_current_region_key)
         )
         region_adjacency = self._region_graph_adjacency_v1(min_edge_count=1)
+        route_distance_cap = int(
+            max(0, self._region_graph_max_pair_distance_v1(region_adjacency))
+        )
         route_distance_before = int(
             self._region_route_distance_v1(
                 region_adjacency,
@@ -4503,6 +4542,7 @@ class ActiveInferenceEFE(Agent):
             "distance_delta": int(distance_delta),
             "target_route_distance_before": int(route_distance_before),
             "target_route_distance_after": int(route_distance_after),
+            "target_route_distance_cap": int(route_distance_cap),
             "alternate_coupled_distance": int(alternate_coupled_distance),
             "moves_toward_target_region": bool(moves_toward_target),
             "moves_away_target_region": bool(moves_away_target),
@@ -6385,6 +6425,9 @@ class ActiveInferenceEFE(Agent):
             sample_counts: dict[str, int],
         ) -> list[str]:
             current_target = str(state.get("current_target_region_key", "NA"))
+            route_distance_cap = int(
+                max(0, self._region_graph_max_pair_distance_v1(region_adjacency))
+            )
             rows: list[
                 tuple[int, int, int, int, int, int, int, int, float, float, int, int, str]
             ] = []
@@ -6458,7 +6501,7 @@ class ActiveInferenceEFE(Agent):
                         goal_region_key=str(region_key),
                     )
                 )
-                if route_distance_graph >= 10**6:
+                if int(route_distance_graph) > int(route_distance_cap):
                     continue
                 rows.append(
                     (

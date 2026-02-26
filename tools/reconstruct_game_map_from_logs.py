@@ -90,6 +90,7 @@ def _build_action_path_segments(
     *,
     width: int,
     height: int,
+    walkable_mask: np.ndarray | None = None,
 ) -> list[list[tuple[float, float, int]]]:
     if not agent_path_xy:
         return []
@@ -100,6 +101,16 @@ def _build_action_path_segments(
     prev_pos: tuple[int, int] | None = None
     for idx, (x, y) in enumerate(agent_path_xy):
         if not (0 <= x < width and 0 <= y < height):
+            if len(current) >= 1:
+                segments.append(current)
+            current = []
+            prev_pos = None
+            continue
+        if (
+            isinstance(walkable_mask, np.ndarray)
+            and walkable_mask.ndim == 2
+            and not bool(walkable_mask[y, x])
+        ):
             if len(current) >= 1:
                 segments.append(current)
             current = []
@@ -408,6 +419,7 @@ def _draw_outputs(
             result.action_path_steps,
             width=int(base_rgb.shape[1]),
             height=int(base_rgb.shape[0]),
+            walkable_mask=walk,
         )
         all_points: list[tuple[float, float, int]] = []
         for seg in segments:
@@ -415,31 +427,15 @@ def _draw_outputs(
                 continue
             xs = np.array([p[0] for p in seg], dtype=float)
             ys = np.array([p[1] for p in seg], dtype=float)
-            t = np.linspace(0.0, 1.0, len(xs))
-            ax3.plot(xs, ys, color="#ffd27a", linewidth=1.3, alpha=0.88)
-            ax3.scatter(
+            ax3.plot(
                 xs,
                 ys,
-                c=t,
-                cmap="autumn",
-                s=14,
-                alpha=0.95,
-                linewidths=0,
-                edgecolors="none",
+                color="#ffd27a",
+                linewidth=1.5,
+                alpha=0.92,
                 label="action-step path" if not all_points else None,
             )
             all_points.extend(seg)
-            stride = max(1, len(seg) // 8)
-            for idx in range(0, len(seg), stride):
-                x, y, step_id = seg[idx]
-                ax3.text(
-                    x + 0.4,
-                    y - 0.4,
-                    str(int(step_id)),
-                    color="#ffeb99",
-                    fontsize=6,
-                    alpha=0.82,
-                )
         if all_points:
             ax3.scatter(all_points[0][0], all_points[0][1], c="lime", s=50, marker="o", label="start")
             ax3.scatter(all_points[-1][0], all_points[-1][1], c="red", s=55, marker="X", label="end")
