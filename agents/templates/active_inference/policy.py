@@ -10,6 +10,7 @@ from .contracts import (
     ObservationPacketV1,
     RepresentationStateV1,
 )
+from .nav_prepass_v1 import NavPrepassConfigV1, select_prepass_recommended_action_v1
 from .efe import (
     compute_risk_kl_v1,
     determine_phase_v1,
@@ -767,6 +768,40 @@ class ActiveInferencePolicyEvaluatorV1:
         if not navigation_entries:
             diagnostics["mode"] = "no_navigation_candidates"
             return None, diagnostics
+
+        nav_action_id, nav_prepass_diagnostics = select_prepass_recommended_action_v1(
+            entries,
+            config=NavPrepassConfigV1(
+                region_size=8,
+                walkable_ratio_threshold=0.02,
+                frontier_block_attempts_threshold=3,
+                frontier_blocked_rate_threshold=0.75,
+            ),
+        )
+        diagnostics["nav_prepass_diagnostics_v1"] = dict(nav_prepass_diagnostics)
+        if int(nav_action_id) in (1, 2, 3, 4):
+            diagnostics["enabled"] = True
+            diagnostics["mode"] = "nav_prepass_v1"
+            diagnostics["goal_region_key"] = str(
+                nav_prepass_diagnostics.get(
+                    "frontier_parent_region_key",
+                    diagnostics.get("goal_region_key", "NA"),
+                )
+            )
+            diagnostics["next_region_key"] = str(
+                nav_prepass_diagnostics.get(
+                    "next_region_key",
+                    diagnostics.get("next_region_key", "NA"),
+                )
+            )
+            matching = [
+                entry
+                for entry in navigation_entries
+                if int(entry.candidate.action_id) == int(nav_action_id)
+            ]
+            if matching:
+                selected = min(matching, key=lambda e: float(e.total_efe))
+                return selected, diagnostics
 
         predicted_stats_by_candidate_id: dict[str, dict[str, Any]] = {
             str(entry.candidate.candidate_id): self._candidate_predicted_region_stats(

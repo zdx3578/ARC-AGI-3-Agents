@@ -35,6 +35,7 @@ from .representation import (
     build_observation_packet_v1,
     build_representation_state_v1,
 )
+from .navigation_map_v1 import build_navigation_map_snapshot_v1
 from .trace import ActiveInferenceTraceRecorderV1
 
 
@@ -11171,6 +11172,15 @@ class ActiveInferenceEFE(Agent):
                             max_regions=12
                         )
                         region_graph_snapshot = self._region_graph_snapshot_v1()
+                        agent_pos_xy_for_nav_map = self._current_agent_position_xy_v1(
+                            representation
+                        )
+                        navigation_map_snapshot_v1 = build_navigation_map_snapshot_v1(
+                            packet.frame,
+                            agent_pos_xy=agent_pos_xy_for_nav_map,
+                            region_size=8,
+                            walkable_ratio_threshold=0.02,
+                        )
                         for candidate in candidates:
                             action_key = str(int(candidate.action_id))
                             action_posterior = dict(control_schema.get(action_key, {}))
@@ -11248,6 +11258,9 @@ class ActiveInferenceEFE(Agent):
                                 )
                                 candidate.metadata["region_graph_snapshot_v1"] = dict(
                                     region_graph_snapshot
+                                )
+                                candidate.metadata["navigation_map_snapshot_v1"] = dict(
+                                    navigation_map_snapshot_v1
                                 )
                             else:
                                 candidate.metadata["orientation_alignment_features_v1"] = (
