@@ -12,15 +12,16 @@
 ## 1. 状态机定义（单步）
 
 1. `S0_PREPARE_CONTEXT`：构建 pre-state 上下文（位置、区域、对象、导航态）。
-2. `S1_PROBE_REACHABLE`：执行动作可达探测（局部 1..4 动作证据累积）。
+2. `S1_PROBE_REACHABLE`：执行 `Reachability Probe（动作可达探测）`（局部 1..4 动作证据累积）。
 3. `S2_FILL_EXPANSION`：基于“已证实可达区域 + 同色连通 + 可行约束”做 fill 扩展。
 4. `S3_QUERY_ADCIM`：对每个候选动作查询双通道影响预测。
 5. `S4_SELECT_ACTION`：策略层融合门控规则 + RRFE + ADCIM 分数选动作。
 6. `S5_EXECUTE_AND_OBSERVE`：执行动作并获取 post-state。
-7. `S6_UPDATE_MODELS`：更新 RRFE 置信与 ADCIM 双通道统计。
-8. `S7_LOG_AND_VERIFY`：落盘诊断并执行一致性检查。
+7. `S6_VALIDATE_FILL`：基于执行观测验证 fill 扩展区域，标记真实命中与误扩展。
+8. `S7_UPDATE_MODELS`：更新 RRFE 置信与 ADCIM 双通道统计，必要时回收（reclaim）误扩展区域。
+9. `S8_LOG_AND_AUDIT`：落盘诊断并执行一致性检查。
 
-状态转移：`S0 -> S1 -> S2 -> S3 -> S4 -> S5 -> S6 -> S7`，任何失败进入 `FALLBACK_SAFE_PATH`。
+状态转移：`S0 -> S1 -> S2 -> S3 -> S4 -> S5 -> S6 -> S7 -> S8`，任何失败进入 `FALLBACK_SAFE_PATH`。
 
 ## 2. 关键数据结构
 
@@ -29,6 +30,7 @@
 1. `nav_reachable_seed_map_v1`：动作证实可达区域种子集合。
 2. `nav_same_color_fill_map_v1`：同色 fill 扩展得到的候选可行区域。
 3. `nav_fill_confidence_stats_v1`：扩展区域的命中率、误扩展率、回收计数。
+4. `nav_fill_verify_reclaim_buffer_v1`：验证窗口、误扩展计数、回收原因、重探测触发位。
 
 ### 2.2 双通道上下文键 `action_impact_context_key_v1`
 
@@ -79,6 +81,13 @@
    - 不跨越明显 UI/背景隔离边界。
 4. 扩展区域写入 `nav_same_color_fill_map_v1`，并附置信分数。
 
+### 3.1.1 fill 扩展↔验证↔回收闭环
+
+1. `Validate`：在 `S6_VALIDATE_FILL` 中根据 `post_state` 判断扩展区域是否被动作证据支持。
+2. `Reclaim`：若区域连续验证失败（`miss_count >= NAV_FILL_RECLAIM_MISS_THRESHOLD`），则回收区域并降置信。
+3. `Re-probe`：发生回收后，将 `reprobe_required=true` 写入 `nav_fill_verify_reclaim_buffer_v1`，下一步强制进入 `S1_PROBE_REACHABLE`。
+4. `Audit`：每次闭环必须落盘 `loop_stage_before/after`、`reclaim_reason`、`reclaimed_regions`。
+
 ### 3.2 ADCIM 预测阶段（`S3_QUERY_ADCIM`）
 
 1. 用 `action_impact_context_key_v1` 检索历史统计。
@@ -99,16 +108,17 @@
 2. high-info 阶段允许 RRFE/ADCIM 调整 seek/value 分支排序。
 3. sequence 阶段允许 RRFE/ADCIM 提供 verify/seek 可信度。
 
-### 3.4 更新阶段（`S6_UPDATE_MODELS`）
+### 3.4 更新阶段（`S6_VALIDATE_FILL` + `S7_UPDATE_MODELS`）
 
-1. 根据执行结果更新 `nav_reachable_seed_map_v1` 与 `nav_fill_confidence_stats_v1`。
-2. 对 pre/post 差分生成双通道观测标签并更新统计：
+1. 在 `S6_VALIDATE_FILL` 先更新 fill 验证窗口，产出 `validated_regions` 与 `false_expanded_regions`。
+2. 在 `S7_UPDATE_MODELS` 根据验证结果更新 `nav_reachable_seed_map_v1` 与 `nav_fill_confidence_stats_v1`。
+3. 对 pre/post 差分生成双通道观测标签并更新统计：
    - `count += 1`
    - `confidence_nav = ema(...)`
    - `confidence_game = ema(...)`
-3. 连续 miss 超阈值时：
+4. 连续 miss 超阈值时：
    - 降低上下文键权重
-   - 回收低置信 fill 扩展区域
+   - 回收低置信 fill 扩展区域并写入 `reclaim_reason`
    - 触发短期回退标记
 
 ## 4. 回退与保护
@@ -124,28 +134,31 @@
 1. `nav_reachable_probe_v1`
 2. `nav_same_color_fill_expansion_v1`
 3. `nav_fill_confidence_update_v1`
-4. `action_dual_channel_prediction_v1`
-5. `action_navigation_effect_observed_v1`
-6. `action_game_effect_observed_v1`
-7. `action_dual_channel_update_v1`
-8. `action_dual_channel_fallback_reason_v1`
+4. `nav_fill_verify_reclaim_v1`
+5. `action_dual_channel_prediction_v1`
+6. `action_navigation_effect_observed_v1`
+7. `action_game_effect_observed_v1`
+8. `action_dual_channel_update_v1`
+9. `action_dual_channel_fallback_reason_v1`
 
 ## 6. 默认参数（初版建议）
 
 1. `NAV_REACHABLE_PROBE_MIN_STEPS=6`
 2. `NAV_SAME_COLOR_FILL_MAX_RADIUS=3`
 3. `NAV_FILL_MIN_CONFIDENCE=0.45`
-4. `ACTION_IMPACT_MIN_SAMPLES=6`
-5. `ACTION_IMPACT_CONFIDENCE_ALPHA=0.2`
-6. `ACTION_IMPACT_LOW_CONFIDENCE_THRESHOLD=0.35`
-7. `ACTION_IMPACT_MISS_WINDOW=8`
+4. `NAV_FILL_VERIFY_WINDOW=6`
+5. `NAV_FILL_RECLAIM_MISS_THRESHOLD=3`
+6. `ACTION_IMPACT_MIN_SAMPLES=6`
+7. `ACTION_IMPACT_CONFIDENCE_ALPHA=0.2`
+8. `ACTION_IMPACT_LOW_CONFIDENCE_THRESHOLD=0.35`
+9. `ACTION_IMPACT_MISS_WINDOW=8`
 
 ## 7. 逻辑验收检查点（映射 P6）
 
-1. 每步均有“可达探测 -> fill 扩展 -> 双通道预测 -> 执行 -> 双通道更新”链路。
+1. 每步均有“可达探测 -> fill 扩展 -> 执行验证 -> 回收判定 -> 双通道更新”链路。
 2. prepass 阶段不存在 RRFE/ADCIM 越权改写门控顺序。
 3. 低置信/冷启动/误扩展/漂移回退路径可触发且可观测。
-4. 诊断字段覆盖“探测-扩展-预测-执行-偏差-回退”完整链路。
+4. 诊断字段覆盖“探测-扩展-验证-回收-预测-执行-偏差-回退”完整链路。
 
 ## 8. 本阶段完成标准
 

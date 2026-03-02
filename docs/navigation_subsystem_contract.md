@@ -67,7 +67,25 @@
 3. 禁止穿越已确认阻塞边。
 4. 禁止跨越 UI/背景隔离边界。
 
-### 4.4 Reachability
+### 4.4 Fill Validation & Reclaim Loop（fill 验证与回收闭环）
+
+输入：`fill_expanded_regions`、执行后观测结果、验证窗口状态。
+输出：
+
+- `validated_regions`
+- `false_expanded_regions`
+- `reclaimed_regions`
+- `reprobe_required`
+- `reclaim_reason_codes`
+
+闭环规则（强制）：
+
+1. 每步必须执行一次 fill 验证，不允许只做扩展不做验证。
+2. 若误扩展累计超阈值，必须立即回收并降置信。
+3. 发生回收后下一步必须触发 `Reachability Probe（动作可达探测）` 重探测。
+4. 回收原因码必须落盘并可审计。
+
+### 4.5 Reachability
 
 输入：当前区域、几何邻接图、`fill_expanded_regions`。  
 输出：
@@ -76,24 +94,24 @@
 - 距离（BFS hops）
 - next step
 
-### 4.5 Planner
+### 4.6 Planner
 
 输入：目标区域。  
 输出：下一动作（1..4）与路径证据。
 
-### 4.6 Frontier Coverage
+### 4.7 Frontier Coverage
 
 输入：已知区域、可达图、blocked 统计、fill 扩展状态。  
 输出：frontier 候选、选中目标、进入动作。
 
-### 4.7 边界确认规则（强制）
+### 4.8 边界确认规则（强制）
 
 - 任何 `行x列y + 动作(1..4)` 的边界/障碍结论，必须由**至少 2 次阻塞尝试**确认后才可标记为“已确认阻塞”。
 - “已确认阻塞”不是永久封闭：必须保留**周期性复探**（默认每 24 步复探一次），避免把后续可打开出口永久封死。
 - prepass 覆盖阶段至少保证：可达区域访问次数达到 `>=2`（默认值）后才视为覆盖完成。
 - fill 扩展区域若连续验证失败，必须回收（reclaim）并降置信。
 
-### 4.8 目标移动（Goal Move）
+### 4.9 目标移动（Goal Move）
 
 输入：目标区域（由 high-info / sequence 模块给出）。  
 输出：可达则规划移动；不可达则返回失败原因并回退到 frontier。
@@ -117,6 +135,12 @@
   - `fill_precision`
   - `fill_false_positive_rate`
   - `reclaimed_regions`
+- `nav_fill_verify_reclaim_v1`
+  - `validated_regions`
+  - `false_expanded_regions`
+  - `reprobe_required`
+  - `reclaim_reason_codes`
+  - `loop_completion_rate`
 - `nav_prepass_diagnostics_v1`
   - `adjacency_source`
   - `frontier_candidate_count`
@@ -139,6 +163,7 @@
   - `recordings/navigation_checks/<run_name>_navigation_map_check.png`
   - `recordings/navigation_checks/<run_name>_navigation_map_check.summary.json`
   - `recordings/navigation_checks/<run_name>_fill_expansion.summary.json`
+  - `recordings/navigation_checks/<run_name>_fill_verify_reclaim.summary.json`
 - 必须检查并输出“最远两点距离”：
   - 像素级最远两点最短路径距离（`pixel_diameter.distance_steps`）
   - 区域级最远两点最短路径距离（`region_diameter.distance_steps`）
@@ -146,6 +171,8 @@
   - `fill_expansion_precision`
   - `fill_expansion_false_positive_rate`
   - `fill_reclaim_count`
+  - `fill_verify_reclaim_loop_completion_rate`
+  - `fill_reprobe_recovery_rate`
 - 对外报告坐标统一使用**行x列y**，禁止 `(line y)` 等旧格式。
 
 ### 6.1 覆盖闸门验证（强制）
@@ -187,7 +214,7 @@
   - `agent.py` 在 cleanup 自动执行 `navigation_map_audit_v1` 并写入最终 trace
   - `policy.py` prepass 仅调用 `nav_prepass_v1`（旧 prepass 内联路由代码已删除）
 - 待补齐：
-  - 动作可达探测与同色 fill 扩展（RRFE）专用字段与回收机制
+  - 动作可达探测与同色 fill 扩展（RRFE）专用字段与验证回收闭环实现
 
 ## 9. 下一步迁移
 

@@ -30,6 +30,7 @@
 - `RELEASE_BASELINE`：版本快照标记（`v111`、`v113`）。
 - `STABILITY_PATCH`：不引入新架构边界的稳定性补丁。
 - `NAV_FILL_MODEL`：动作可达探测 + 同色 fill 扩展（RRFE）能力轨道（当前作为新增需求，待后续提交填充）。
+- `NAV_FILL_CLOSED_LOOP`：`Reachability Probe（动作可达探测） + fill 扩展↔验证↔回收` 闭环能力轨道（当前作为新增需求，待后续提交填充）。
 - `ACTION_DUAL_IMPACT_MODEL`：动作影响双通道建模（ADCIM）能力轨道（当前作为新增需求，待后续提交填充）。
 
 ## `main..HEAD` 提交映射（v1）
@@ -80,7 +81,7 @@
 1. 已完成 `main..HEAD` 全量提交的能力轨道映射。
 2. 代码锚点目前是候选级，需要进一步补到逐提交行号级。
 3. 证据列仍需回填关键 trace/命令记录。
-4. `NAV_FILL_MODEL` 与 `ACTION_DUAL_IMPACT_MODEL` 轨道尚无历史提交，已在 P1~P4 设计阶段立项，待代码阶段补齐。
+4. `NAV_FILL_MODEL`、`NAV_FILL_CLOSED_LOOP` 与 `ACTION_DUAL_IMPACT_MODEL` 轨道尚无历史提交，已在 P1~P4 设计阶段立项，待代码阶段补齐。
 
 ## P0 关闭标准
 

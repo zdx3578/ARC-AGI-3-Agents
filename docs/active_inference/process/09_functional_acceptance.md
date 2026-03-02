@@ -22,6 +22,9 @@
 2. `fill_expansion_precision`
 3. `fill_expansion_false_positive_rate`
 4. `route_success_rate_on_expanded_regions`
+5. `fill_verify_reclaim_loop_completion_rate`
+6. `fill_reclaim_precision`
+7. `reclaim_to_reprobe_recovery_rate`
 
 ## 3. ADCIM 双通道指标
 
@@ -42,8 +45,9 @@
 
 1. `levels_completed` 不下降。
 2. `fill_expansion_precision` 提升且 `fill_expansion_false_positive_rate` 不恶化。
-3. `navigation_effect_prediction_hit_rate` 与 `game_effect_prediction_hit_rate` 至少一项提升，且另一项不显著退化。
-4. 若出现指标冲突，以“通关能力不退化 + 伪可达扩展不恶化”为硬约束，再做权衡。
+3. `fill_verify_reclaim_loop_completion_rate` 达到目标阈值（建议 `>=0.9`）。
+4. `navigation_effect_prediction_hit_rate` 与 `game_effect_prediction_hit_rate` 至少一项提升，且另一项不显著退化。
+5. 若出现指标冲突，以“通关能力不退化 + 伪可达扩展不恶化 + 闭环不失效”为硬约束，再做权衡。
 
 ## 6. 证据记录
 

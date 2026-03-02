@@ -27,9 +27,10 @@
 1. 禁止游戏耦合硬编码：禁止固定 region 字面量，禁止固定 5x5 步长假设。
 2. prepass 先于利用：覆盖 prepass 是进入 high-info 利用前的硬门控。
 3. 导航重构：先动作探测可达区域，再对未到达但可达且同色连通区域做 fill 扩展（RRFE）。
-4. 动作影响双通道建模（ADCIM）：同时建模“导航行动属性 + 游戏因果属性”。
-5. 运行治理可复现：统一 runtime config，trace 与诊断字段强制落盘。
-6. 验证基于工件：每次改动必须映射到 trace 证据与验收结论。
+4. 导航闭环强制化：`Reachability Probe（动作可达探测） -> fill 扩展 -> 执行验证 -> 回收（reclaim） -> 重新探测`。
+5. 动作影响双通道建模（ADCIM）：同时建模“导航行动属性 + 游戏因果属性”。
+6. 运行治理可复现：统一 runtime config，trace 与诊断字段强制落盘。
+7. 验证基于工件：每次改动必须映射到 trace 证据与验收结论。
 
 ## 3. 当前实现框架
 
@@ -37,12 +38,13 @@
 
 1. 观测与表示更新。
 2. 导航快照更新（`navigation_map_snapshot_v1`）。
-3. 可达动作探测与同色 fill 扩展（RRFE）。
-4. 候选动作 ADCIM 双通道影响预测查询。
-5. high-info 与 sequence 在各自阶段读取 RRFE/ADCIM 评分增强。
-6. 策略门控确定最终动作。
-7. 执行后根据 pre/post 差分更新 RRFE 与 ADCIM。
-8. 每步诊断记录 + 结束时审计工件输出。
+3. `Reachability Probe（动作可达探测）` 生成已证实可达种子。
+4. 基于种子执行同色 fill 扩展（RRFE）。
+5. 候选动作 ADCIM 双通道影响预测查询。
+6. high-info 与 sequence 在各自阶段读取 RRFE/ADCIM 评分增强。
+7. 策略门控确定最终动作。
+8. 执行后先做 fill 扩展验证与回收判定，再根据 pre/post 差分更新 RRFE 与 ADCIM。
+9. 每步诊断记录 + 结束时审计工件输出。
 
 ### 3.2 模块边界
 
@@ -51,19 +53,20 @@
 | 运行时编排（`agent.py`） | 编排运行生命周期与配置注入 | runtime config + frame stream | step context + run summary | trace JSONL、final audit |
 | 策略核心（`policy.py`） | 多阶段动作选择与门控 | candidates + nav state + rrfe/adcim/high-info/sequence state | selected action | `selection_diagnostics_v1` |
 | 导航地图（`navigation_map_v1.py`） | 可行走地图与邻接构建 | frame + anchor + movement estimate | map snapshot + region graph | `walkable_*`、`navigation_map_snapshot_v1` |
-| RRFE（可达扩展） | 动作可达探测 + 同色 fill 扩展 | action evidence + color region map + blocked edges | reachable seeds + fill map + confidence | `nav_reachable_probe_v1`、`nav_same_color_fill_expansion_v1` |
+| RRFE（可达扩展） | 动作可达探测 + 同色 fill 扩展 + 验证回收闭环 | action evidence + color region map + blocked edges + observed transitions | reachable seeds + fill map + verify/reclaim state + confidence | `nav_reachable_probe_v1`、`nav_same_color_fill_expansion_v1`、`nav_fill_verify_reclaim_v1` |
 | ADCIM（双通道） | 建模动作双通道影响并在线更新 | pre/post state + candidate contexts + rrfe features | nav/game effect prediction + update stats | `action_dual_channel_*_v1` |
 | 导航审计（`navigation_audit_v1.py`） | run 结束后的地图审计 | final map/trace | png + summary json | `final_navigation_map_audit_v1` |
-| 工具层（`tools/*`） | 运行后验证与可视化 | trace files | gate/fill/causal summary + visual checks | `*_coverage_gate.summary.json`、`*_fill_expansion.summary.json`、`*_nav_causal_acceptance.summary.json` |
+| 工具层（`tools/*`） | 运行后验证与可视化 | trace files | gate/fill/causal summary + visual checks | `*_coverage_gate.summary.json`、`*_fill_expansion.summary.json`、`*_fill_verify_reclaim.summary.json`、`*_nav_causal_acceptance.summary.json` |
 
 ### 3.3 硬约束
 
 1. region key 统一为 `row:col`。
 2. 源码禁止硬编码具体 region 地址。
 3. RRFE 扩展必须基于动作证据，禁止纯颜色静态泛化。
-4. 进入利用阶段前必须通过 prepass coverage gate。
-5. ADCIM 不得越权改变 prepass/high-info/sequence 层级顺序。
-6. RRFE/ADCIM 低置信时必须显式回退到稳定策略。
+4. RRFE 必须实现 `fill 扩展↔验证↔回收` 闭环，禁止只扩展不回收。
+5. 进入利用阶段前必须通过 prepass coverage gate。
+6. ADCIM 不得越权改变 prepass/high-info/sequence 层级顺序。
+7. RRFE/ADCIM 低置信时必须显式回退到稳定策略。
 
 ## 4. 历史功能点与新增能力方向
 
@@ -99,12 +102,14 @@
 1. 在既定 action 预算下可启动并完成。
 2. trace 输出完整可解析。
 3. 导航检查、coverage gate、fill 扩展、nav-causal 验收工件完整生成。
+4. trace 中可回放 `Reachability Probe -> fill -> validate -> reclaim` 完整闭环。
 
 ### 6.3 代码功能运行验收（结果）
 
 1. 相比基线，`levels_completed` 不退化并优先追求提升。
 2. trigger->verify->follow-up 链路命中率提升。
 3. `fill_expansion_precision`、`navigation_effect_prediction_hit_rate`、`game_effect_prediction_hit_rate` 提升或不退化。
+4. `fill_verify_reclaim_loop_completion_rate` 与 `fill_reclaim_precision` 达到验收阈值。
 
 ## 7. 已完成与下一步
 
@@ -118,7 +123,7 @@
 ### 7.2 立即下一步
 
 1. 为 `main..HEAD` 全部提交补齐“文件+行号+证据+结论”。
-2. 按 `RRFE-A1 -> A2 -> A3 -> ADCIM-B1 -> B2 -> B3 -> MODEL-C1 -> C2 -> AUDIT-D1` 顺序进入实现。
+2. 按 `RRFE-A1 -> A2 -> A3 -> A4 -> ADCIM-B1 -> B2 -> B3 -> MODEL-C1 -> C2 -> AUDIT-D1` 顺序进入实现。
 3. 每次提交后同步更新 P6/P7/P8 验收记录。
 
 ## 8. 文档治理规则

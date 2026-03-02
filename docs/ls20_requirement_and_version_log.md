@@ -1,6 +1,6 @@
 # LS20 调试需求与版本治理记录
 
-更新时间：2026-02-22
+更新时间：2026-03-02
 适用范围：`/Users/zhangdexiang/github/vsahdc/ARC-AGI-3-Agents`（`active_inference` 模板）
 
 缩写全拼约定：
@@ -44,6 +44,7 @@
 6. 新增核心要求：建立“动作影响双通道建模（ADCIM）”，让动作决策具备“预测影响 -> 执行验证 -> 在线更新”的闭环。
 7. 导航建模必须采用“动作证实可达区域 -> 同色可行区域 fill 扩展”路径，不允许纯颜色静态推断可达。
 8. 动作影响建模必须拆成双通道：`导航行动属性` 与 `游戏因果属性`，并分别审计。
+9. RRFE 必须包含 `Reachability Probe（动作可达探测） + fill 扩展↔验证↔回收` 闭环；回收后必须触发重探测。
 
 ### 2.4 验收关注点
 
@@ -127,6 +128,8 @@
 6. 在验收中增加 ADCIM 指标：`navigation_effect_prediction_hit_rate`、`game_effect_prediction_hit_rate`、`progress_effect_precision`、`dual_channel_fallback_rate`。
 7. 落地 RRFE：动作可达探测、同色 fill 扩展、误扩展回收与对应审计字段。
 8. 在验收中增加 RRFE 指标：`fill_expansion_precision`、`fill_expansion_false_positive_rate`、`route_success_rate_on_expanded_regions`。
+9. 落地 fill 验证回收闭环：新增验证窗口、回收原因码、重探测触发位与审计字段。
+10. 在验收中增加闭环指标：`fill_verify_reclaim_loop_completion_rate`、`fill_reclaim_precision`、`reclaim_to_reprobe_recovery_rate`。
 
 ## 8. 2026-02-22 增量实验记录（本次会话）
 
@@ -275,7 +278,7 @@
 
 1. 文档梳理：先把历史修改功能点、问题事实、约束条件收敛成文档基线。
 2. 架构设计：从核心思路文档抽象模块边界、职责划分与演进路线。
-3. 详细设计：细化状态机、数据结构、关键算法与故障回退路径。
+3. 详细设计：细化状态机、数据结构、关键算法与故障回退路径（含 fill 扩展↔验证↔回收闭环）。
 4. 接口设计：明确模块输入/输出契约、日志字段、配置项与兼容策略。
 5. 代码落实：按原子改动提交，实现与文档一一对应。
 6. 代码实现逻辑验收：先做静态逻辑核对（门控顺序、状态转移、边界条件）。
@@ -290,6 +293,7 @@
 4. 后续新增与更新文档统一使用中文；必要英文术语需附中文语义。
 5. 后续由 Codex 自动执行的代码提交，`commit message` 统一使用中文。
 6. 所有缩写首次出现必须给出“中文名称 + 英文全拼 + 缩写”（例如 RRFE/ADCIM），禁止只写缩写。
+7. 导航相关改动未体现“探测->扩展->验证->回收->重探测”闭环的，不得进入基线提交。
 
 ### 11.4 流程文档入口（2026-03-02）
 
