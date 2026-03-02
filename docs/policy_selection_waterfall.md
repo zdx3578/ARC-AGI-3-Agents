@@ -1,109 +1,68 @@
-# Active Inference 策略（Policy）决策瀑布（当前实现）
+# Active Inference 策略决策架构（现状问题与改造目标）
 
-更新时间：2026-02-24  
+更新时间：2026-03-02
 对应代码：`agents/templates/active_inference/policy.py`（`select_action`）
 
-## 1. 总体执行顺序（从高到低）
+## 1. 当前实现（问题基线）
 
-`selected_entry` 最初取 `entries[0]`（按 EFE/rollout 排序），随后按如下顺序可能被覆盖：
+当前实现仍是“waterfall 逐层覆盖”结构：`selected_entry` 先按候选排序取值，再被 prepass/coverage/high-info/sequence 等层按顺序覆盖。
 
-1. `fixed_two_pass_traversal_prepass`  
-2. `early_probe_budget_least_tried`  
-3. `coverage_region_probe`  
-4. `high_info_focus_probe`  
-5. `sequence_causal_probe`（仅当 high_info 未生效）  
+典型覆盖顺序（从强到弱）：
+
+1. `fixed_two_pass_traversal_prepass`
+2. `early_probe_budget_least_tried`
+3. `coverage_region_probe`
+4. `high_info_focus_probe`
+5. `sequence_causal_probe`
 6. tie/near-tie/stagnation 等兜底 probe
 
-关键覆盖关系：
+这意味着“记录的排序分值”与“最终执行动作”可能不一致。
 
-- prepass 生效时，high_info 只记录 `suppressed_by_fixed_two_pass_prepass`，不会改动作。
-- high_info 生效后，sequence_causal 不再介入（门控条件是 `not high_info_focus_probe_applied`）。
+## 2. 核心缺陷（本轮必须修复）
 
-## 2. 各层门控与优先级
+1. 目标函数与执行机制不一致：记录的是 `Expected Free Energy（期望自由能，EFE）` 相关分值，执行却可能被 waterfall 硬覆盖。
+2. 学习信号失真：后续调优很容易退化为“补门控/加例外”，复杂度持续上升。
+3. 泛化风险高：关卡变化时，硬门控规则比 EFE 后验更容易失效。
 
-## 2.1 Prepass（最强覆盖）
+## 3. 目标架构（改进框架口径）
 
-- 入口：`fixed_prepass_entry is not None`
-- 动作直接改为 prepass 候选。
-- 代码：`policy.py:3620`
+### 3.1 总原则
 
-## 2.2 Early Probe（次强覆盖）
+1. EFE 必须是最终动作唯一排序源。
+2. waterfall 从“决策器”降级为“可行性约束层（veto）”。
+3. prepass/coverage/high-info/sequence-causal 全部 option 化，进入同一个后验。
 
-- 条件：非 prepass、prepass 未完成、预算>0、phase in explore/explain。
-- 在可行动作里挑“最少尝试”的候选。
-- 代码：`policy.py:3662`, `policy.py:3749`
+### 3.2 Option 集合（统一后验输入）
 
-## 2.3 Coverage Probe
+1. `spare_explore_option`：空余区域探索（预算固定 10 动作）。
+2. `high_info_option`：高信息目标跟进。
+3. `sequence_causal_option`：trigger->verify->follow-up 链路动作。
+4. `fallback_option`：安全兜底动作。
 
-- 条件：非 prepass、非 early probe、coverage phase 允许、`levels_completed<=0`。
-- 从导航候选里按覆盖/可达/边统计排序选动作。
-- 代码：`policy.py:3762`, `policy.py:4558`
+每个 option 必须输出：
 
-## 2.4 High Info（核心复杂段）
+1. `option_candidates`
+2. `option_prior`
+3. `efe_terms_hint`
+4. `option_support_evidence`
 
-- 条件：非 early probe、非 prepass。
-- 代码入口：`policy.py:4799`
+### 3.3 统一后验与执行
 
-### 高信息（High Info）内部优先级（从高到低）
+1. 统一后验层计算每个候选动作的后验分布（`policy_option_posterior_v1`）。
+2. 可行性约束层只做 veto（如 blocked 边、非法动作、重复高风险动作）。
+3. 最终执行动作必须来自“可行候选中的最大后验”。
 
-1. `chain_lock_window_priority`  
-2. `verify_action_priority`  
-3. `simultaneous_target_lock`  
-4. `seek_*`（`seek_target_priority` / `seek_target_bfs_priority` / `seek_trap_escape` / `blocked_seek_*`）  
-5. `high_value_*`（`high_value_region_priority` / `high_value_bfs_priority` / `high_value_detour_priority`）
+## 4. 约束与审计字段
 
-代码位置：
+1. `waterfall_override_rate` 必须接近 0（目标值按验收文档执行）。
+2. `efe_decision_consistency_rate` 必须达到阈值（建议 `>=0.95`）。
+3. 每步必须落盘：
+   - `policy_option_posterior_v1`
+   - `policy_option_feasibility_veto_v1`
+   - `spare_explore_budget_state_v1`
 
-- chain lock：`policy.py:4898-4939`
-- verify：`policy.py:4940-4960`
-- simultaneous lock：`policy.py:4962-5066`
-- seek 分支：`policy.py:5070-5465`
-- value 分支：`policy.py:5466-5640`
+## 5. 迁移落地要求
 
-### 高信息（High Info）前置过滤
-
-- 先过滤 hard blocked，再可选过滤 loop-risk。
-- 可能 reason：`active_loop_risk_auto_skip` / `active_blocked_edge_auto_skip`。
-- 代码：`policy.py:4838-4894`
-
-## 2.5 Sequence Causal（只在 high_info 没接管时）
-
-- 条件：`sequence_causal_term_enabled` 且 非 prepass/early/high_info。
-- reason：`verify_action_priority` 或 `seek_target_priority`。
-- 代码：`policy.py:5752-5839`
-
-## 2.6 其余兜底 probe
-
-- tie least-tried：`policy.py:5870`
-- exploit near-tie action6：`policy.py:5939`
-- action6-only stagnation：`policy.py:6042`
-- exploit direction-sequence probe：`policy.py:6142`
-- navigation stagnation probe：`policy.py:6319`
-
-## 3. 为什么“锁窗口”会压过“早跳到新目标”
-
-这是你提到的核心问题。当前机制是：
-
-1. lock 窗口激活后，候选先按“是否到达当前锁定目标/是否朝当前锁定目标靠近”排序。  
-   代码：`policy.py:4908-4921`、`policy.py:5022-5038`
-2. 只要还有能“到达/靠近当前目标”的动作，链路优先级会先吃掉选择权。  
-3. 新触发的高变化区（哪怕变化很大）只有在 chain lock 分支未命中或被判定不优时，才会落到后续 `simultaneous/seek/value` 分支。
-4. 若 prepass 仍在生效，高信息分支本身就不会接管（`suppressed_by_fixed_two_pass_prepass`）。
-
-结论：
-
-- “高变化”不是第一优先级，当前实现里“锁定链路一致性”优先级更高。
-- 这就是“到达当前目标”会压过“早跳”的直接原因。
-
-## 4. 日志对照方法（快速定位）
-
-看 `selection_diagnostics_v1` 这两个字段：
-
-1. `tie_breaker_rule_applied`
-2. `high_info_focus_probe_reason`
-
-判读规则：
-
-- 若 `tie_breaker_rule_applied` 显示 `fixed_two_pass_traversal_prepass...`：说明是 prepass 接管。
-- 若 `high_info_focus_probe_reason=chain_lock_window_priority`：说明锁窗口分支接管。
-- 若 reason 变成 `seek_*` 或 `high_value_*`：说明链路锁没有压住，进入后续目标导向分支。
+1. 先保留旧 waterfall 分支用于对照审计，再逐步删除硬覆盖路径。
+2. 所有“模块直接改写 selected_entry”的路径必须迁移为“option 候选输出”。
+3. 迁移完成后，`policy.py` 中不允许存在无后验证据的动作覆盖分支。

@@ -1,5 +1,9 @@
 # LS20 Active Inference 改进版本记录
 
+缩写全拼约定：
+
+- `EFE` = `Expected Free Energy`（期望自由能）
+
 ## 适用范围
 
 - 项目：ARC-AGI-3-Agents

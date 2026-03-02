@@ -19,20 +19,22 @@
 1. 任务可启动并正常结束。
 2. trace（轨迹）文件可生成且可解析。
 3. 导航地图审计工件已生成。
-4. coverage gate（覆盖闸门）汇总文件已生成。
+4. spare-explore 预算检查工件已生成（10 动作预算）。
 5. RRFE 字段在 trace 中可见（`Reachability Probe（动作可达探测）` + fill 扩展 + 验证回收 + 置信更新）。
 6. ADCIM 双通道预测与更新字段在 trace 中可见。
 7. RRFE/ADCIM 回退字段在触发场景下可见。
 8. `fill 扩展↔验证↔回收` 闭环阶段字段可完整回放。
+9. `policy_option_posterior_v1` 与 `policy_option_feasibility_veto_v1` 字段可完整回放。
 
 ## 3. 必需工件
 
 1. `recordings/active_inference_traces/*.trace.jsonl`
-2. `recordings/navigation_checks/*_coverage_gate.summary.json`
+2. `recordings/navigation_checks/*_spare_explore_budget.summary.json`
 3. `recordings/navigation_checks/*_navigation_map_check.summary.json`
 4. `recordings/navigation_checks/*_fill_expansion.summary.json`（新增）
 5. `recordings/navigation_checks/*_fill_verify_reclaim.summary.json`（新增）
 6. `recordings/causal_checks/*_nav_causal_acceptance.summary.json`（新增）
+7. `recordings/causal_checks/*_efe_decision_consistency.summary.json`（新增）
 
 ## 4. 证据记录
 

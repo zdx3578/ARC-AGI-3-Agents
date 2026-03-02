@@ -6,6 +6,7 @@
 
 - `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
 - `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+- `EFE` = `Expected Free Energy`（期望自由能）
 
 目标：基于指标验证行为改进是否成立，并验证 RRFE 与 ADCIM 的有效性。
 
@@ -15,6 +16,8 @@
 2. 触发->验证->跟进（trigger->verify->follow-up）链路命中率
 3. 无进展循环（no-progress loop）集中度
 4. 回退路径（fallback）主导比例
+5. `efe_decision_consistency_rate`
+6. `waterfall_override_rate`
 
 ## 2. RRFE 导航建模指标
 
@@ -25,6 +28,8 @@
 5. `fill_verify_reclaim_loop_completion_rate`
 6. `fill_reclaim_precision`
 7. `reclaim_to_reprobe_recovery_rate`
+8. `spare_explore_budget_utilization`
+9. `trigger_preservation_rate_after_explore`
 
 ## 3. ADCIM 双通道指标
 
@@ -46,8 +51,9 @@
 1. `levels_completed` 不下降。
 2. `fill_expansion_precision` 提升且 `fill_expansion_false_positive_rate` 不恶化。
 3. `fill_verify_reclaim_loop_completion_rate` 达到目标阈值（建议 `>=0.9`）。
-4. `navigation_effect_prediction_hit_rate` 与 `game_effect_prediction_hit_rate` 至少一项提升，且另一项不显著退化。
-5. 若出现指标冲突，以“通关能力不退化 + 伪可达扩展不恶化 + 闭环不失效”为硬约束，再做权衡。
+4. `efe_decision_consistency_rate` 达到目标阈值（建议 `>=0.95`），`waterfall_override_rate` 接近 0。
+5. `navigation_effect_prediction_hit_rate` 与 `game_effect_prediction_hit_rate` 至少一项提升，且另一项不显著退化。
+6. 若出现指标冲突，以“通关能力不退化 + 伪可达扩展不恶化 + 闭环不失效 + EFE 决策一致”为硬约束，再做权衡。
 
 ## 6. 证据记录
 

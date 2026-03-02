@@ -4,6 +4,7 @@
 
 - `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
 - `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+- `EFE` = `Expected Free Energy`（期望自由能）
 
 ## 1. 目标
 
@@ -106,11 +107,17 @@
 输入：已知区域、可达图、blocked 统计、fill 扩展状态。  
 输出：frontier 候选、选中目标、进入动作。
 
+预算探索规则（强制）：
+
+1. frontier 覆盖仅作为“空余区域探索”使用，不再追求全图覆盖完成。
+2. 每轮探索预算固定为 `10` 动作（`SPARE_EXPLORE_ACTION_BUDGET=10`）。
+3. 预算耗尽后禁止继续覆盖动作抢占，直接回到统一后验决策。
+
 ### 4.8 边界确认规则（强制）
 
 - 任何 `行row, 列col + 动作(1..4)` 的边界/障碍结论，必须由**至少 2 次阻塞尝试**确认后才可标记为“已确认阻塞”。
 - “已确认阻塞”不是永久封闭：必须保留**周期性复探**（默认每 24 步复探一次），避免把后续可打开出口永久封死。
-- prepass 覆盖阶段至少保证：可达区域访问次数达到 `>=2`（默认值）后才视为覆盖完成。
+- prepass/coverage 不再要求“可达区域访问次数>=2”的全覆盖完成条件。
 - fill 扩展区域若连续验证失败，必须回收（reclaim）并降置信。
 
 ### 4.9 目标移动（Goal Move）
@@ -175,26 +182,30 @@
   - `fill_reclaim_count`
   - `fill_verify_reclaim_loop_completion_rate`
   - `fill_reprobe_recovery_rate`
+- 必须检查预算探索执行质量：
+  - `spare_explore_budget_total`（应为 10）
+  - `spare_explore_budget_used`（应 `<=10`）
+  - `spare_explore_budget_respected`
 - 对外报告坐标统一使用**行row, 列col**，禁止 `(line y)`、`行x列y` 等旧格式。
 
-### 6.1 覆盖闸门验证（强制）
+### 6.1 探索预算闸门验证（强制）
 
-- 在任何“high-info / sequence / EFE 利用阶段”之前，必须先通过覆盖闸门：
-  - `full_coverage_once == true`
-  - `full_coverage_twice == true`
-- 闸门脚本：
-  - `python tools/verify_navigation_coverage_gate.py --trace <trace.jsonl>`
+- 在任何“high-info / sequence / EFE 利用阶段”之前，只要求预算探索流程正确，不要求全覆盖：
+  - `spare_explore_budget_total == 10`
+  - `spare_explore_budget_used <= 10`
+  - `spare_explore_budget_respected == true`
+- 闸门脚本（目标）：
+  - `python tools/verify_navigation_explore_budget_gate.py --trace <trace.jsonl>`
+- 过渡期说明：旧脚本 `tools/verify_navigation_coverage_gate.py` 仅用于历史对照，不再作为主闸门依据。
 - 输出文件：
-  - `recordings/navigation_checks/<trace_stem>_coverage_gate.summary.json`
+  - `recordings/navigation_checks/<trace_stem>_spare_explore_budget.summary.json`
 - 闸门输出字段（最小集）：
-  - `gate_pass`
-  - `reachable_region_count`
-  - `coverage_once_ratio`
-  - `coverage_twice_ratio`
-  - `missing_once_regions_human`（行row, 列col）
-  - `missing_twice_regions_human`（行row, 列col）
-  - `reachable_region_diameter.distance_steps`
-  - `reachable_region_diameter.point_a / point_b`（行row, 列col）
+  - `budget_gate_pass`
+  - `spare_explore_budget_total`
+  - `spare_explore_budget_used`
+  - `spare_explore_budget_remaining`
+  - `spare_explore_budget_respected`
+  - `budget_exhausted_step`
 
 ## 7. 结构约束
 
@@ -204,6 +215,7 @@
   - 读取导航审计结果
 - 导航子系统可被完整替换（同接口）而不影响 EFE 逻辑。
 - `policy` 的 prepass 入口只能调用 `nav_prepass_v1`，禁止保留旧的内联 BFS/serpentine 选择路径。
+- prepass/coverage 只能输出 option 候选，不得硬覆盖最终动作。
 
 ## 8. 当前实现状态
 

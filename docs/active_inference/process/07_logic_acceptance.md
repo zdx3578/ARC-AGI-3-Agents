@@ -6,14 +6,15 @@
 
 - `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
 - `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+- `EFE` = `Expected Free Energy`（期望自由能）
 
-目标：在运行前完成逻辑正确性核对，重点校验 RRFE 与 ADCIM 与既有门控是否兼容。
+目标：在运行前完成逻辑正确性核对，重点校验 RRFE 与 ADCIM 在“10 动作预算探索 + EFE 统一决策”框架下是否一致。
 
-## 1. 门控与流程检查
+## 1. 决策一致性与流程检查
 
-1. prepass 仍是最高优先级，不受 RRFE/ADCIM 越权影响。
-2. high-info 与 sequence 的接管关系不被 RRFE/ADCIM 破坏。
-3. RRFE/ADCIM 只做同层候选评分增强，不改变层级顺序。
+1. 最终执行动作可由 `policy_option_posterior_v1` 的最优可行候选复算得到。
+2. waterfall 模块仅可 veto，不存在 hard override 直接改写最优后验动作。
+3. 覆盖探索预算严格受 `SPARE_EXPLORE_ACTION_BUDGET=10` 限制。
 
 ## 2. RRFE 逻辑检查
 
@@ -42,7 +43,8 @@
 
 | 项目 | 方法 | 结果 | 备注 |
 |---|---|---|---|
-| `门控顺序静态审查` | 代码路径检查 | `TODO` | `TODO` |
+| `EFE 决策一致性静态审查` | 后验重算 + 代码路径检查 | `TODO` | `TODO` |
+| `10 动作预算约束` | 构造预算耗尽场景 | `TODO` | `TODO` |
 | `RRFE 状态机完整性` | 单步推导 + 日志字段对照 | `TODO` | `TODO` |
 | `fill 验证回收闭环` | 构造误扩展场景 + 检查 `reprobe_required` | `TODO` | `TODO` |
 | `ADCIM 状态机完整性` | 单步推导 + 日志字段对照 | `TODO` | `TODO` |

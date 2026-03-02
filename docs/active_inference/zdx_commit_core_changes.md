@@ -2,6 +2,10 @@
 
 更新时间：2026-03-02
 
+缩写全拼约定：
+
+- `EFE` = `Expected Free Energy`（期望自由能）
+
 ## 1. 范围与提炼口径
 
 - 分支：`codex/fa9729f-decoupled-core`

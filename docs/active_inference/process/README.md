@@ -8,6 +8,7 @@
 
 - `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
 - `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+- `EFE` = `Expected Free Energy`（期望自由能）
 
 ## 阶段文档
 
@@ -32,6 +33,8 @@
 3. 代码提交必须可回链到阶段文档条目。
 4. 缩写首次出现必须同时给出“中文名 + 英文全拼 + 缩写”，禁止只写缩写。
 5. 导航建模必须体现 `Reachability Probe（动作可达探测） + fill 扩展↔验证↔回收` 闭环，缺失闭环不得进入实现阶段。
+6. 覆盖策略必须采用“10 动作空余区域探索预算”，禁止回退到全图覆盖先决门槛。
+7. 决策策略必须采用“EFE 统一后验 + waterfall 仅 veto 约束”，禁止硬覆盖改写最终动作。
 
 ## 语言规范
 

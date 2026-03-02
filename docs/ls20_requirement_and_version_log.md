@@ -7,6 +7,7 @@
 
 - `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
 - `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+- `EFE` = `Expected Free Energy`（期望自由能）
 
 ## 1. 记录目的
 
@@ -29,8 +30,8 @@
 
 ### 2.2 探索流程要求
 
-1. 先执行 prepass 覆盖，再进入 high_info 深探。
-2. 覆盖遍历是兜底机制，没头绪时必须可回退到全图扫描。
+1. 先执行空余区域预算探索，再进入 high_info 深探。
+2. 覆盖遍历从“全图扫描”改为“10 动作预算探索”，防止触发机制被提前消耗。
 3. 高信息区域应动态发现，不允许把“十字/出口”当固定标签写死。
 4. 高信息触发后要形成“触发 -> 验证 -> 跟进变化区”的子链路探索。
 5. 允许 300/500/800+ 步长回归，测试阶段可加长。
@@ -46,6 +47,8 @@
 7. 导航建模必须采用“动作证实可达区域 -> 同色可行区域 fill 扩展”路径，不允许纯颜色静态推断可达。
 8. 动作影响建模必须拆成双通道：`导航行动属性` 与 `游戏因果属性`，并分别审计。
 9. RRFE 必须包含 `Reachability Probe（动作可达探测） + fill 扩展↔验证↔回收` 闭环；回收后必须触发重探测。
+10. 决策机制必须以 `Expected Free Energy（期望自由能，EFE）` 为唯一动作排序源。
+11. prepass/coverage/high-info/sequence 必须 option 化进入同一后验；waterfall 仅保留可行性约束，不得硬覆盖最终动作。
 
 ### 2.4 验收关注点
 
@@ -108,6 +111,7 @@
 2. 默认一遍 prepass（可配置 `ACTIVE_INFERENCE_COVERAGE_PREPASS_PASSES`）。
 3. prepass 完成后释放 high_info，避免 300 步全被 prepass 吞掉。
 4. 关键诊断字段已补齐，便于日志复盘。
+5. 以上为历史基线事实；当前改进目标已切换为“10 动作预算探索 + EFE 统一后验决策”。
 
 ## 6. 版本治理规则（执行规范）
 
@@ -131,6 +135,8 @@
 8. 在验收中增加 RRFE 指标：`fill_expansion_precision`、`fill_expansion_false_positive_rate`、`route_success_rate_on_expanded_regions`。
 9. 落地 fill 验证回收闭环：新增验证窗口、回收原因码、重探测触发位与审计字段。
 10. 在验收中增加闭环指标：`fill_verify_reclaim_loop_completion_rate`、`fill_reclaim_precision`、`reclaim_to_reprobe_recovery_rate`。
+11. 落地预算探索：新增 `SPARE_EXPLORE_ACTION_BUDGET=10`、预算使用统计与预算闸门工件。
+12. 落地决策一致性：新增 `efe_decision_consistency_rate` 与 `waterfall_override_rate` 指标。
 
 ## 8. 2026-02-22 增量实验记录（本次会话）
 
@@ -295,6 +301,7 @@
 5. 后续由 Codex 自动执行的代码提交，`commit message` 统一使用中文。
 6. 所有缩写首次出现必须给出“中文名称 + 英文全拼 + 缩写”（例如 RRFE/ADCIM），禁止只写缩写。
 7. 导航相关改动未体现“探测->扩展->验证->回收->重探测”闭环的，不得进入基线提交。
+8. 决策相关改动未体现“EFE 统一后验 + waterfall 仅 veto”的，不得进入基线提交。
 
 ### 11.4 流程文档入口（2026-03-02）
 
