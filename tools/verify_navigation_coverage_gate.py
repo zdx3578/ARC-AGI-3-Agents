@@ -8,7 +8,7 @@ Hard gate:
 - every reachable map region must be visited at least twice
 
 Coordinate convention in output:
-- 行x列y
+- 行row, 列col（region key: row:col）
 """
 
 from __future__ import annotations
@@ -25,21 +25,21 @@ def _parse_region_key(region_key: str | None) -> tuple[int, int] | None:
         return None
     left, right = region_key.split(":", 1)
     try:
-        row_x = int(left)
-        col_y = int(right)
+        row = int(left)
+        col = int(right)
     except Exception:
         return None
-    if row_x < 0 or col_y < 0:
+    if row < 0 or col < 0:
         return None
-    return (row_x, col_y)
+    return (row, col)
 
 
 def _format_region_key_human(region_key: str) -> str:
     parsed = _parse_region_key(region_key)
     if parsed is None:
-        return "行x?-列y?"
-    row_x, col_y = parsed
-    return f"行x{row_x}列y{col_y}"
+        return "行row?-列col?"
+    row, col = parsed
+    return f"行row{row}列col{col}"
 
 
 def _find_latest_trace(repo_root: Path) -> Path:
@@ -178,8 +178,20 @@ def _diameter(graph: dict[str, dict[str, int]], nodes: set[str]) -> dict[str, An
     pb = _parse_region_key(best_b) or (-1, -1)
     return {
         "distance_steps": int(best_dist),
-        "point_a": {"region_key": str(best_a), "row_x": int(pa[0]), "col_y": int(pa[1])},
-        "point_b": {"region_key": str(best_b), "row_x": int(pb[0]), "col_y": int(pb[1])},
+        "point_a": {
+            "region_key": str(best_a),
+            "row": int(pa[0]),
+            "col": int(pa[1]),
+            "row_x": int(pa[0]),
+            "col_y": int(pa[1]),
+        },
+        "point_b": {
+            "region_key": str(best_b),
+            "row": int(pb[0]),
+            "col": int(pb[1]),
+            "row_x": int(pb[0]),
+            "col_y": int(pb[1]),
+        },
     }
 
 
@@ -256,8 +268,8 @@ def _build_report(summary: dict[str, Any], trace_path: Path) -> dict[str, Any]:
 
     diameter = _diameter(adjacency, reachable_regions) if reachable_regions else {
         "distance_steps": -1,
-        "point_a": {"region_key": "NA", "row_x": -1, "col_y": -1},
-        "point_b": {"region_key": "NA", "row_x": -1, "col_y": -1},
+        "point_a": {"region_key": "NA", "row": -1, "col": -1, "row_x": -1, "col_y": -1},
+        "point_b": {"region_key": "NA", "row": -1, "col": -1, "row_x": -1, "col_y": -1},
     }
 
     report: dict[str, Any] = {

@@ -3,8 +3,8 @@
 Render region coverage visualizations from active inference trace JSONL.
 
 Coordinate convention used in this script:
-- region key format: "x:y"
-- x = row index, y = column index
+- region key format: "row:col"
+- ARC pixel coordinates are "(x, y)"; region/grid coordinates are "(row, col)" where row=y and col=x.
 """
 
 from __future__ import annotations
@@ -150,13 +150,13 @@ def _render(data: TraceCoverageData, output_path: Path) -> None:
 
     # Left: coverage heatmap (visit count by region).
     im = ax_heat.imshow(heatmap, cmap="YlOrRd", origin="upper")
-    ax_heat.set_title("Coverage Heatmap (row x, col y)")
-    ax_heat.set_xlabel("col y")
-    ax_heat.set_ylabel("row x")
+    ax_heat.set_title("Coverage Heatmap (row, col)")
+    ax_heat.set_xlabel("col")
+    ax_heat.set_ylabel("row")
     ax_heat.set_xticks(range(GRID_SIZE))
     ax_heat.set_yticks(range(GRID_SIZE))
-    ax_heat.set_xticklabels([f"y{i}" for i in range(GRID_SIZE)])
-    ax_heat.set_yticklabels([f"x{i}" for i in range(GRID_SIZE)])
+    ax_heat.set_xticklabels([f"c{i}" for i in range(GRID_SIZE)])
+    ax_heat.set_yticklabels([f"r{i}" for i in range(GRID_SIZE)])
     ax_heat.set_xlim(-0.5, GRID_SIZE - 0.5)
     ax_heat.set_ylim(GRID_SIZE - 0.5, -0.5)
     ax_heat.set_xticks(np.arange(-0.5, GRID_SIZE, 1), minor=True)
@@ -183,8 +183,8 @@ def _render(data: TraceCoverageData, output_path: Path) -> None:
 
     # Right: trajectory plot in region-grid space.
     ax_path.set_title("Region Path (action order)")
-    ax_path.set_xlabel("col y")
-    ax_path.set_ylabel("row x")
+    ax_path.set_xlabel("col")
+    ax_path.set_ylabel("row")
     ax_path.set_xlim(0, GRID_SIZE)
     ax_path.set_ylim(GRID_SIZE, 0)
     ax_path.set_xticks(range(GRID_SIZE + 1))

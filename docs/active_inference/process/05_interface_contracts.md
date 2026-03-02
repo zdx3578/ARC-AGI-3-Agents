@@ -40,6 +40,7 @@
 4. 所有置信分数字段范围必须在 `[0,1]`。
 5. 所有错误字段必须落盘，不得静默吞掉。
 6. `reclaim_reason_codes` 必须使用受控枚举（如 `miss_threshold_exceeded`、`blocked_edge_conflict`、`boundary_violation`）。
+7. 像素坐标字段使用 ARC 官方 `x/y`；region/网格字段使用 `row/col` 或 `row:col`，禁止把 `x/y` 当行列字段语义。
 
 ## 4. 兼容性策略
 

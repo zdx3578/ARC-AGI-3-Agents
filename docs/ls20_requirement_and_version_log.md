@@ -23,6 +23,7 @@
 5. 硬约束：源码中禁止写死任何具体 region 地址（如 `"4:2"` / `"1:4"`）。
 6. region 表示统一为 `row:col`（行:列），不再使用 `line` 别名。
 7. 配置治理：禁止新增环境变量参数入口，统一使用 `config/runtime_config.json`（需要本地覆盖时使用 `config/runtime_config.local.json`）。
+8. 坐标命名强约束：ARC 像素坐标使用 `x/y`；region/网格坐标使用 `row/col`；禁止把 `x/y` 当作“行/列”口径描述。
 
 说明：文档中历史实验命令若出现 `ACTIVE_INFERENCE_*=` 或 `OPERATION_MODE=` 前缀，仅作为历史记录，不再作为当前配置方式。
 

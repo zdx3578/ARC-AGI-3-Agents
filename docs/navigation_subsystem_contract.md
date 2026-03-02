@@ -19,9 +19,11 @@
 
 ## 2. 坐标与命名（强制）
 
-- 对外展示统一使用：**行x列y**。
-- 内部 region key 统一为：`行x:列y`（例如 `4:7` 表示 行x=4，列y=7）。
-- 禁止再输出 `(line y)` 这类写法。
+- ARC 官方像素坐标使用：`x`（水平，左->右）、`y`（垂直，上->下）。
+- 导航/region 语义统一使用：`row, col`，并满足映射 `row=y`、`col=x`。
+- 内部 region key 统一为：`row:col`（例如 `4:7` 表示 `row=4`、`col=7`）。
+- 对外人类可读展示统一使用：`行row, 列col`。
+- 禁止使用“行x列y / 行x:列y / (line y)”这类易混淆写法。
 
 ## 3. 地图单位原则（强制）
 
@@ -106,7 +108,7 @@
 
 ### 4.8 边界确认规则（强制）
 
-- 任何 `行x列y + 动作(1..4)` 的边界/障碍结论，必须由**至少 2 次阻塞尝试**确认后才可标记为“已确认阻塞”。
+- 任何 `行row, 列col + 动作(1..4)` 的边界/障碍结论，必须由**至少 2 次阻塞尝试**确认后才可标记为“已确认阻塞”。
 - “已确认阻塞”不是永久封闭：必须保留**周期性复探**（默认每 24 步复探一次），避免把后续可打开出口永久封死。
 - prepass 覆盖阶段至少保证：可达区域访问次数达到 `>=2`（默认值）后才视为覆盖完成。
 - fill 扩展区域若连续验证失败，必须回收（reclaim）并降置信。
@@ -149,11 +151,11 @@
   - `recommended_action_id`
   - `reason`
 - `final_navigation_map_audit_v1`
-  - `anchor`（行x列y）
+  - `anchor`（行row, 列col）
   - `pixel_diameter.distance_steps`
-  - `pixel_diameter.point_a / point_b`（行x列y）
+  - `pixel_diameter.point_a / point_b`（行row, 列col）
   - `region_diameter.distance_steps`
-  - `region_diameter.point_a / point_b`（行x列y + region_key）
+  - `region_diameter.point_a / point_b`（行row, 列col + region_key）
   - `map_png_path`
   - `summary_json_path`
 
@@ -173,7 +175,7 @@
   - `fill_reclaim_count`
   - `fill_verify_reclaim_loop_completion_rate`
   - `fill_reprobe_recovery_rate`
-- 对外报告坐标统一使用**行x列y**，禁止 `(line y)` 等旧格式。
+- 对外报告坐标统一使用**行row, 列col**，禁止 `(line y)`、`行x列y` 等旧格式。
 
 ### 6.1 覆盖闸门验证（强制）
 
@@ -189,10 +191,10 @@
   - `reachable_region_count`
   - `coverage_once_ratio`
   - `coverage_twice_ratio`
-  - `missing_once_regions_human`（行x列y）
-  - `missing_twice_regions_human`（行x列y）
+  - `missing_once_regions_human`（行row, 列col）
+  - `missing_twice_regions_human`（行row, 列col）
   - `reachable_region_diameter.distance_steps`
-  - `reachable_region_diameter.point_a / point_b`（行x列y）
+  - `reachable_region_diameter.point_a / point_b`（行row, 列col）
 
 ## 7. 结构约束
 

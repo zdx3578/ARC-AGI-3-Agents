@@ -9,7 +9,7 @@ Outputs:
 
 Coordinate convention:
 - image index [row=y, col=x]
-- UI label "row x, col y" follows project naming (x=row, y=col).
+- ARC pixel coordinates are "(x, y)"; region/grid labels use "(row, col)" where row=y and col=x.
 """
 
 from __future__ import annotations
@@ -207,10 +207,11 @@ def _load_trace_steps(trace_path: Path) -> dict[int, TraceStepInfo]:
             if isinstance(nav, dict):
                 nav_region = nav.get("agent_pos_region") or {}
                 try:
-                    col_y = int(nav_region.get("x", -1))
-                    row_x = int(nav_region.get("y", -1))
-                    if col_y >= 0 and row_x >= 0:
-                        nav_region_key = f"{row_x}:{col_y}"
+                    # region payload keeps historical x/y keys; semantically they mean col/row.
+                    region_col = int(nav_region.get("x", -1))
+                    region_row = int(nav_region.get("y", -1))
+                    if region_col >= 0 and region_row >= 0:
+                        nav_region_key = f"{region_row}:{region_col}"
                 except (TypeError, ValueError):
                     nav_region_key = "NA"
                 nav_pos = nav.get("agent_pos_xy") or {}
@@ -386,10 +387,10 @@ def reconstruct_map(recording_path: Path, trace_path: Path) -> ReconstructionRes
             ):
                 left, right = step.nav_region_key.split(":", 1)
                 try:
-                    row_x = int(left)
-                    col_y = int(right)
-                    cx = int(col_y * region_size + (region_size // 2))
-                    cy = int(row_x * region_size + (region_size // 2))
+                    region_row = int(left)
+                    region_col = int(right)
+                    cx = int(region_col * region_size + (region_size // 2))
+                    cy = int(region_row * region_size + (region_size // 2))
                     action_path_xy.append((cx, cy))
                     action_path_steps.append(int(step.action_counter))
                     action_path_ids.append(int(action_id))
@@ -439,8 +440,8 @@ def _draw_outputs(
     fig1, ax1 = plt.subplots(figsize=(8, 8), constrained_layout=True)
     ax1.imshow(base_rgb, interpolation="nearest")
     ax1.set_title("Reconstructed Map (pixel-level)")
-    ax1.set_xlabel("col y")
-    ax1.set_ylabel("row x")
+    ax1.set_xlabel("col")
+    ax1.set_ylabel("row")
     ax1.set_xticks([])
     ax1.set_yticks([])
     fig1.savefig(map_only_path, dpi=180)
@@ -453,8 +454,8 @@ def _draw_outputs(
     img[walk] = (165, 173, 184)
     ax2.imshow(img, interpolation="nearest")
     ax2.set_title(f"Walkable Mask (floor_color={result.floor_color})")
-    ax2.set_xlabel("col y")
-    ax2.set_ylabel("row x")
+    ax2.set_xlabel("col")
+    ax2.set_ylabel("row")
     ax2.set_xticks([])
     ax2.set_yticks([])
     fig2.savefig(walkable_path, dpi=180)
@@ -494,8 +495,8 @@ def _draw_outputs(
             ax3.scatter(all_points[-1][0], all_points[-1][1], c="red", s=55, marker="X", label="end")
         ax3.legend(loc="upper right", framealpha=0.9)
     ax3.set_title("Reconstructed Map + Agent Action Path")
-    ax3.set_xlabel("col y")
-    ax3.set_ylabel("row x")
+    ax3.set_xlabel("col")
+    ax3.set_ylabel("row")
     ax3.set_xticks([])
     ax3.set_yticks([])
     fig3.savefig(overlay_path, dpi=180)
