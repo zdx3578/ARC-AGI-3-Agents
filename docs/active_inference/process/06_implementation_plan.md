@@ -1,15 +1,15 @@
-# P5 Code Implementation Plan
+# P5 代码落实计划
 
-Goal: transform design and interfaces into atomic code commits.
+目标：将设计与接口条目转化为可执行原子提交。
 
-## Planning Table
+## 计划表
 
-| Item ID | Design Ref | Interface Ref | Target Files | Change Type | Commit Strategy | Status |
+| 条目 ID | 设计引用 | 接口引用 | 目标文件 | 变更类型 | 提交策略 | 状态 |
 |---|---|---|---|---|---|---|
 | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` | `todo` |
 
-## Rules
+## 规则
 
-1. One atomic behavior change per commit.
-2. Commit message references design/interface IDs.
-3. No mixed experimental branches in a single baseline commit.
+1. 每个提交只包含一个原子行为变更。
+2. 提交信息必须引用设计/接口条目 ID。
+3. 禁止将多类实验混入同一基线提交。

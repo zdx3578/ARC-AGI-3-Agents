@@ -1,22 +1,22 @@
-# P8 Functional Acceptance
+# P8 代码功能运行验收
 
-Goal: verify behavioral improvements on target metrics.
+目标：基于指标验证行为改进是否成立。
 
-## Core Metrics
+## 核心指标
 
 1. `levels_completed`
-2. trigger->verify->follow-up chain hit rate
-3. no-progress loop concentration
-4. fallback dominance ratio
+2. 触发->验证->跟进（trigger->verify->follow-up）链路命中率
+3. 无进展循环（no-progress loop）集中度
+4. 回退路径（fallback）主导比例
 
-## Comparison Protocol
+## 对比协议
 
-1. Select fixed baseline runs.
-2. Execute A/B runs under same profile.
-3. Compare metrics and summarize deltas.
+1. 固定基线运行样本。
+2. 在同档位下执行 A/B 对比实验。
+3. 对关键指标差异做结论归档。
 
-## Evidence Record
+## 证据记录
 
-| Experiment | Baseline | Candidate | Key Deltas | Decision |
+| 实验项 | 基线 | 候选版本 | 关键差异 | 结论 |
 |---|---|---|---|---|
 | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` |

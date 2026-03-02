@@ -1,22 +1,22 @@
-# P2 Architecture Design
+# P2 架构设计
 
-Goal: define module boundaries and ownership.
+目标：定义模块边界与职责归属。
 
-## Module Map
+## 模块地图
 
-1. Runtime orchestration
-2. Policy/gating engine
-3. Navigation subsystem
-4. High-info/novelty subsystem
-5. Sequence-causal subsystem
-6. Tooling and verification layer
+1. 运行时编排层
+2. 策略/门控引擎
+3. 导航子系统
+4. high-info/novelty 子系统
+5. sequence-causal 子系统
+6. 工具与验证层
 
-## Data Flow
+## 数据流
 
-Document end-to-end flow from frame input to action output to run audit.
+描述从帧输入到动作输出再到运行审计产物的端到端流程。
 
-## Completion Criteria
+## 完成标准
 
-1. Clear module boundaries.
-2. No duplicated responsibilities.
-3. Every cross-module dependency is explicit.
+1. 模块边界清晰。
+2. 无重复职责。
+3. 所有跨模块依赖均显式定义。

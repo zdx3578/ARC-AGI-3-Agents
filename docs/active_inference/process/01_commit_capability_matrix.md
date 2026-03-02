@@ -1,11 +1,11 @@
-# P0 Commit Capability Matrix
+# P0 提交能力矩阵
 
-Updated: 2026-03-02
-Scope: `main..HEAD` on branch `codex/fa9729f-decoupled-core` (author: `zdx`)
+更新时间：2026-03-02
+范围：分支 `codex/fa9729f-decoupled-core` 上 `main..HEAD`（作者：`zdx`）
 
-Goal: map historical commits to capability tracks, then complete code anchors and evidence.
+目标：先完成历史提交到能力轨道的映射，再补齐代码锚点与证据。
 
-## Input Sources
+## 输入文档
 
 1. `docs/active_inference/zdx_commit_core_changes.md`
 2. `docs/ls20_requirement_and_version_log.md`
@@ -13,21 +13,21 @@ Goal: map historical commits to capability tracks, then complete code anchors an
 4. `docs/navigation_subsystem_contract.md`
 5. `docs/policy_selection_waterfall.md`
 
-## Capability Track Dictionary
+## 能力轨道字典
 
-- `HIGH_INFO_CONTROL`: high-info target selection, lock/novelty/queue behavior.
-- `POLICY_GATING`: top-level gate ordering, prepass/exploit handoff, safety overrides.
-- `NAV_SUBSYSTEM`: navigation map, prepass, reachability, coverage gate and planning constraints.
-- `STATE_REPRESENTATION`: trajectory/state representation and normalization.
-- `CONFIG_GOVERNANCE`: runtime config entrypoint and parameter governance.
-- `DOCS_GOVERNANCE`: contracts, policy docs, and governance process records.
-- `TOOLING_AUDIT`: offline verification/visualization scripts and audit utilities.
-- `RELEASE_BASELINE`: version snapshot markers (`v111`, `v113`).
-- `STABILITY_PATCH`: stabilization patches not introducing new architecture boundaries.
+- `HIGH_INFO_CONTROL`：high-info 目标选择、锁窗口、新颖性、子队列控制。
+- `POLICY_GATING`：顶层门控顺序、prepass/exploit 交接、安全兜底。
+- `NAV_SUBSYSTEM`：导航地图、prepass、可达性、coverage gate 与规划约束。
+- `STATE_REPRESENTATION`：轨迹/状态表示与归一化。
+- `CONFIG_GOVERNANCE`：运行时配置入口与参数治理。
+- `DOCS_GOVERNANCE`：契约文档、策略文档与治理记录。
+- `TOOLING_AUDIT`：离线验证/可视化脚本与审计工具。
+- `RELEASE_BASELINE`：版本快照标记（`v111`、`v113`）。
+- `STABILITY_PATCH`：不引入新架构边界的稳定性补丁。
 
-## main..HEAD Mapping (v1)
+## `main..HEAD` 提交映射（v1）
 
-| Commit | Date | Capability Track | Core Change | Candidate Code Anchor(s) | Evidence (trace/cmd) | Risk | Status |
+| 提交号 | 日期 | 能力轨道 | 核心改动 | 候选代码锚点 | 证据（trace/cmd） | 风险 | 状态 |
 |---|---|---|---|---|---|---|---|
 | `bafbc33` | 2026-02-22 | HIGH_INFO_CONTROL | active-inference: decoupled high-info interaction rebuild | `agents/templates/active_inference/policy.py` | TODO | high | mapped-v1 |
 | `d7d2c60` | 2026-02-22 | HIGH_INFO_CONTROL | active-inference: harden dynamic high-info loop control and idle rearm | `agents/templates/active_inference/policy.py` | TODO | high | mapped-v1 |
@@ -68,14 +68,14 @@ Goal: map historical commits to capability tracks, then complete code anchors an
 | `8468ddf` | 2026-02-26 | NAV_SUBSYSTEM | Use route-distance cap for high-info gating; line-only action path overlay | `agents/templates/active_inference/navigation_*.py, agents/templates/active_inference/nav_prepass_v1.py, agents/templates/active_inference/policy.py` | TODO | high | mapped-v1 |
 | `6312e13` | 2026-02-26 | NAV_SUBSYSTEM | fix(nav): stabilize map anchor and coverage gate auditing | `agents/templates/active_inference/navigation_*.py, tools/verify_navigation_coverage_gate.py, agents/templates/active_inference/policy.py` | TODO | high | mapped-v1 |
 
-## Current Progress
+## 当前进度
 
-1. Commit-to-capability mapping is completed for all `main..HEAD` commits.
-2. Code anchors are candidate-level and need per-commit line-level refinement.
-3. Evidence column is pending trace/command backfill for key commits.
+1. 已完成 `main..HEAD` 全量提交的能力轨道映射。
+2. 代码锚点目前是候选级，需要进一步补到逐提交行号级。
+3. 证据列仍需回填关键 trace/命令记录。
 
-## Completion Criteria (for P0 close)
+## P0 关闭标准
 
-1. Upgrade candidate anchors to exact file+line references for all high-risk commits.
-2. Fill evidence for all high-risk commits and all release markers.
-3. Mark each commit as accepted/rejected/deferred based on evidence.
+1. 所有高风险提交的锚点补齐为精确“文件+行号”。
+2. 所有高风险提交和版本锚点补齐 evidence。
+3. 每个提交标记 accepted/rejected/deferred 结论。

@@ -1,20 +1,20 @@
-# P1 Core Thinking
+# P1 核心思路文档
 
-Goal: freeze the high-level engineering thinking before architecture/detail design.
+目标：在进入架构/详细设计之前，先冻结高层工程思路。
 
-## Core Principles
+## 核心原则
 
-1. Audit first.
-2. No hardcoded game coupling.
-3. Prepass-first gating.
-4. Dynamic evidence-driven high-info control.
-5. Decoupled navigation subsystem.
+1. 审计优先（audit first）。
+2. 禁止游戏耦合硬编码。
+3. prepass 优先门控。
+4. high-info 控制基于动态证据而非静态规则。
+5. 导航子系统解耦并可替换。
 
-## Problem Statement
+## 问题陈述
 
-- Current gap: exploration is improved, but exploitation still fails to convert trigger events into stable level progress.
+- 当前主要缺口：探索能力已提升，但利用阶段仍未稳定把触发事件转化为关卡推进。
 
-## Acceptance Goals
+## 验收目标
 
-1. Define measurable success signals.
-2. Define explicit non-goals to avoid scope drift.
+1. 明确定义可量化的成功信号。
+2. 明确非目标，避免范围漂移。

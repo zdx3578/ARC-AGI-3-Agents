@@ -1,4 +1,4 @@
-# Active Inference Policy 决策瀑布（当前实现）
+# Active Inference 策略（Policy）决策瀑布（当前实现）
 
 更新时间：2026-02-24  
 对应代码：`agents/templates/active_inference/policy.py`（`select_action`）
@@ -44,7 +44,7 @@
 - 条件：非 early probe、非 prepass。
 - 代码入口：`policy.py:4799`
 
-### High Info 内部优先级（从高到低）
+### 高信息（High Info）内部优先级（从高到低）
 
 1. `chain_lock_window_priority`  
 2. `verify_action_priority`  
@@ -60,7 +60,7 @@
 - seek 分支：`policy.py:5070-5465`
 - value 分支：`policy.py:5466-5640`
 
-### High Info 前置过滤
+### 高信息（High Info）前置过滤
 
 - 先过滤 hard blocked，再可选过滤 loop-risk。
 - 可能 reason：`active_loop_risk_auto_skip` / `active_blocked_edge_auto_skip`。

@@ -1,6 +1,6 @@
-# Agent Templates
+# Agent 模板
 
-For all information on how to build agents from templates, please see the official documentation:
+关于如何基于模板构建 agents，请参考官方文档：
 
-- Standard templates: [Building Agents](https://three.arcprize.org/docs#building-agents)
-- Third-party templates: [Third-Party Templates](https://three.arcprize.org/docs#third-party-templates)
+- 标准模板：[Building Agents](https://three.arcprize.org/docs#building-agents)
+- 第三方模板：[Third-Party Templates](https://three.arcprize.org/docs#third-party-templates)

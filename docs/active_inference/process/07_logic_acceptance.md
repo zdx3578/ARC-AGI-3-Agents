@@ -1,17 +1,17 @@
-# P6 Logic Acceptance
+# P6 代码实现逻辑验收
 
-Goal: verify implementation logic before runtime execution.
+目标：在运行前完成逻辑正确性核对。
 
-## Checklist
+## 检查清单
 
-1. Gate order is correct and deterministic.
-2. Prepass suppression/hand-off conditions are correct.
-3. High-info/sequence mutual exclusion rules are correct.
-4. No forbidden hardcoded region literals.
-5. Navigation responsibilities are not duplicated outside subsystem contracts.
+1. 门控顺序正确且确定。
+2. prepass 抑制/交接条件正确。
+3. high-info 与 sequence 的互斥/接管规则正确。
+4. 无禁止的硬编码 region 字面量。
+5. 导航职责未在子系统外重复实现。
 
-## Evidence Record
+## 证据记录
 
-| Item | Method | Result | Notes |
+| 项目 | 方法 | 结果 | 备注 |
 |---|---|---|---|
 | `TODO` | `TODO` | `TODO` | `TODO` |

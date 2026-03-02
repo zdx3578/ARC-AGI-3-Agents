@@ -1,9 +1,9 @@
-# Tests
+# 测试
 
-To run the tests, you will need to have `pytest` installed. Run the tests like this:
+运行测试前请先安装 `pytest`，执行命令如下：
 
 ```bash
 pytest
 ```
 
-For more information on tests, please see the [tests documentation](https://three.arcprize.org/docs#testing).
+更多说明请参考[测试文档](https://three.arcprize.org/docs#testing)。

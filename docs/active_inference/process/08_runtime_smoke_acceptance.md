@@ -1,21 +1,21 @@
-# P7 Runtime Smoke Acceptance
+# P7 代码运行跑通验收
 
-Goal: verify the system runs end-to-end and produces expected artifacts.
+目标：验证系统端到端可运行并产出必需工件。
 
-## Run Profiles
+## 运行档位
 
-1. Debug profile (300 actions)
-2. Long profile (3000 actions)
+1. 调试档（300 actions）
+2. 长跑档（3000 actions）
 
-## Smoke Checklist
+## 跑通检查清单
 
-1. Run starts and exits cleanly.
-2. Trace file is generated and parseable.
-3. Navigation map audit artifacts are generated.
-4. Coverage gate summary is generated.
+1. 任务可启动并正常结束。
+2. trace（轨迹）文件可生成且可解析。
+3. 导航地图审计工件已生成。
+4. coverage gate（覆盖闸门）汇总文件已生成。
 
-## Evidence Record
+## 证据记录
 
-| Run Tag | Command | Trace ID | Artifacts | Pass/Fail | Notes |
+| 运行标签 | 运行命令 | Trace ID | 工件 | 通过/失败 | 备注 |
 |---|---|---|---|---|---|
 | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` |

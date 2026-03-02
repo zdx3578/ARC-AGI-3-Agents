@@ -1,17 +1,17 @@
 # ARC-AGI-3-Agents
 
-## Quickstart
+## 快速开始
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if not aready installed.
+如果尚未安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，请先安装。
 
-1. Clone the ARC-AGI-3-Agents repo and enter the directory.
+1. 克隆 ARC-AGI-3-Agents 仓库并进入目录。
 
 ```bash
 git clone https://github.com/arcprize/ARC-AGI-3-Agents.git
 cd ARC-AGI-3-Agents
 ```
 
-2. Create runtime config file `config/runtime_config.local.json`.
+2. 创建运行时配置文件 `config/runtime_config.local.json`。
 
 ```bash
 mkdir -p config
@@ -31,87 +31,86 @@ cat > config/runtime_config.local.json <<'JSON'
 JSON
 ```
 
-3. Run the random agent (generates random actions) against the ls20 game.
+3. 在 `ls20` 游戏上运行随机 agent（会生成随机动作）。
 
 ```bash
 uv run main.py --agent=random --game=ls20
 ```
 
-For more information, see the [documentation](https://three.arcprize.org/docs#quick-start) or the [tutorial video](https://youtu.be/xEVg9dcJMkw).
+更多信息请参考[官方文档](https://three.arcprize.org/docs#quick-start)或[教程视频](https://youtu.be/xEVg9dcJMkw)。
 
-## Active Inference / EFE Framework Agent
+## Active Inference / EFE 框架 Agent
 
-This repository includes `activeinferenceefe`, a modular framework agent that
-implements an audit-first Active Inference loop for ARC-AGI-3:
+本仓库包含 `activeinferenceefe`，这是一个模块化框架 agent，实现了 ARC-AGI-3 的“审计优先（audit-first）”Active Inference 回路，包含：
 
-- observation contract (state, levels, available actions, frame)
-- frame-chain diagnostics (1-N frame digests + micro/macro transition signatures)
-- micro-signature dual channel (`micro_pixel_change_type` + `micro_object_change_type`)
-- signature-key v2 for posterior updates (`type/progress + translation_delta_bucket + click_context_bucket`)
-- object-anchored `click_context_bucket_v2` (`hit_type`, object digest bucket, relative position bucket, object-boundary flag, nearest-object fallback buckets)
-- Action6 `subcluster` refinement (`click_context_subcluster_v1` with fine-region + local pattern hash) for bucket-internal tie breaking
-- object representation contract (same-color and mixed-color connected components with 4/8 connectivity + hierarchy links + Action6 proposals)
-- world-model hypothesis bank (hidden mode state + rule-family/parameter version space)
-- posterior delta report per step (elimination/falsification reason buckets + survivor histograms)
-- action-space compatibility pruning + soft mode-transition confidence diagnostics
-- Expected Free Energy ledger per candidate (risk / ambiguity / split information gain / action cost / complexity / VFE term)
-- causal event signatures for action interventions (`obs_change_type` diff semantics)
-- transition record asset (`state_before/action_token/action_context/effect/state_after/env_delta`) for per-action effect auditing
-- Action6 proposal diagnostics (region coverage / redundancy / context diversity / hit-object rate)
-- Action6 proposal diversity selection (greedy coverage across region / bucket / subcluster / object digest)
-- action-selection tie diagnostics (`best_vs_second_best_delta_total_efe`, `tie_group_size`, `tie_breaker_rule_applied`)
-- navigation-state diagnostics (`tracked_agent_token_id`, `agent_pos_xy`, `delta_pos_xy`, `control_schema_posterior`)
-- operability diagnostics (`navigation_blocked_rate`, blocked-edge histogram, Action6 click-bucket + click-subcluster effectiveness)
-- navigation blocked outcome modeling (`delta=blocked`) wired into predictive signatures/risk preference
-- least-tried probing in explore/explain phases, including early probing budget that forces action-space coverage in the first N steps
-- cluster/subcluster-aware least-tried tie-break (`candidate_cluster_id` + `candidate_subcluster_id`) including exploit-phase Action6 bucket/subcluster probing for tie and near-tie candidate sets
-- state-action frontier-aware probing (`transition_exploration_stats` + state-action visit counts) to prioritize under-sampled transitions
-- hard methodology guard: `cross-episode memory = off` (no persistent cross-run parameter learning; enforced in reasoning + trace)
-- hard objective guard: `action_cost_in_objective = off` (action cost is logged for audit, but excluded from action selection objective)
-- JSONL trace emission for bottleneck analysis
-- stage diagnostics (`stage / duration_ms / status / reject_reason_v1`)
-- failure taxonomy in reasoning for non-silent fallback paths
-- two-step rollout scoring with budget-aware phase switching and stop-loss guard
+- 观测契约（state、levels、available actions、frame）
+- 帧链路诊断（1-N 帧摘要 + 微观/宏观转移签名）
+- 微签名双通道（`micro_pixel_change_type` + `micro_object_change_type`）
+- 用于后验更新的 signature-key v2（`type/progress + translation_delta_bucket + click_context_bucket`）
+- 以对象为锚点的 `click_context_bucket_v2`（`hit_type`、对象摘要桶、相对位置桶、对象边界标记、最近对象回退桶）
+- Action6 `subcluster` 细分（`click_context_subcluster_v1`，含细粒度区域 + 局部模式哈希）用于桶内 tie-break
+- 对象表示契约（同色/混色连通域，支持 4/8 连通 + 层级关系 + Action6 proposals）
+- 世界模型假设库（隐藏 mode state + rule-family/parameter 版本空间）
+- 每步后验差分报告（消除/证伪原因桶 + 幸存者直方图）
+- 动作空间兼容性裁剪 + 软模式转移置信诊断
+- 候选动作 Expected Free Energy 账本（risk / ambiguity / split information gain / action cost / complexity / VFE）
+- 用于动作干预的因果事件签名（`obs_change_type` 差分语义）
+- 转移记录资产（`state_before/action_token/action_context/effect/state_after/env_delta`）用于逐动作效果审计
+- Action6 proposal 诊断（区域覆盖 / 冗余 / 上下文多样性 / 命中对象率）
+- Action6 proposal 多样性选择（跨 region / bucket / subcluster / object digest 的贪心覆盖）
+- 动作选择 tie 诊断（`best_vs_second_best_delta_total_efe`、`tie_group_size`、`tie_breaker_rule_applied`）
+- 导航状态诊断（`tracked_agent_token_id`、`agent_pos_xy`、`delta_pos_xy`、`control_schema_posterior`）
+- 可操作性诊断（`navigation_blocked_rate`、blocked-edge 直方图、Action6 点击桶/子簇有效性）
+- 导航阻塞结果建模（`delta=blocked`）并接入预测签名/风险偏好
+- explore/explain 阶段 least-tried probing，含早期探测预算（前 N 步强制动作空间覆盖）
+- cluster/subcluster 感知的 least-tried tie-break（`candidate_cluster_id` + `candidate_subcluster_id`），并在 exploit 阶段用于 Action6 桶/子簇的 tie 与 near-tie 探测
+- state-action frontier 感知探测（`transition_exploration_stats` + state-action 访问计数）优先探索欠采样转移
+- 方法学硬约束：`cross-episode memory = off`（禁止跨回合持久学习，推理与 trace 均强制执行）
+- 目标函数硬约束：`action_cost_in_objective = off`（保留 action cost 审计，但不参与动作选择目标）
+- JSONL trace 输出，用于瓶颈分析
+- 阶段诊断（`stage / duration_ms / status / reject_reason_v1`）
+- 非静默回退路径的失败分类
+- 带预算感知阶段切换与止损保护的两步 rollout 评分
 
-Run it with:
+运行方式：
 
 ```bash
 uv run main.py --agent=activeinferenceefe --game=ls20
 ```
 
-Useful `active_inference` config keys (set in `config/runtime_config.local.json`):
+常用 `active_inference` 配置项（配置在 `config/runtime_config.local.json`）：
 
-- `ACTIVE_INFERENCE_MAX_ACTIONS` (default `80`)
-- `ACTIVE_INFERENCE_COMPONENT_CONNECTIVITY` (`4` or `8`, default `8`)
-- `ACTIVE_INFERENCE_MAX_ACTION6_POINTS` (default `16`)
-- `ACTIVE_INFERENCE_EXPLORE_STEPS` (default `20`)
-- `ACTIVE_INFERENCE_EXPLORATION_MIN_STEPS` (default `20`)
-- `ACTIVE_INFERENCE_EXPLORATION_MAX_STEPS` (default `120`)
-- `ACTIVE_INFERENCE_EXPLORATION_FRACTION` (default `0.35`, used with `MAX_ACTIONS` to size early exploration without huge random budgets)
-- `ACTIVE_INFERENCE_EXPLOIT_ENTROPY_THRESHOLD` (default `0.9`)
-- `ACTIVE_INFERENCE_ROLLOUT_HORIZON` (default `2`)
-- `ACTIVE_INFERENCE_ROLLOUT_DISCOUNT` (default `0.55`)
-- `ACTIVE_INFERENCE_EARLY_PROBE_BUDGET` (default `8`, force early action-space coverage in explore/explain)
-- `ACTIVE_INFERENCE_ACTION6_BUCKET_PROBE_MIN_ATTEMPTS` (default `3`, minimum per-bucket attempts before exploit stops bucket probing tie-break)
-- `ACTIVE_INFERENCE_ACTION6_SUBCLUSTER_PROBE_MIN_ATTEMPTS` (default `2`, minimum per-subcluster attempts before exploit stops subcluster probing)
-- `ACTIVE_INFERENCE_ACTION6_PROBE_SCORE_MARGIN` (default `0.06`, exploit near-tie probing margin for Action6 candidate diversification)
-- `ACTIVE_INFERENCE_NAV_CONFIDENCE_GATING_ENABLED` (default `true`, gate geometry-heavy target terms when nav semantics drift)
-- `ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TERM_ENABLED` (default `true`, enable sequence prior from dynamic high-info region chains)
-- `ACTIVE_INFERENCE_SEQUENCE_CAUSAL_WINDOW_STEPS` (default `24`)
-- `ACTIVE_INFERENCE_SEQUENCE_CAUSAL_VERIFY_WINDOW_STEPS` (default `8`)
-- `ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TRIGGER_REGION` (default `NA`, optional manual override; region format is `row:col`)
-- `ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TARGET_REGION` (default `NA`, optional manual override; region format is `row:col`)
-- `ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS` (default `3`)
-- `ACTIVE_INFERENCE_ENABLE_CROSS_EPISODE_MEMORY` (default `false`; any `true` request is blocked and recorded as `override_blocked=true`, policy remains hard-off)
-- `ACTIVE_INFERENCE_ENABLE_ACTION_COST_OBJECTIVE` (default `false`; any `true` request is blocked and recorded as `action_cost_override_blocked=true`, objective remains hard-off)
-- `ACTIVE_INFERENCE_TRACE_ENABLED` (default `true`)
-- `ACTIVE_INFERENCE_TRACE_CANDIDATE_LIMIT` (default `30`)
-- `ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION` (default `false`)
-- `ACTIVE_INFERENCE_FRAME_CHAIN_WINDOW` (default `8`)
-- `ACTIVE_INFERENCE_ACTION_SPACE_HISTORY_WINDOW` (default `24`)
-- `ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` (optional object; can also be JSON string)
+- `ACTIVE_INFERENCE_MAX_ACTIONS`（默认 `80`）
+- `ACTIVE_INFERENCE_COMPONENT_CONNECTIVITY`（`4` 或 `8`，默认 `8`）
+- `ACTIVE_INFERENCE_MAX_ACTION6_POINTS`（默认 `16`）
+- `ACTIVE_INFERENCE_EXPLORE_STEPS`（默认 `20`）
+- `ACTIVE_INFERENCE_EXPLORATION_MIN_STEPS`（默认 `20`）
+- `ACTIVE_INFERENCE_EXPLORATION_MAX_STEPS`（默认 `120`）
+- `ACTIVE_INFERENCE_EXPLORATION_FRACTION`（默认 `0.35`，配合 `MAX_ACTIONS` 控制早期探索比例）
+- `ACTIVE_INFERENCE_EXPLOIT_ENTROPY_THRESHOLD`（默认 `0.9`）
+- `ACTIVE_INFERENCE_ROLLOUT_HORIZON`（默认 `2`）
+- `ACTIVE_INFERENCE_ROLLOUT_DISCOUNT`（默认 `0.55`）
+- `ACTIVE_INFERENCE_EARLY_PROBE_BUDGET`（默认 `8`，在 explore/explain 阶段强制早期动作覆盖）
+- `ACTIVE_INFERENCE_ACTION6_BUCKET_PROBE_MIN_ATTEMPTS`（默认 `3`，每个 bucket 至少尝试次数）
+- `ACTIVE_INFERENCE_ACTION6_SUBCLUSTER_PROBE_MIN_ATTEMPTS`（默认 `2`，每个 subcluster 至少尝试次数）
+- `ACTIVE_INFERENCE_ACTION6_PROBE_SCORE_MARGIN`（默认 `0.06`，exploit 阶段 Action6 near-tie 探测阈值）
+- `ACTIVE_INFERENCE_NAV_CONFIDENCE_GATING_ENABLED`（默认 `true`，导航语义漂移时门控几何重项）
+- `ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TERM_ENABLED`（默认 `true`，启用动态 high-info 区域链路 sequence 先验）
+- `ACTIVE_INFERENCE_SEQUENCE_CAUSAL_WINDOW_STEPS`（默认 `24`）
+- `ACTIVE_INFERENCE_SEQUENCE_CAUSAL_VERIFY_WINDOW_STEPS`（默认 `8`）
+- `ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TRIGGER_REGION`（默认 `NA`，可手动覆盖，格式 `row:col`）
+- `ACTIVE_INFERENCE_SEQUENCE_CAUSAL_TARGET_REGION`（默认 `NA`，可手动覆盖，格式 `row:col`）
+- `ACTIVE_INFERENCE_NO_CHANGE_STOP_LOSS_STEPS`（默认 `3`）
+- `ACTIVE_INFERENCE_ENABLE_CROSS_EPISODE_MEMORY`（默认 `false`；若请求 `true` 会被阻断并记录 `override_blocked=true`）
+- `ACTIVE_INFERENCE_ENABLE_ACTION_COST_OBJECTIVE`（默认 `false`；若请求 `true` 会被阻断并记录 `action_cost_override_blocked=true`）
+- `ACTIVE_INFERENCE_TRACE_ENABLED`（默认 `true`）
+- `ACTIVE_INFERENCE_TRACE_CANDIDATE_LIMIT`（默认 `30`）
+- `ACTIVE_INFERENCE_TRACE_INCLUDE_FULL_REPRESENTATION`（默认 `false`）
+- `ACTIVE_INFERENCE_FRAME_CHAIN_WINDOW`（默认 `8`）
+- `ACTIVE_INFERENCE_ACTION_SPACE_HISTORY_WINDOW`（默认 `24`）
+- `ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON`（可选对象，也可 JSON 字符串）
 
-`ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` example:
+`ACTIVE_INFERENCE_PHASE_WEIGHT_OVERRIDES_JSON` 示例：
 
 ```json
 {
@@ -131,50 +130,49 @@ Useful `active_inference` config keys (set in `config/runtime_config.local.json`
 }
 ```
 
-## Team Run Profiles
+## 团队运行档位
 
-For this project, keep two standard run profiles so diagnostics are comparable:
+为了保证诊断可对比，建议固定两种标准运行档位：
 
-- Short debugging/analysis runs: around `300` actions per game.
-- Long stress/optimization runs: around `3000` actions per game.
+- 短跑调试/分析：每个游戏约 `300` actions
+- 长跑压测/优化：每个游戏约 `3000` actions
 
-Example (single game):
+单游戏示例：
 
 ```bash
 uv run main.py --agent=activeinferenceefe --game=ls20 --tags=profile,debug300
 uv run main.py --agent=activeinferenceefe --game=ls20 --tags=profile,long3000
 ```
 
-Before each profile run, set `active_inference.ACTIVE_INFERENCE_MAX_ACTIONS` in `config/runtime_config.local.json` (e.g. `300` or `3000`).
+每次运行前，在 `config/runtime_config.local.json` 中设置 `active_inference.ACTIVE_INFERENCE_MAX_ACTIONS`（例如 `300` 或 `3000`）。
 
-### Offline / API-502 Fallback
+### Offline / API-502 回退
 
-If `https://three.arcprize.org/api/games` is unavailable (for example `502`), you can still run
-with explicit `--game` ids. The runner no longer hard-fails on game-list fetch.
-
-```bash
-uv run main.py --agent=random --game=ls20
-```
-
-To force local-only execution (no online API calls), set `runtime.OPERATION_MODE` to `"offline"` and `runtime.ENVIRONMENTS_DIR` to your local path in config, then run:
+若 `https://three.arcprize.org/api/games` 不可用（例如 `502`），仍可通过显式 `--game` id 运行。当前 runner 不会因为游戏列表拉取失败而硬退出。
 
 ```bash
 uv run main.py --agent=random --game=ls20
 ```
 
-Notes:
-- `runtime.OPERATION_MODE="offline"` requires local environments in `runtime.ENVIRONMENTS_DIR`.
-- If a game is not present locally, the run now exits cleanly with a clear "No playable environments" error.
+若要强制仅本地执行（不调用在线 API），请在配置中设置 `runtime.OPERATION_MODE="offline"` 和 `runtime.ENVIRONMENTS_DIR`，然后运行：
 
-### 2080 / 2080-out3TS Batch Example
+```bash
+uv run main.py --agent=random --game=ls20
+```
 
-On remote machines (`2080` and `2080-out3TS`), run from:
+说明：
+- `runtime.OPERATION_MODE="offline"` 依赖 `runtime.ENVIRONMENTS_DIR` 下存在本地环境文件。
+- 若本地不存在目标游戏，运行会以清晰的 “No playable environments” 报错退出。
+
+### 2080 / 2080-out3TS 批量运行示例
+
+在远端机器（`2080` 和 `2080-out3TS`）上，从以下目录运行：
 
 ```bash
 cd /home/zdx/github/VSAHDC/ARC-AGI-3-Agents
 ```
 
-Use repeated exploration with `500` actions per game:
+使用每局 `500` actions 的重复探索：
 
 ```bash
 for game in ls20 ft09 vc33; do
@@ -187,58 +185,61 @@ for game in ls20 ft09 vc33; do
 done
 ```
 
-## Changelog
-## [0.9.3] - 2026-01-29
-**Note: This will be a breaking change is you use the fields outline below**
+## 变更日志
 
-### Added
-- `FrameData` had two field names changes. 
-  - `score` changed to `levels_completed`
-  - `win_score` changed to `win_levels`
-- Updated to use the new [ARC-AGI](https://github.com/arcprize/ARC-AGI) tool
-  - Allows local execution of environments
-  - Allows the creation of your own environments, see [Creating an Environment](https://docs.arcprize.org/add_game)
-  - If you want to continue to use the online API/Replays set `runtime.OPERATION_MODE` to `"online"` in `config/runtime_config.local.json`
+## [0.9.3] - 2026-01-29
+**注意：如果你依赖下述字段，本版本包含破坏性变更。**
+
+### 新增
+
+- `FrameData` 有两个字段重命名：
+  - `score` 改为 `levels_completed`
+  - `win_score` 改为 `win_levels`
+- 升级为使用新 [ARC-AGI](https://github.com/arcprize/ARC-AGI) 工具：
+  - 支持本地环境执行
+  - 支持创建自定义环境，参考 [Creating an Environment](https://docs.arcprize.org/add_game)
+  - 若继续使用在线 API/Replays，请在 `config/runtime_config.local.json` 设置 `runtime.OPERATION_MODE="online"`
 
 ## [0.9.2] - 2025-08-19
 
-### Added
-- `available_actions` to `FrameData`
-- `ACTION7` as possible `GameAction`
+### 新增
+
+- 在 `FrameData` 中新增 `available_actions`
+- 新增 `ACTION7` 作为可选 `GameAction`
 
 ## [0.9.1] - 2025-07-18
 
-Initial Release
+首次发布
 
-## Observability (Optional)
+## 可观测性（可选）
 
-[AgentOps](https://agentops.ai/) is an observability platform designed for providing real-time monitoring, debugging, and analytics for your agent's behavior, helping you understand how your agents perform and make decisions.
+[AgentOps](https://agentops.ai/) 是一个可观测性平台，用于实时监控、调试和分析 agent 行为，帮助你理解 agent 如何执行与决策。
 
-### Installation
+### 安装
 
-AgentOps is already included as an optional dependency in this project. To install it:
+本项目已将 AgentOps 作为可选依赖。安装方式：
 
 ```bash
 uv sync --extra agentops
 ```
 
-Or if you're installing manually:
+或者手动安装：
 
 ```bash
 pip install -U agentops
 ```
 
-### Getting Your API Key
+### 获取 API Key
 
-1. Visit [app.agentops.ai](https://app.agentops.ai) and create an account if you haven't already
-2. Once logged in, click on "New Project" to create a project for your ARC-AGI-3 agents
-3. Give your project a meaningful name (e.g., "ARC-AGI-3-Agents")
-4. After creating the project, you'll see your project dashboard
-5. Click on the "API Keys" tab on the left side & copy the API key
+1. 访问 [app.agentops.ai](https://app.agentops.ai) 并注册账号
+2. 登录后点击 “New Project” 创建 ARC-AGI-3 项目
+3. 为项目命名（例如 “ARC-AGI-3-Agents”）
+4. 创建后进入项目仪表盘
+5. 在左侧 “API Keys” 页面复制 API key
 
-### Configuration
+### 配置
 
-1. Add your AgentOps API key to `config/runtime_config.local.json`:
+1. 将 AgentOps API key 写入 `config/runtime_config.local.json`：
 
 ```json
 {
@@ -248,50 +249,56 @@ pip install -U agentops
 }
 ```
 
-2. The AgentOps integration is automatically initialized when you run an agent. The tracing decorator `@trace_agent_session` is already applied to agent execution methods in the codebase.
+2. 运行 agent 时会自动初始化 AgentOps。代码中已通过 `@trace_agent_session` 装饰器接入追踪。
 
-3. When you run your agent, you'll see AgentOps initialization messages and session URLs in the console:
+3. 运行时控制台会输出 AgentOps 初始化日志和会话链接：
 
 ```bash
 🖇 AgentOps: Session Replay for your-agent-name: https://app.agentops.ai/sessions?trace_id=xxxxx
 ```
 
-4. Click on the session URL to view real-time traces of your agent's execution. You can also view the traces in the AgentOps dashboard by locating the trace ID in the "Traces" tab.
+4. 点击会话链接可查看实时追踪，也可在 AgentOps 仪表盘 “Traces” 中用 trace ID 查询。
 
-### Using AgentOps with Custom Agents
+### 在自定义 Agent 中使用 AgentOps
 
-If you're creating a custom agent, the tracing is automatically applied through the `@trace_agent_session` decorator on the `main()` method. No additional code changes are needed.
+若你在开发自定义 agent，`main()` 已应用 `@trace_agent_session`，通常无需额外改动。
 
-## Contest Submission
+## 比赛提交
 
-To submit your agent for the ARC-AGI-3 competition, please use this form: https://forms.gle/wMLZrEFGDh33DhzV9.
+提交 ARC-AGI-3 比赛 agent，请使用该表单：https://forms.gle/wMLZrEFGDh33DhzV9
 
-## Contributing
+## 贡献指南
 
-We welcome contributions! To contribute to ARC-AGI-3-Agents, please follow these steps:
+欢迎贡献。请按以下步骤：
 
-1.  Fork the repository and create a new branch for your feature or bugfix.
-2.  Make your changes and ensure that all tests pass, you are welcome to add more tests for your specific fixes.
-3.  This project uses `ruff` for linting and formatting. Please set up the pre-commit hooks to ensure your contributions match the project's style.
-    ```bash
-    pip install pre-commit
-    pre-commit install
-    ```
-4.  Write clear commit messages describing your changes.
-5.  Open a pull request with a description of your changes and the motivation behind them.
+1. Fork 仓库并创建功能/修复分支。
+2. 完成改动并确保测试通过，欢迎补充针对性测试。
+3. 本项目使用 `ruff` 做 lint/format，建议安装 pre-commit：
+   ```bash
+   pip install pre-commit
+   pre-commit install
+   ```
+4. 使用清晰的 commit message 描述改动。
+5. 提交 PR，说明改动内容和动机。
 
-If you have questions or need help, feel free to open an issue.
+若有问题，欢迎提 issue。
 
-## Tests
+## 测试
 
-To run the tests, you will need to have `pytest` installed. Run the tests like this:
+运行测试前请先安装 `pytest`，执行：
 
 ```bash
 pytest
 ```
 
-For more information on tests, please see the [tests documentation](https://three.arcprize.org/docs#testing).
+更多信息请参考[测试文档](https://three.arcprize.org/docs#testing)。
 
-## License
+## 许可证
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+本项目采用 MIT License。详见 [LICENSE](LICENSE)。
+
+## 文档语言规范
+
+1. 仓库文档默认语言为中文。
+2. 英文术语可保留，但需配中文语义说明。
+3. 新增文档请优先按中文撰写。

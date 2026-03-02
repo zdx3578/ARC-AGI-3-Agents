@@ -1,16 +1,16 @@
-# P3 Detailed Design
+# P3 详细设计
 
-Goal: specify algorithmic details and state transitions.
+目标：细化算法细节与状态转移规则。
 
-## Required Sections
+## 必填章节
 
-1. State machine definitions.
-2. Gate ordering and transition conditions.
-3. Fallback paths and failure handling.
-4. Key parameter defaults and override boundaries.
+1. 状态机定义。
+2. 门控顺序与状态转移条件。
+3. 回退路径与失败处理。
+4. 关键参数默认值与覆盖边界。
 
-## Completion Criteria
+## 完成标准
 
-1. Deterministic state transitions.
-2. Every fallback has trigger and exit condition.
-3. Ambiguous behavior paths are eliminated.
+1. 状态转移可判定且确定。
+2. 每条回退路径都有触发条件与退出条件。
+3. 消除歧义行为路径。

@@ -1,10 +1,10 @@
-# ARC3 Documentation-First Pipeline
+# ARC3 文档先行执行流水线
 
-Updated: 2026-03-02
+更新时间：2026-03-02
 
-This folder hosts the executable documentation pipeline for ARC3 improvement work.
+本目录用于承载 ARC3 改进工作的可执行文档流程。
 
-## Phase Files
+## 阶段文档
 
 1. `01_commit_capability_matrix.md`
 2. `02_core_thinking.md`
@@ -16,6 +16,10 @@ This folder hosts the executable documentation pipeline for ARC3 improvement wor
 8. `08_runtime_smoke_acceptance.md`
 9. `09_functional_acceptance.md`
 
-## Execution Rule
+## 执行规则
 
-Always proceed in phase order. A later phase cannot be marked complete unless the previous phase has explicit acceptance records.
+必须按阶段顺序推进。若前一阶段未形成明确验收记录，不得标记后一阶段完成。
+
+## 语言规范
+
+后续新增或更新文档默认使用中文；如需保留英文术语，采用“中文说明 + 英文术语”形式。

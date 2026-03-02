@@ -1,22 +1,22 @@
-# P4 Interface Contracts
+# P4 接口契约设计
 
-Goal: formalize module IO and diagnostics schemas.
+目标：形式化模块间输入/输出与诊断字段模式。
 
-## Required Interfaces
+## 必要接口
 
-1. Policy <-> Navigation
-2. Policy <-> High-info
-3. Policy <-> Sequence-causal
-4. Runtime <-> Audit tools
+1. 策略层（Policy）<-> 导航层（Navigation）
+2. 策略层（Policy）<-> 高信息层（High-info）
+3. 策略层（Policy）<-> 序列因果层（Sequence-causal）
+4. 运行时层（Runtime）<-> 审计工具层（Audit tools）
 
-## Contract Template
+## 契约模板
 
-| Interface | Request Fields | Response Fields | Error Fields | Diagnostics | Compatibility Rule |
+| 接口 | 请求字段 | 响应字段 | 错误字段 | 诊断字段 | 兼容性规则 |
 |---|---|---|---|---|---|
 | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` | `TODO` |
 
-## Completion Criteria
+## 完成标准
 
-1. All handoffs have schema definitions.
-2. Diagnostics fields are bound to interfaces.
-3. Backward compatibility policy is explicit.
+1. 所有模块交接面均有 schema 定义。
+2. 诊断字段已绑定到具体接口。
+3. 向后兼容策略明确。
