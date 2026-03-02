@@ -7,7 +7,7 @@
 ## 阶段文档
 
 1. `01_commit_capability_matrix.md`：历史提交映射与能力轨道归档。
-2. `02_core_thinking.md`：核心思路冻结（含 ACIM 核心需求）。
+2. `02_core_thinking.md`：核心思路冻结（含 RRFE+ADCIM 核心需求）。
 3. `03_architecture_design.md`：架构边界与数据流设计。
 4. `04_detailed_design.md`：状态机、数据结构、算法与回退规则。
 5. `05_interface_contracts.md`：模块接口契约与字段约束。
@@ -18,7 +18,7 @@
 
 ## 专项设计文档
 
-1. `../action_causal_impact_model_design.md`：动作因果影响建模（ACIM）专项设计。
+1. `../action_causal_impact_model_design.md`：动作影响双通道建模（ADCIM）专项设计。
 
 ## 执行规则
 

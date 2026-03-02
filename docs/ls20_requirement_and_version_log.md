@@ -36,7 +36,9 @@
 3. 因果输入应尽量包含：位置、对象属性、相对位置、邻域像素等。
 4. 区分 UI/背景 与地图内可达区域，防止边界信息混淆。
 5. 阻塞边需自动识别并跳过（硬门控+软惩罚）。
-6. 新增核心要求：建立“动作因果影响建模（ACIM）”，让动作决策具备“预测影响 -> 执行验证 -> 在线更新”的闭环。
+6. 新增核心要求：建立“动作影响双通道建模（ADCIM）”，让动作决策具备“预测影响 -> 执行验证 -> 在线更新”的闭环。
+7. 导航建模必须采用“动作证实可达区域 -> 同色可行区域 fill 扩展”路径，不允许纯颜色静态推断可达。
+8. 动作影响建模必须拆成双通道：`导航行动属性` 与 `游戏因果属性`，并分别审计。
 
 ### 2.4 验收关注点
 
@@ -116,8 +118,10 @@
 2. 把 `blocked_seek_chain_override` 触发条件再细化，减少无意义覆写。
 3. 增加链路指标：`trigger->verify` 在 N 步窗口的成功率与复现次数。
 4. 将该指标写入 `selection_diagnostics_v1`，作为提交门槛的一部分。
-5. 落地 ACIM 最小能力：上下文键、效果标签、命中统计、低置信回退与审计字段。
-6. 在验收中增加 ACIM 指标：`causal_effect_prediction_hit_rate`、`progress_effect_precision`、`causal_fallback_rate`。
+5. 落地 ADCIM 最小能力：双通道上下文键、双通道效果标签、命中统计、低置信回退与审计字段。
+6. 在验收中增加 ADCIM 指标：`navigation_effect_prediction_hit_rate`、`game_effect_prediction_hit_rate`、`progress_effect_precision`、`dual_channel_fallback_rate`。
+7. 落地 RRFE：动作可达探测、同色 fill 扩展、误扩展回收与对应审计字段。
+8. 在验收中增加 RRFE 指标：`fill_expansion_precision`、`fill_expansion_false_positive_rate`、`route_success_rate_on_expanded_regions`。
 
 ## 8. 2026-02-22 增量实验记录（本次会话）
 
