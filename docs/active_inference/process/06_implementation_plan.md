@@ -2,6 +2,11 @@
 
 更新时间：2026-03-02
 
+缩写全拼约定：
+
+- `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
+- `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+
 目标：将设计与接口条目转化为可执行原子提交，优先落实 RRFE 与 ADCIM。
 
 ## 1. 实施分组

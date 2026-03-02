@@ -2,6 +2,11 @@
 
 更新时间：2026-03-02
 
+缩写全拼约定：
+
+- `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
+- `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+
 目标：在进入架构/详细设计之前，冻结高层工程思路，并明确本轮新增核心需求“导航可达建模重构 + 动作影响双通道建模”。
 
 ## 1. 背景与现状

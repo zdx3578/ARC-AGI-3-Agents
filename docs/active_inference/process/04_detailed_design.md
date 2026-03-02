@@ -2,6 +2,11 @@
 
 更新时间：2026-03-02
 
+缩写全拼约定：
+
+- `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
+- `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+
 目标：把“导航可达 fill 扩展（RRFE）+ 动作影响双通道建模（ADCIM）”细化为可编码规则。
 
 ## 1. 状态机定义（单步）

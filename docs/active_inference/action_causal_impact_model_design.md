@@ -1,6 +1,11 @@
-# 动作影响双通道建模（ADCIM）专项设计
+# 动作影响双通道建模（Action Dual-Channel Impact Modeling, ADCIM）专项设计
 
 更新时间：2026-03-02
+
+缩写全拼约定：
+
+- `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
+- `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
 
 ## 1. 设计目的
 

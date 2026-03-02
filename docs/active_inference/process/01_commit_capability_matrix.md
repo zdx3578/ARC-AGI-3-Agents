@@ -3,6 +3,11 @@
 更新时间：2026-03-02
 范围：分支 `codex/fa9729f-decoupled-core` 上 `main..HEAD`（作者：`zdx`）
 
+缩写全拼约定：
+
+- `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
+- `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+
 目标：先完成历史提交到能力轨道的映射，再补齐代码锚点与证据。
 
 ## 输入文档

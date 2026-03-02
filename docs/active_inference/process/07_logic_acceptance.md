@@ -2,6 +2,11 @@
 
 更新时间：2026-03-02
 
+缩写全拼约定：
+
+- `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
+- `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+
 目标：在运行前完成逻辑正确性核对，重点校验 RRFE 与 ADCIM 与既有门控是否兼容。
 
 ## 1. 门控与流程检查

@@ -3,6 +3,11 @@
 更新时间：2026-02-22
 适用范围：`/Users/zhangdexiang/github/vsahdc/ARC-AGI-3-Agents`（`active_inference` 模板）
 
+缩写全拼约定：
+
+- `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
+- `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+
 ## 1. 记录目的
 
 这份文档用于把本轮对话中的核心工程要求、版本演进和回归事实固定下来，避免“口头记忆漂移”，并作为后续改进与验收基线。
@@ -284,6 +289,7 @@
 3. 禁止跳过文档直接堆改动；禁止把多类实验混成不可审计的单提交。
 4. 后续新增与更新文档统一使用中文；必要英文术语需附中文语义。
 5. 后续由 Codex 自动执行的代码提交，`commit message` 统一使用中文。
+6. 所有缩写首次出现必须给出“中文名称 + 英文全拼 + 缩写”（例如 RRFE/ADCIM），禁止只写缩写。
 
 ### 11.4 流程文档入口（2026-03-02）
 

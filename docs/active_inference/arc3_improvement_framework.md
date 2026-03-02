@@ -4,6 +4,11 @@
 分支：`codex/fa9729f-decoupled-core`
 范围：`agents/templates/active_inference`
 
+缩写全拼约定：
+
+- `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
+- `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+
 ## 1. 当前基线文档全集
 
 1. `docs/active_inference/zdx_commit_core_changes.md`

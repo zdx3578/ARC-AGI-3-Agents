@@ -1,5 +1,10 @@
 # 导航子系统契约（独立、可审计、可替换）
 
+缩写全拼约定：
+
+- `RRFE` = `Reachable-Region Fill Expansion`（可达区域填充扩展）
+- `ADCIM` = `Action Dual-Channel Impact Modeling`（动作双通道影响建模）
+
 ## 1. 目标
 
 把以下能力收敛为**单一导航子系统**，其余模块只调用，不再各自实现：
